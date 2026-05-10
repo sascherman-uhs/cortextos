@@ -41,8 +41,11 @@ export function FilterBar({ filters, onClearAll, className }: FilterBarProps) {
           value={filter.value}
           onValueChange={(value) => filter.onChange(value ?? '')}
         >
-          <SelectTrigger size="sm">
-            <SelectValue placeholder={filter.label} />
+          <SelectTrigger size="sm" className="gap-1">
+            <span className="text-muted-foreground text-xs font-medium shrink-0">
+              {filter.label}:
+            </span>
+            <SelectValue placeholder="All" />
           </SelectTrigger>
           <SelectContent>
             {filter.options.map((option) => (
