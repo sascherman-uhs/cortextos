@@ -40,9 +40,14 @@ export async function getAllHeartbeats(): Promise<Heartbeat[]> {
   const stateDir = path.join(CTX_ROOT, 'state');
   const heartbeats: Heartbeat[] = [];
 
+  // These directories exist in state/ but are not agents — exclude from health checks.
+  // 'cortextos' was a ghost entry created by MOD #2 bug (daemon wrote its own heartbeat
+  // there before CTX_AGENT_NAME was passed correctly). 'oauth' and 'usage' are data dirs.
+  const NON_AGENT_DIRS = new Set(['cortextos', 'oauth', 'usage']);
+
   try {
     const entries = await fs.readdir(stateDir, { withFileTypes: true });
-    const dirs = entries.filter((e) => e.isDirectory());
+    const dirs = entries.filter((e) => e.isDirectory() && !NON_AGENT_DIRS.has(e.name));
 
     const results = await Promise.allSettled(
       dirs.map((d) => getHeartbeat(d.name))
