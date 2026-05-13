@@ -36,7 +36,7 @@ export function KanbanBoard({ tasks, completedTodayTasks, onTaskClick }: KanbanB
     },
     {
       status: 'completed',
-      label: 'Completed (today)',
+      label: 'Completed',
       tasks: completedTodayTasks,
     },
   ];

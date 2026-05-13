@@ -66,12 +66,7 @@ export default function TasksPage() {
       }
       if (completedRes.ok) {
         const data: Task[] = await completedRes.json();
-        // Filter to completed today only
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        setCompletedToday(
-          data.filter((t) => t.completed_at && new Date(t.completed_at) >= todayStart)
-        );
+        setCompletedToday(data);
       }
     } catch {
       // Silently fail
