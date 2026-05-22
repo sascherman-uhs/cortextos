@@ -21,7 +21,7 @@ type TreeNode =
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
-  const org = url.searchParams.get('org') ?? 'sondre-hq';
+  const org = url.searchParams.get('org') ?? 'uhs';
 
   const vaultRoot = getVaultRoot(org);
   if (!vaultRoot) {

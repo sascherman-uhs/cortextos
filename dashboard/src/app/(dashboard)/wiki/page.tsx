@@ -8,6 +8,6 @@ interface PageProps {
 
 export default async function WikiPage({ searchParams }: PageProps) {
   const params = await searchParams;
-  const org = params.org ?? 'sondre-hq';
+  const org = params.org ?? 'uhs';
   return <WikiShell org={org} />;
 }

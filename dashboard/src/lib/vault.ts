@@ -17,6 +17,12 @@ export const PARA_DIRS = [
   '04-archive',
   '05-daily',
   '06-maps',
+  // UHS vault structure (non-PARA)
+  'business',
+  'clients',
+  'learnings',
+  'sessions',
+  'research',
 ] as const;
 
 export type ParaDir = (typeof PARA_DIRS)[number];
