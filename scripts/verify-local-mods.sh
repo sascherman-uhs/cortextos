@@ -213,6 +213,22 @@ check "api/tasks/[id]/route.ts enriches with recurring info" \
   "$DASHBOARD_ROOT/src/app/api/tasks/[id]/route.ts" \
   "recurring_task_id"
 
+check "api/tasks/[id]/route.ts fetches result+error for supa_ tasks" \
+  "$DASHBOARD_ROOT/src/app/api/tasks/[id]/route.ts" \
+  "supaResult"
+
+check "task-detail-sheet.tsx renders result section" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-detail-sheet.tsx" \
+  "supaResult"
+
+check "approvals/page.tsx imports TaskNumberBadge" \
+  "$DASHBOARD_ROOT/src/app/(dashboard)/approvals/page.tsx" \
+  "TaskNumberBadge"
+
+check "task-list-table.tsx has task_num sort field" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-list-table.tsx" \
+  "task_num"
+
 echo ""
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

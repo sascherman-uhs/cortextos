@@ -29,6 +29,9 @@ import {
 } from '@/components/shared';
 import { IconPencil, IconFile, IconPhoto, IconFileText, IconCode } from '@tabler/icons-react';
 import { DeliverablePreview } from '@/components/tasks/deliverable-preview';
+// UHS MOD #7 — task number badge + recurring panel (components/uhs/ never overwritten)
+import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
+import { RecurringPanel } from '@/components/uhs/recurring-tasks-tab';
 import type { Task, TaskOutput, TaskStatus, TaskPriority } from '@/lib/types';
 
 export interface TaskDetailSheetProps {
@@ -92,6 +95,17 @@ export function TaskDetailSheet({
   const [outputs, setOutputs] = useState<TaskOutput[]>([]);
   const [deliverablesEnabled, setDeliverablesEnabled] = useState(false);
   const [previewOutput, setPreviewOutput] = useState<TaskOutput | null>(null);
+  // UHS MOD #7 — result/error from Supabase (populated for supa_ tasks)
+  const [supaResult, setSupaResult] = useState<Record<string, unknown> | null>(null);
+  const [supaError, setSupaError] = useState<string | null>(null);
+  // UHS MOD #7 — recurring task metadata (populated for supa_ tasks)
+  const [recurringInfo, setRecurringInfo] = useState<{
+    recurring_task_id: number;
+    recurring_name: string;
+    recurring_schedule: string;
+    recurring_enabled: boolean;
+    recent_runs: Array<{ id: number; type: string; status: string; created_at: string; completed_at: string | null; error: string | null }>;
+  } | null>(null);
 
   // Fetch outputs and deliverables setting when task detail opens
   const fetchTaskOutputs = useCallback(async (taskId: string, org: string) => {
@@ -100,6 +114,21 @@ export function TaskDetailSheet({
       if (res.ok) {
         const data = await res.json();
         setOutputs(Array.isArray(data.outputs) ? data.outputs : []);
+        // UHS MOD #7 — populate result/error if present
+        setSupaResult(data.supaResult ?? null);
+        setSupaError(data.supaError ?? null);
+        // UHS MOD #7 — populate recurring info if present
+        if (data.recurring_task_id) {
+          setRecurringInfo({
+            recurring_task_id: data.recurring_task_id,
+            recurring_name: data.recurring_name ?? 'Recurring task',
+            recurring_schedule: data.recurring_schedule ?? 'nightly',
+            recurring_enabled: data.recurring_enabled ?? true,
+            recent_runs: data.recent_runs ?? [],
+          });
+        } else {
+          setRecurringInfo(null);
+        }
       }
     } catch { /* non-fatal */ }
 
@@ -118,6 +147,9 @@ export function TaskDetailSheet({
     } else {
       setOutputs([]);
       setPreviewOutput(null);
+      setRecurringInfo(null); // UHS MOD #7
+      setSupaResult(null);    // UHS MOD #7
+      setSupaError(null);     // UHS MOD #7
     }
   }, [open, task?.id, task?.org, fetchTaskOutputs, task]);
 
@@ -194,13 +226,18 @@ export function TaskDetailSheet({
             />
           ) : (
             <div className="flex items-start gap-2 pr-8">
+              {/* UHS MOD #7: number badge in title */}
+              <TaskNumberBadge id={task.id} className="mt-1" />
               <SheetTitle className="flex-1">{task.title}</SheetTitle>
               <Button variant="ghost" size="icon-sm" onClick={startEditing} title="Edit task" className="shrink-0">
                 <IconPencil size={14} />
               </Button>
             </div>
           )}
-          <SheetDescription>Task ID: {task.id}</SheetDescription>
+          <SheetDescription>
+            {/* UHS MOD #7: show numeric ref prominently */}
+            Task ID: {task.id}
+          </SheetDescription>
         </SheetHeader>
 
         {/* Error banner */}
@@ -275,6 +312,75 @@ export function TaskDetailSheet({
               </div>
             )}
           </div>
+
+          {/* UHS MOD #7: recurring task panel */}
+          {!editing && recurringInfo && (
+            <>
+              <Separator />
+              <RecurringPanel
+                recurringTaskId={recurringInfo.recurring_task_id}
+                recentRuns={recurringInfo.recent_runs}
+                schedule={recurringInfo.recurring_schedule}
+                recurringName={recurringInfo.recurring_name}
+                enabled={recurringInfo.recurring_enabled}
+              />
+            </>
+          )}
+
+          {/* UHS MOD #7 — Result/outcome for supa_ tasks */}
+          {!editing && (supaResult || supaError) && (
+            <>
+              <Separator />
+              <div>
+                <p className="text-sm text-muted-foreground mb-2">Result</p>
+                {supaError && (
+                  <div className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive mb-2">
+                    <span className="font-semibold">Error: </span>{supaError}
+                  </div>
+                )}
+                {supaResult && (() => {
+                  // Unwrap nested summary string if present
+                  let parsed: Record<string, unknown> = supaResult;
+                  try {
+                    if (typeof supaResult.summary === 'string') {
+                      parsed = JSON.parse(supaResult.summary);
+                    }
+                  } catch { /* use supaResult as-is */ }
+                  const status = parsed.status as string | undefined;
+                  const reason = parsed.reason as string | undefined;
+                  const summary = parsed.summary as string | undefined;
+                  const executedBy = parsed.executed_by as string | undefined;
+                  const isSkip = status === 'skipped';
+                  const isError = status === 'error' || status === 'failed';
+                  return (
+                    <div className={`rounded-md px-3 py-2 text-xs space-y-1 ${
+                      isSkip ? 'bg-muted/50 text-muted-foreground' :
+                      isError ? 'bg-destructive/10 text-destructive' :
+                      'bg-muted/30'
+                    }`}>
+                      {status && (
+                        <div>
+                          <span className="font-semibold capitalize">{status}</span>
+                          {isSkip && <span className="ml-1 text-muted-foreground">(no action taken)</span>}
+                        </div>
+                      )}
+                      {(reason || summary) && (
+                        <div className="text-muted-foreground">{reason ?? summary}</div>
+                      )}
+                      {executedBy && (
+                        <div className="text-muted-foreground/70">by {executedBy}</div>
+                      )}
+                      {!status && !reason && !summary && (
+                        <pre className="whitespace-pre-wrap break-all font-mono text-[10px]">
+                          {JSON.stringify(parsed, null, 2)}
+                        </pre>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </>
+          )}
 
           {/* Description */}
           <Separator />

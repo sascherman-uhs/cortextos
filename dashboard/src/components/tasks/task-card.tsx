@@ -2,6 +2,8 @@
 
 import { Card } from '@/components/ui/card';
 import { PriorityBadge, OrgBadge, TimeAgo } from '@/components/shared';
+// UHS MOD #7 — task number badge (components/uhs/ never overwritten by upstream)
+import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
 import type { Task } from '@/lib/types';
 
 interface TaskCardProps {
@@ -16,9 +18,13 @@ export function TaskCard({ task, onClick }: TaskCardProps) {
       onClick={() => onClick?.(task)}
     >
       <div className="space-y-2">
-        <p className="text-sm font-medium leading-snug line-clamp-2">
-          {task.title}
-        </p>
+        {/* UHS MOD #7: task number badge */}
+        <div className="flex items-start gap-1.5">
+          <TaskNumberBadge id={task.id} className="mt-0.5" />
+          <p className="text-sm font-medium leading-snug line-clamp-2 flex-1">
+            {task.title}
+          </p>
+        </div>
         <div className="flex flex-wrap items-center gap-1.5">
           <PriorityBadge priority={task.priority} />
           <OrgBadge org={task.org} />

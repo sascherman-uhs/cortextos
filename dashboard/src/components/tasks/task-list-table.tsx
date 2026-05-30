@@ -11,13 +11,25 @@ import {
 } from '@/components/ui/table';
 import { PriorityBadge, StatusBadge, OrgBadge, TimeAgo } from '@/components/shared';
 import { IconArrowsSort, IconSortAscending, IconSortDescending } from '@tabler/icons-react';
+// UHS MOD #7 — task number in table (components/uhs/ never overwritten by upstream)
+import { getTaskNumber } from '@/components/uhs/task-number-badge';
 import type { Task } from '@/lib/types';
 
-type SortField = 'title' | 'status' | 'priority' | 'assignee' | 'org' | 'created_at';
+type SortField = 'task_num' | 'title' | 'status' | 'priority' | 'assignee' | 'org' | 'created_at';
 type SortDir = 'asc' | 'desc';
 
 const PRIORITY_ORDER: Record<string, number> = { critical: 0, urgent: 0, high: 1, normal: 2, low: 3 };
 const STATUS_ORDER = { blocked: 0, in_progress: 1, pending: 2, completed: 3 };
+
+// Extract a numeric sort key from any task ID format
+// supa_720 → 720 | task_{ts}_{N} → N | fallback → 0
+function taskSortNum(id: string): number {
+  const supaMatch = id.match(/^supa_(\d+)$/);
+  if (supaMatch) return parseInt(supaMatch[1], 10);
+  const tailMatch = id.match(/_(\d+)$/);
+  if (tailMatch) return parseInt(tailMatch[1], 10);
+  return 0;
+}
 
 interface TaskListTableProps {
   tasks: Task[];
@@ -25,7 +37,7 @@ interface TaskListTableProps {
 }
 
 export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
-  const [sortField, setSortField] = useState<SortField>('created_at');
+  const [sortField, setSortField] = useState<SortField>('task_num');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
 
   const sorted = useMemo(() => {
@@ -33,6 +45,9 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
     copy.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
+        case 'task_num':
+          cmp = taskSortNum(a.id) - taskSortNum(b.id);
+          break;
         case 'title':
           cmp = a.title.localeCompare(b.title);
           break;
@@ -77,6 +92,7 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
   }
 
   const columns: { field: SortField; label: string }[] = [
+    { field: 'task_num', label: '#' },
     { field: 'title', label: 'Title' },
     { field: 'status', label: 'Status' },
     { field: 'priority', label: 'Priority' },
@@ -106,7 +122,7 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
       <TableBody>
         {sorted.length === 0 ? (
           <TableRow>
-            <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+            <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
               No tasks found
             </TableCell>
           </TableRow>
@@ -117,8 +133,12 @@ export function TaskListTable({ tasks, onTaskClick }: TaskListTableProps) {
               className="cursor-pointer"
               onClick={() => onTaskClick(task)}
             >
-              <TableCell className="max-w-[300px] truncate font-medium">
-                {task.title}
+              {/* UHS MOD #7: dedicated # column */}
+              <TableCell className="w-12 font-mono text-xs text-muted-foreground/70 shrink-0">
+                {getTaskNumber(task.id) ? `#${getTaskNumber(task.id)}` : ''}
+              </TableCell>
+              <TableCell className="max-w-[300px] font-medium">
+                <span className="truncate">{task.title}</span>
               </TableCell>
               <TableCell>
                 <StatusBadge status={task.status} />

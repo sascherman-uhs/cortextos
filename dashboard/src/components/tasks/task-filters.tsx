@@ -2,6 +2,8 @@
 
 import { FilterBar } from '@/components/shared';
 import type { FilterConfig } from '@/components/shared';
+// UHS MOD #7 — search input for task number / title
+import { IconSearch, IconX } from '@tabler/icons-react';
 
 interface TaskFiltersProps {
   orgs: string[];
@@ -13,6 +15,7 @@ interface TaskFiltersProps {
     priority: string;
     project: string;
     status: string;
+    search: string; // UHS MOD #7
   };
   onChange: (key: string, value: string) => void;
   onClearAll: () => void;
@@ -88,5 +91,28 @@ export function TaskFilters({
     });
   }
 
-  return <FilterBar filters={filterConfigs} onClearAll={onClearAll} />;
+  return (
+    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+      {/* UHS MOD #7: search by task number or title */}
+      <div className="relative flex-1 max-w-xs">
+        <IconSearch size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+        <input
+          type="text"
+          value={filters.search}
+          onChange={(e) => onChange('search', e.target.value)}
+          placeholder="Search by #number or title…"
+          className="h-9 w-full rounded-md border border-input bg-background pl-8 pr-8 text-sm shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        {filters.search && (
+          <button
+            onClick={() => onChange('search', '')}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          >
+            <IconX size={13} />
+          </button>
+        )}
+      </div>
+      <FilterBar filters={filterConfigs} onClearAll={onClearAll} />
+    </div>
+  );
 }

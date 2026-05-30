@@ -10,6 +10,8 @@ import { IconUser, IconCheck, IconClock } from '@tabler/icons-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { PriorityBadge, TimeAgo } from '@/components/shared';
+// UHS MOD #6 — task number badge on human-tasks cards
+import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
 import type { Approval, Task } from '@/lib/types';
 
 export default function ApprovalsPage() {
@@ -161,7 +163,10 @@ export default function ApprovalsPage() {
                 <Card key={task.id} className="hover:bg-muted/20 transition-colors">
                   <CardContent className="flex items-start justify-between py-3">
                     <div className="min-w-0 flex-1 space-y-1">
-                      <p className="text-sm font-medium">{task.title}</p>
+                      <div className="flex items-center gap-1.5">
+                        <TaskNumberBadge id={task.id} className="shrink-0" />
+                        <p className="text-sm font-medium">{task.title}</p>
+                      </div>
                       {task.description && (
                         <p className="text-xs text-muted-foreground line-clamp-2">{task.description}</p>
                       )}

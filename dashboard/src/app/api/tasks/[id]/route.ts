@@ -65,6 +65,65 @@ export async function GET(
       } catch { /* non-fatal — outputs are optional */ }
     }
 
+    // UHS MOD #7 (extends MOD #6) — for supa_ tasks, enrich with recurring task info
+    if (id.startsWith('supa_')) {
+      const supaId = id.slice(5);
+      const supaUrl = process.env.SUPABASE_URL;
+      const supaKey = process.env.SUPABASE_KEY;
+      if (supaUrl && supaKey) {
+        const sbHeaders = {
+          apikey: supaKey,
+          Authorization: `Bearer ${supaKey}`,
+          'Content-Type': 'application/json',
+        };
+        try {
+          // Fetch payload + result + error for full task context
+          const payloadRes = await fetch(
+            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error`,
+            { headers: sbHeaders, cache: 'no-store' },
+          );
+          if (payloadRes.ok) {
+            const rows = await payloadRes.json();
+            const payload = rows[0]?.payload ?? {};
+            const rtId = payload.recurring_task_id;
+            // Pass result + error through to the task object
+            if (rows[0]?.result !== undefined) {
+              Object.assign(task, { supaResult: rows[0].result });
+            }
+            if (rows[0]?.error !== undefined && rows[0].error !== null) {
+              Object.assign(task, { supaError: rows[0].error });
+            }
+            if (rtId) {
+              // Fetch the recurring_task definition
+              const rtRes = await fetch(
+                `${supaUrl}/rest/v1/recurring_tasks?id=eq.${rtId}&select=id,name,schedule,enabled`,
+                { headers: sbHeaders, cache: 'no-store' },
+              );
+              // Fetch last 5 sibling runs
+              const runsRes = await fetch(
+                `${supaUrl}/rest/v1/tasks?payload->>recurring_task_id=eq.${rtId}&select=id,type,status,created_at,completed_at,error&order=created_at.desc&limit=5`,
+                { headers: sbHeaders, cache: 'no-store' },
+              );
+              const [rtRows, runsRows] = await Promise.all([
+                rtRes.ok ? rtRes.json() : [],
+                runsRes.ok ? runsRes.json() : [],
+              ]);
+              const rt = rtRows[0];
+              if (rt) {
+                Object.assign(task, {
+                  recurring_task_id: rt.id,
+                  recurring_name: rt.name,
+                  recurring_schedule: rt.schedule,
+                  recurring_enabled: rt.enabled,
+                  recent_runs: runsRows,
+                });
+              }
+            }
+          }
+        } catch { /* non-fatal — recurring info is optional */ }
+      }
+    }
+
     return Response.json(task);
   } catch (err) {
     console.error('[api/tasks/[id]] GET error:', err);
