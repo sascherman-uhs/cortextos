@@ -5,6 +5,7 @@ import path from 'path';
 import { getTaskById } from '@/lib/data/tasks';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { syncAll } from '@/lib/sync';
+import { db } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
@@ -252,6 +253,67 @@ export async function PATCH(
 
   // Look up task's org to pass CTX_ORG to bus script
   const task = getTaskById(id);
+
+  // ---------------------------------------------------------------------------
+  // Supabase-sourced tasks (id prefix "supa_") — bus scripts can't find these
+  // because they live only in SQLite, not in CortexOS JSON files. Handle them
+  // by calling Supabase REST directly and updating the local SQLite cache.
+  // ---------------------------------------------------------------------------
+  if (id.startsWith('supa_')) {
+    const supabaseId = id.slice(5); // strip "supa_" prefix → numeric string
+    const supaUrl = process.env.SUPABASE_URL;
+    const supaKey = process.env.SUPABASE_KEY;
+
+    if (!supaUrl || !supaKey) {
+      return Response.json(
+        { error: 'SUPABASE_URL / SUPABASE_KEY not configured in .env.local' },
+        { status: 500 },
+      );
+    }
+
+    try {
+      const now = new Date().toISOString();
+      const patch: Record<string, string | null> = { status };
+      if (status === 'completed') patch.completed_at = now;
+      if (status === 'in_progress') patch.started_at = now;
+
+      const sbRes = await fetch(
+        `${supaUrl}/rest/v1/tasks?id=eq.${supabaseId}`,
+        {
+          method: 'PATCH',
+          headers: {
+            apikey: supaKey,
+            Authorization: `Bearer ${supaKey}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: JSON.stringify(patch),
+        },
+      );
+
+      if (!sbRes.ok) {
+        const errText = await sbRes.text();
+        throw new Error(`Supabase PATCH failed ${sbRes.status}: ${errText}`);
+      }
+
+      // Mirror immediately in local SQLite so the UI updates before next sync
+      db.prepare(
+        `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?
+         WHERE id = ?`,
+      ).run(
+        status,
+        now,
+        status === 'completed' ? now : null,
+        id,
+      );
+
+      return Response.json({ success: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[api/tasks/[id]] supa_ PATCH error:', message);
+      return Response.json({ error: `Failed to update task: ${message}` }, { status: 500 });
+    }
+  }
 
   const frameworkRoot = getFrameworkRoot();
   const env = {

@@ -43,6 +43,7 @@ export interface TaskDetailSheetProps {
 const STATUS_TRANSITIONS: Record<TaskStatus, { label: string; status: TaskStatus; variant: 'default' | 'outline' | 'destructive' | 'secondary' }[]> = {
   pending: [
     { label: 'Start', status: 'in_progress', variant: 'default' },
+    { label: 'Complete', status: 'completed', variant: 'secondary' },
     { label: 'Block', status: 'blocked', variant: 'destructive' },
   ],
   in_progress: [
