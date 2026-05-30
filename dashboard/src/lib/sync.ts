@@ -93,15 +93,20 @@ export function syncTasks(org: string): number {
       }
     }
 
-    // Prune rows whose source files no longer exist on disk
+    // Prune rows whose source files no longer exist on disk.
+    // IMPORTANT (MOD #5): never delete rows synced from Supabase
+    // (source_file = 'supabase://tasks/{id}') — those are written by
+    // cortex_dashboard_sync.py and are invisible to the JSON-file scanner.
     if (activePaths.length > 0) {
       const placeholders = activePaths.map(() => '?').join(',');
       db.prepare(
-        `DELETE FROM tasks WHERE org = ? AND source_file NOT IN (${placeholders})`,
+        `DELETE FROM tasks WHERE org = ? AND source_file NOT IN (${placeholders}) AND source_file NOT LIKE 'supabase://%'`,
       ).run(org, ...activePaths);
     } else {
-      // No files at all — delete all tasks for this org
-      db.prepare('DELETE FROM tasks WHERE org = ?').run(org);
+      // No JSON task files on disk — only delete non-Supabase rows
+      db.prepare(
+        `DELETE FROM tasks WHERE org = ? AND source_file NOT LIKE 'supabase://%'`,
+      ).run(org);
     }
   });
 
