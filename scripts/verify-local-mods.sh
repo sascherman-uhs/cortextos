@@ -163,6 +163,58 @@ check ".env.local has SUPABASE_KEY" \
 
 echo ""
 
+# ─── MOD #7: Task numbers, search, recurring tab ─────────────────────────────
+echo "── MOD #7: Task numbers, search, two-tab tasks page, recurring management"
+
+# New UHS-owned files (safe zone — upstream never writes here)
+for f in \
+  "$DASHBOARD_ROOT/src/components/uhs/task-number-badge.tsx" \
+  "$DASHBOARD_ROOT/src/components/uhs/recurring-tasks-tab.tsx" \
+  "$DASHBOARD_ROOT/src/app/api/uhs/recurring-tasks/route.ts"; do
+  if [[ -f "$f" ]]; then
+    green "$(basename "$f") exists in uhs/ safe zone"
+    ((PASS++))
+  else
+    red "$(basename "$f") MISSING — expected at $f"
+    ((FAIL++))
+  fi
+done
+
+# Hooks in upstream files (minimal 1-line imports)
+check "task-card.tsx imports TaskNumberBadge" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-card.tsx" \
+  "from '@/components/uhs/task-number-badge'"
+
+check "task-list-table.tsx imports getTaskNumber" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-list-table.tsx" \
+  "from '@/components/uhs/task-number-badge'"
+
+check "task-filters.tsx has search field" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-filters.tsx" \
+  "search: string"
+
+check "task-detail-sheet.tsx imports RecurringPanel" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-detail-sheet.tsx" \
+  "RecurringPanel"
+
+check "tasks/page.tsx imports RecurringTasksTab" \
+  "$DASHBOARD_ROOT/src/app/(dashboard)/tasks/page.tsx" \
+  "RecurringTasksTab"
+
+check "tasks/page.tsx has Tabs structure" \
+  "$DASHBOARD_ROOT/src/app/(dashboard)/tasks/page.tsx" \
+  "TabsContent.*recurring"
+
+check "tasks/page.tsx DEFAULT_FILTERS includes search" \
+  "$DASHBOARD_ROOT/src/app/(dashboard)/tasks/page.tsx" \
+  "search: ''"
+
+check "api/tasks/[id]/route.ts enriches with recurring info" \
+  "$DASHBOARD_ROOT/src/app/api/tasks/[id]/route.ts" \
+  "recurring_task_id"
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then

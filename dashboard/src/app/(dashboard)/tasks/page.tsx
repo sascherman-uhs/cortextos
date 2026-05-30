@@ -3,12 +3,16 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useOrg } from '@/hooks/use-org';
 import { Button } from '@/components/ui/button';
-import { IconLayoutKanban, IconList, IconChecklist } from '@tabler/icons-react';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
+import { IconLayoutKanban, IconList, IconChecklist, IconRepeat } from '@tabler/icons-react';
 import { KanbanBoard } from '@/components/tasks/kanban-board';
 import { TaskListTable } from '@/components/tasks/task-list-table';
 import { TaskDetailSheet } from '@/components/tasks/task-detail-sheet';
 import { CreateTaskDialog } from '@/components/tasks/create-task-dialog';
 import { TaskFilters } from '@/components/tasks/task-filters';
+// UHS MOD #7 — recurring tasks tab (components/uhs/ never overwritten by upstream)
+import { RecurringTasksTab } from '@/components/uhs/recurring-tasks-tab';
+import { getTaskNumber } from '@/components/uhs/task-number-badge';
 import type { Task, TaskStatus } from '@/lib/types';
 
 type ViewMode = 'kanban' | 'list';
@@ -19,6 +23,7 @@ const DEFAULT_FILTERS = {
   priority: 'all',
   project: 'all',
   status: 'all',
+  search: '', // UHS MOD #7
 };
 
 export default function TasksPage() {
@@ -124,10 +129,23 @@ export default function TasksPage() {
     }
   }
 
+  // UHS MOD #7 — client-side search by task number or title
+  function matchesSearch(task: Task, query: string): boolean {
+    if (!query.trim()) return true;
+    const q = query.trim().toLowerCase();
+    // Match "#720" or "720" against task number
+    const numQuery = q.replace(/^#/, '');
+    const taskNum = getTaskNumber(task.id);
+    if (taskNum && taskNum === numQuery) return true;
+    // Match against title
+    return task.title.toLowerCase().includes(q);
+  }
+
   // Filter tasks for display (non-completed for kanban columns, all for list)
-  const displayTasks = view === 'kanban'
+  const displayTasks = (view === 'kanban'
     ? tasks.filter((t) => t.status !== 'completed')
-    : tasks;
+    : tasks
+  ).filter((t) => matchesSearch(t, filters.search));
 
   if (loading) {
     return (
@@ -147,69 +165,100 @@ export default function TasksPage() {
 
   return (
     <div className="space-y-4">
-      {/* Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-semibold">Tasks</h1>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center rounded-lg border bg-muted/30 p-0.5">
-            <Button
-              variant={view === 'kanban' ? 'secondary' : 'ghost'}
-              size="xs"
-              onClick={() => setView('kanban')}
-            >
-              <IconLayoutKanban className="size-3.5" />
-              Board
-            </Button>
-            <Button
-              variant={view === 'list' ? 'secondary' : 'ghost'}
-              size="xs"
-              onClick={() => setView('list')}
-            >
-              <IconList className="size-3.5" />
-              List
-            </Button>
+      {/* UHS MOD #7 — top-level tabs: One-time tasks vs Recurring tasks */}
+      <Tabs defaultValue="tasks" className="w-full">
+        {/* Header — title + tab switcher + view controls on same row */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-semibold">Tasks</h1>
+            <TabsList className="h-8">
+              <TabsTrigger value="tasks" className="text-xs px-3 h-7">
+                <IconChecklist className="size-3.5 mr-1.5" />
+                One-time
+              </TabsTrigger>
+              <TabsTrigger value="recurring" className="text-xs px-3 h-7">
+                <IconRepeat className="size-3.5 mr-1.5" />
+                Recurring
+              </TabsTrigger>
+            </TabsList>
           </div>
-          <CreateTaskDialog
+          <div className="flex items-center gap-2">
+            <div className="flex items-center rounded-lg border bg-muted/30 p-0.5">
+              <Button
+                variant={view === 'kanban' ? 'secondary' : 'ghost'}
+                size="xs"
+                onClick={() => setView('kanban')}
+              >
+                <IconLayoutKanban className="size-3.5" />
+                Board
+              </Button>
+              <Button
+                variant={view === 'list' ? 'secondary' : 'ghost'}
+                size="xs"
+                onClick={() => setView('list')}
+              >
+                <IconList className="size-3.5" />
+                List
+              </Button>
+            </div>
+            <CreateTaskDialog
+              agents={agents}
+              projects={projects}
+              onCreated={fetchTasks}
+            />
+          </div>
+        </div>
+
+        {/* One-time tasks tab */}
+        <TabsContent value="tasks" className="mt-0 space-y-4">
+          {/* Filters */}
+          <TaskFilters
+            orgs={orgs}
             agents={agents}
             projects={projects}
-            onCreated={fetchTasks}
+            filters={filters}
+            onChange={handleFilterChange}
+            onClearAll={handleClearFilters}
           />
-        </div>
-      </div>
 
-      {/* Filters */}
-      <TaskFilters
-        orgs={orgs}
-        agents={agents}
-        projects={projects}
-        filters={filters}
-        onChange={handleFilterChange}
-        onClearAll={handleClearFilters}
-      />
+          {/* Content */}
+          {tasks.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <IconChecklist size={48} className="text-muted-foreground/30 mb-4" />
+              <h3 className="text-lg font-medium mb-1">No tasks yet</h3>
+              <p className="text-sm text-muted-foreground mb-4 max-w-sm">
+                Create your first task to start tracking work across your agents.
+              </p>
+              <CreateTaskDialog
+                agents={agents}
+                projects={projects}
+                onCreated={fetchTasks}
+              />
+            </div>
+          ) : displayTasks.length === 0 && filters.search ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <IconChecklist size={48} className="text-muted-foreground/30 mb-4" />
+              <h3 className="text-lg font-medium mb-1">No tasks match &ldquo;{filters.search}&rdquo;</h3>
+              <p className="text-sm text-muted-foreground">
+                Try searching by task number (e.g. #720) or a word in the title.
+              </p>
+            </div>
+          ) : view === 'kanban' ? (
+            <KanbanBoard
+              tasks={displayTasks}
+              completedTodayTasks={completedToday}
+              onTaskClick={handleTaskClick}
+            />
+          ) : (
+            <TaskListTable tasks={displayTasks} onTaskClick={handleTaskClick} />
+          )}
+        </TabsContent>
 
-      {/* Content */}
-      {tasks.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-center">
-          <IconChecklist size={48} className="text-muted-foreground/30 mb-4" />
-          <h3 className="text-lg font-medium mb-1">No tasks yet</h3>
-          <p className="text-sm text-muted-foreground mb-4 max-w-sm">
-            Create your first task to start tracking work across your agents.
-          </p>
-          <CreateTaskDialog
-            agents={agents}
-            projects={projects}
-            onCreated={fetchTasks}
-          />
-        </div>
-      ) : view === 'kanban' ? (
-        <KanbanBoard
-          tasks={displayTasks}
-          completedTodayTasks={completedToday}
-          onTaskClick={handleTaskClick}
-        />
-      ) : (
-        <TaskListTable tasks={displayTasks} onTaskClick={handleTaskClick} />
-      )}
+        {/* Recurring tasks tab */}
+        <TabsContent value="recurring" className="mt-0">
+          <RecurringTasksTab />
+        </TabsContent>
+      </Tabs>
 
       {/* Task detail sheet */}
       <TaskDetailSheet
