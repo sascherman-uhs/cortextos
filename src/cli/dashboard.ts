@@ -80,6 +80,12 @@ export const dashboardCommand = new Command('dashboard')
 
     const adminUsername = process.env.ADMIN_USERNAME || dashCreds['ADMIN_USERNAME'] || 'admin';
 
+    // AUTH_URL: env > dashboard.env — must be persisted to avoid CSRF cookie domain mismatch
+    // when accessing from different hostnames (localhost vs Tailscale IP).
+    // MOD #4 (2026-05-23): without this, NextAuth stamps CSRF cookies with the request Host
+    // header, causing MissingCSRF errors when switching between access methods.
+    const authUrl = process.env.AUTH_URL || dashCreds['AUTH_URL'];
+
     // ─── Install dashboard deps ───────────────────────────────────────────────
 
     if (options.install || !existsSync(join(dashboardDir, 'node_modules'))) {
@@ -120,6 +126,7 @@ export const dashboardCommand = new Command('dashboard')
       `CTX_FRAMEWORK_ROOT=${process.cwd()}`,
       `CTX_INSTANCE_ID=${options.instance}`,
       `PORT=${options.port}`,
+      ...(authUrl ? [`AUTH_URL=${authUrl}`] : []),
     ];
     writeFileSync(nextEnvPath, nextEnvLines.join('\n') + '\n', 'utf-8');
     try { chmodSync(nextEnvPath, 0o600); } catch { /* ignore on Windows */ }
@@ -136,6 +143,7 @@ export const dashboardCommand = new Command('dashboard')
       CTX_FRAMEWORK_ROOT: process.cwd(),
       CTX_INSTANCE_ID: options.instance,
       AUTH_TRUST_HOST: process.env.AUTH_TRUST_HOST || 'true',
+      ...(authUrl ? { AUTH_URL: authUrl } : {}),
     };
 
     const startMode = options.build ? 'start' : 'dev';

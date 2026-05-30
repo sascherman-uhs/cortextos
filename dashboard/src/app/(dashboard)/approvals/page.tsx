@@ -19,6 +19,8 @@ export default function ApprovalsPage() {
   const [resolved, setResolved] = useState<Approval[]>([]);
   const [humanTasks, setHumanTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
+  const [completingTaskId, setCompletingTaskId] = useState<string | null>(null);
+  const [taskError, setTaskError] = useState<string | null>(null);
 
   const [selectedApproval, setSelectedApproval] = useState<Approval | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -53,7 +55,7 @@ export default function ApprovalsPage() {
       }
       if (humanRes.ok) {
         const allHuman: Task[] = await humanRes.json();
-        setHumanTasks(allHuman.filter(t => t.status !== 'completed'));
+        setHumanTasks(allHuman.filter(t => t.status === 'pending' || t.status === 'in_progress'));
       }
     } catch {
       // Silently fail
@@ -144,6 +146,11 @@ export default function ApprovalsPage() {
 
         {/* Human Tasks tab */}
         <TabsContent value="human">
+          {taskError && (
+            <div className="mb-3 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive max-w-2xl">
+              {taskError}
+            </div>
+          )}
           {humanTasks.length === 0 ? (
             <p className="py-12 text-center text-sm text-muted-foreground">
               No tasks assigned to you right now.
@@ -169,17 +176,31 @@ export default function ApprovalsPage() {
                       size="sm"
                       variant="outline"
                       className="ml-3 shrink-0"
+                      disabled={completingTaskId === task.id}
                       onClick={async () => {
-                        await fetch(`/api/tasks/${task.id}`, {
-                          method: 'PATCH',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ status: 'completed' }),
-                        });
-                        fetchApprovals();
+                        setCompletingTaskId(task.id);
+                        setTaskError(null);
+                        try {
+                          const res = await fetch(`/api/tasks/${task.id}`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ status: 'completed' }),
+                          });
+                          if (!res.ok) {
+                            const data = await res.json().catch(() => ({}));
+                            setTaskError(data.error || `Failed to complete task ${task.id}`);
+                          } else {
+                            fetchApprovals();
+                          }
+                        } catch {
+                          setTaskError('Network error completing task');
+                        } finally {
+                          setCompletingTaskId(null);
+                        }
                       }}
                     >
                       <IconCheck size={14} className="mr-1" />
-                      Done
+                      {completingTaskId === task.id ? '…' : 'Done'}
                     </Button>
                   </CardContent>
                 </Card>
