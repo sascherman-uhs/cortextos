@@ -150,6 +150,47 @@ export async function DELETE(
     return Response.json({ error: 'Task not found' }, { status: 404 });
   }
 
+  // Supabase-sourced tasks live only in SQLite — no JSON file on disk.
+  if (id.startsWith('supa_')) {
+    const supabaseId = id.slice(5);
+    const supaUrl = process.env.SUPABASE_URL;
+    const supaKey = process.env.SUPABASE_KEY;
+
+    if (!supaUrl || !supaKey) {
+      return Response.json(
+        { error: 'SUPABASE_URL / SUPABASE_KEY not configured in .env.local' },
+        { status: 500 },
+      );
+    }
+
+    try {
+      const sbRes = await fetch(
+        `${supaUrl}/rest/v1/tasks?id=eq.${supabaseId}`,
+        {
+          method: 'DELETE',
+          headers: {
+            apikey: supaKey,
+            Authorization: `Bearer ${supaKey}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+        },
+      );
+
+      if (!sbRes.ok) {
+        const errText = await sbRes.text();
+        throw new Error(`Supabase DELETE failed ${sbRes.status}: ${errText}`);
+      }
+
+      db.prepare(`DELETE FROM tasks WHERE id = ?`).run(id);
+      return Response.json({ success: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[api/tasks/[id]] supa_ DELETE error:', message);
+      return Response.json({ error: `Failed to delete task: ${message}` }, { status: 500 });
+    }
+  }
+
   // Delete the task file directly
   const fs = await import('fs/promises');
   const path = await import('path');

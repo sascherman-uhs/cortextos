@@ -23,7 +23,6 @@ const DEFAULT_FILTERS = {
   priority: 'all',
   project: 'all',
   status: 'all',
-  search: '', // UHS MOD #7
 };
 
 export default function TasksPage() {
@@ -35,6 +34,9 @@ export default function TasksPage() {
   const [loading, setLoading] = useState(true);
 
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  // UHS MOD #7 — search is client-side only; isolated from filters so typing
+  // never re-creates fetchTasks or triggers setLoading (no API round-trip).
+  const [searchQuery, setSearchQuery] = useState('');
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
 
@@ -91,6 +93,7 @@ export default function TasksPage() {
 
   function handleClearFilters() {
     setFilters(DEFAULT_FILTERS);
+    setSearchQuery('');
   }
 
   function handleTaskClick(task: Task) {
@@ -145,7 +148,7 @@ export default function TasksPage() {
   const displayTasks = (view === 'kanban'
     ? tasks.filter((t) => t.status !== 'completed')
     : tasks
-  ).filter((t) => matchesSearch(t, filters.search));
+  ).filter((t) => matchesSearch(t, searchQuery));
 
   if (loading) {
     return (
@@ -217,6 +220,8 @@ export default function TasksPage() {
             agents={agents}
             projects={projects}
             filters={filters}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
             onChange={handleFilterChange}
             onClearAll={handleClearFilters}
           />
@@ -235,10 +240,10 @@ export default function TasksPage() {
                 onCreated={fetchTasks}
               />
             </div>
-          ) : displayTasks.length === 0 && filters.search ? (
+          ) : displayTasks.length === 0 && searchQuery ? (
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <IconChecklist size={48} className="text-muted-foreground/30 mb-4" />
-              <h3 className="text-lg font-medium mb-1">No tasks match &ldquo;{filters.search}&rdquo;</h3>
+              <h3 className="text-lg font-medium mb-1">No tasks match &ldquo;{searchQuery}&rdquo;</h3>
               <p className="text-sm text-muted-foreground">
                 Try searching by task number (e.g. #720) or a word in the title.
               </p>

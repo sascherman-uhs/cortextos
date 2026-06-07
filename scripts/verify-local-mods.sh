@@ -161,6 +161,10 @@ check ".env.local has SUPABASE_KEY" \
   "$DASHBOARD_ROOT/.env.local" \
   "SUPABASE_KEY="
 
+check "route.ts has supa_ fast-path for DELETE (Jun 1 fix)" \
+  "$DASHBOARD_ROOT/src/app/api/tasks/[id]/route.ts" \
+  "supa_ DELETE error"
+
 echo ""
 
 # ─── MOD #7: Task numbers, search, recurring tab ─────────────────────────────
@@ -189,9 +193,13 @@ check "task-list-table.tsx imports getTaskNumber" \
   "$DASHBOARD_ROOT/src/components/tasks/task-list-table.tsx" \
   "from '@/components/uhs/task-number-badge'"
 
-check "task-filters.tsx has search field" \
+check "task-filters.tsx has onSearchChange prop (search isolated from filters)" \
   "$DASHBOARD_ROOT/src/components/tasks/task-filters.tsx" \
-  "search: string"
+  "onSearchChange"
+
+check "task-filters.tsx search fires on Enter/click (not keypress)" \
+  "$DASHBOARD_ROOT/src/components/tasks/task-filters.tsx" \
+  "commitSearch"
 
 check "task-detail-sheet.tsx imports RecurringPanel" \
   "$DASHBOARD_ROOT/src/components/tasks/task-detail-sheet.tsx" \
@@ -205,9 +213,9 @@ check "tasks/page.tsx has Tabs structure" \
   "$DASHBOARD_ROOT/src/app/(dashboard)/tasks/page.tsx" \
   "TabsContent.*recurring"
 
-check "tasks/page.tsx DEFAULT_FILTERS includes search" \
+check "tasks/page.tsx has isolated searchQuery state (not inside filters)" \
   "$DASHBOARD_ROOT/src/app/(dashboard)/tasks/page.tsx" \
-  "search: ''"
+  "searchQuery, setSearchQuery"
 
 check "api/tasks/[id]/route.ts enriches with recurring info" \
   "$DASHBOARD_ROOT/src/app/api/tasks/[id]/route.ts" \
@@ -228,6 +236,27 @@ check "approvals/page.tsx imports TaskNumberBadge" \
 check "task-list-table.tsx has task_num sort field" \
   "$DASHBOARD_ROOT/src/components/tasks/task-list-table.tsx" \
   "task_num"
+
+echo ""
+
+# ─── MOD #8: Delete/Archive recurring tasks from UI ──────────────────────────
+echo "── MOD #8: Recurring task delete — trash button + inline confirm + DELETE API"
+
+check "recurring-tasks-tab.tsx imports IconTrash" \
+  "$DASHBOARD_ROOT/src/components/uhs/recurring-tasks-tab.tsx" \
+  "IconTrash"
+
+check "recurring-tasks-tab.tsx has deleteState" \
+  "$DASHBOARD_ROOT/src/components/uhs/recurring-tasks-tab.tsx" \
+  "deleteState"
+
+check "recurring-tasks route.ts has DELETE handler" \
+  "$DASHBOARD_ROOT/src/app/api/uhs/recurring-tasks/route.ts" \
+  "export async function DELETE"
+
+check "recurring-tasks-tab.tsx shows RT-N badge" \
+  "$DASHBOARD_ROOT/src/components/uhs/recurring-tasks-tab.tsx" \
+  "RT-{task.id}"
 
 echo ""
 

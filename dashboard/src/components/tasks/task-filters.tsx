@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef, useState } from 'react';
 import { FilterBar } from '@/components/shared';
 import type { FilterConfig } from '@/components/shared';
 // UHS MOD #7 — search input for task number / title
@@ -15,8 +16,13 @@ interface TaskFiltersProps {
     priority: string;
     project: string;
     status: string;
-    search: string; // UHS MOD #7
   };
+  // UHS MOD #7 — search is client-side only, passed separately so it never
+  // ends up in fetchTasks dependencies and never triggers an API round-trip.
+  // Filtering only fires on Enter or search-button click, never on keypress,
+  // so typing never triggers a parent re-render or kanban board re-paint.
+  searchQuery: string;
+  onSearchChange: (value: string) => void;
   onChange: (key: string, value: string) => void;
   onClearAll: () => void;
 }
@@ -26,9 +32,37 @@ export function TaskFilters({
   agents,
   projects,
   filters,
+  searchQuery,
+  onSearchChange,
   onChange,
   onClearAll,
 }: TaskFiltersProps) {
+  // inputValue is purely local — never pushed to parent until the user
+  // submits (Enter key or search button). This means zero re-renders
+  // of the parent/kanban while the user is typing.
+  const [inputValue, setInputValue] = useState(searchQuery);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Sync when parent clears the search externally (e.g. Clear All)
+  useEffect(() => {
+    if (searchQuery === '') setInputValue('');
+  }, [searchQuery]);
+
+  function commitSearch(value: string) {
+    onSearchChange(value.trim());
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') commitSearch(inputValue);
+    if (e.key === 'Escape') handleSearchClear();
+  }
+
+  function handleSearchClear() {
+    setInputValue('');
+    onSearchChange('');
+    inputRef.current?.focus();
+  }
+
   const filterConfigs: FilterConfig[] = [
     {
       key: 'org',
@@ -93,20 +127,31 @@ export function TaskFilters({
 
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-      {/* UHS MOD #7: search by task number or title */}
+      {/* UHS MOD #7: search by task number or title — fires on Enter or click */}
       <div className="relative flex-1 max-w-xs">
-        <IconSearch size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+        <button
+          onClick={() => commitSearch(inputValue)}
+          className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          tabIndex={-1}
+          aria-label="Search"
+        >
+          <IconSearch size={13} />
+        </button>
         <input
+          ref={inputRef}
           type="text"
-          value={filters.search}
-          onChange={(e) => onChange('search', e.target.value)}
-          placeholder="Search by #number or title…"
+          value={inputValue}
+          onChange={(e) => setInputValue(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Search… (Enter to filter)"
           className="h-9 w-full rounded-md border border-input bg-background pl-8 pr-8 text-sm shadow-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
         />
-        {filters.search && (
+        {inputValue && (
           <button
-            onClick={() => onChange('search', '')}
+            onClick={handleSearchClear}
             className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            tabIndex={-1}
+            aria-label="Clear search"
           >
             <IconX size={13} />
           </button>
