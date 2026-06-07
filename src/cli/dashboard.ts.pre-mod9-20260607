@@ -86,14 +86,6 @@ export const dashboardCommand = new Command('dashboard')
     // header, causing MissingCSRF errors when switching between access methods.
     const authUrl = process.env.AUTH_URL || dashCreds['AUTH_URL'];
 
-    // SUPABASE_URL / SUPABASE_KEY: env > dashboard.env — must be persisted so the
-    // supa_ task fast-path (dashboard/src/app/api/tasks/[id]/route.ts) can reach the
-    // JARVIS Supabase project. MOD #9 (2026-06-07): without this, every dashboard
-    // restart regenerates .env.local from dashCreds and DROPS these manually-added
-    // keys, breaking supa_ task reads/PATCH/DELETE. Mirrors the MOD #4 AUTH_URL pattern.
-    const supaUrl = process.env.SUPABASE_URL || dashCreds['SUPABASE_URL'];
-    const supaKey = process.env.SUPABASE_KEY || dashCreds['SUPABASE_KEY'];
-
     // ─── Install dashboard deps ───────────────────────────────────────────────
 
     if (options.install || !existsSync(join(dashboardDir, 'node_modules'))) {
@@ -135,8 +127,6 @@ export const dashboardCommand = new Command('dashboard')
       `CTX_INSTANCE_ID=${options.instance}`,
       `PORT=${options.port}`,
       ...(authUrl ? [`AUTH_URL=${authUrl}`] : []),
-      ...(supaUrl ? [`SUPABASE_URL=${supaUrl}`] : []),
-      ...(supaKey ? [`SUPABASE_KEY=${supaKey}`] : []),
     ];
     writeFileSync(nextEnvPath, nextEnvLines.join('\n') + '\n', 'utf-8');
     try { chmodSync(nextEnvPath, 0o600); } catch { /* ignore on Windows */ }
@@ -154,8 +144,6 @@ export const dashboardCommand = new Command('dashboard')
       CTX_INSTANCE_ID: options.instance,
       AUTH_TRUST_HOST: process.env.AUTH_TRUST_HOST || 'true',
       ...(authUrl ? { AUTH_URL: authUrl } : {}),
-      ...(supaUrl ? { SUPABASE_URL: supaUrl } : {}),
-      ...(supaKey ? { SUPABASE_KEY: supaKey } : {}),
     };
 
     const startMode = options.build ? 'start' : 'dev';

@@ -260,6 +260,31 @@ check "recurring-tasks-tab.tsx shows RT-N badge" \
 
 echo ""
 
+# ─── MOD #9: SUPABASE_URL/KEY persistence through .env.local regen ────────────
+echo "── MOD #9: SUPABASE keys persist in dashboard.ts (stop .env.local clobber)"
+
+check "dashboard.ts reads SUPABASE_URL" \
+  "$CORTEXTOS_ROOT/src/cli/dashboard.ts" \
+  "const supaUrl = process.env.SUPABASE_URL"
+
+check "dashboard.ts reads SUPABASE_KEY" \
+  "$CORTEXTOS_ROOT/src/cli/dashboard.ts" \
+  "const supaKey = process.env.SUPABASE_KEY"
+
+check "dashboard.ts writes SUPABASE_URL into nextEnvLines" \
+  "$CORTEXTOS_ROOT/src/cli/dashboard.ts" \
+  "SUPABASE_URL="
+
+check "dashboard.env has SUPABASE_URL" \
+  "$HOME/.cortextos/default/dashboard.env" \
+  "SUPABASE_URL="
+
+check "dashboard.env has SUPABASE_KEY" \
+  "$HOME/.cortextos/default/dashboard.env" \
+  "SUPABASE_KEY="
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then
