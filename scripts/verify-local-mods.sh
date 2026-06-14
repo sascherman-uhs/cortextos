@@ -285,6 +285,19 @@ check "dashboard.env has SUPABASE_KEY" \
 
 echo ""
 
+# ─── MOD #10: Trillion report callback bridge ───────────────────────────────
+echo "── MOD #10: Trillion report callback bridge"
+
+check "fast-checker routes Trillion report callbacks" \
+  "$CORTEXTOS_ROOT/src/daemon/fast-checker.ts" \
+  "trillion_(fix|skip|run)"
+
+check "fast-checker converts Trillion callback to yes fix command" \
+  "$CORTEXTOS_ROOT/src/daemon/fast-checker.ts" \
+  "Trillion report callback routed as command"
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then

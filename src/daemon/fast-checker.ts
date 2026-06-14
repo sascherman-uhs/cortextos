@@ -812,6 +812,41 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
+    // [UHS MOD #10] Trillion report buttons are action shortcuts, not browser
+    // links. Convert the native Telegram callback payload into the same plain
+    // command Scott used before buttons existed, then inject it through the
+    // normal Telegram message path so existing approval handling still applies.
+    const trillionMatch = data.match(/^trillion_(fix|skip|run)_(\d+)$/);
+    if (trillionMatch && chatId && this.agent) {
+      const [, action, id] = trillionMatch;
+      const command = action === 'fix'
+        ? `yes fix ${id}`
+        : action === 'run'
+          ? `yes run ${id}`
+          : `skip ${id}`;
+      const senderName = sanitizeForPtyInjection(query.from?.first_name || 'User');
+      const safeCommand = sanitizeForPtyInjection(command);
+      const msg = [
+        `=== TELEGRAM from [USER: ${senderName}] (chat_id:${chatId}) ===`,
+        safeCommand,
+        `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
+      ].join('\n');
+      const injected = this.agent.injectMessage(msg);
+      if (injected && this.telegramApi) {
+        try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Received'); } catch { /* ignore */ }
+      }
+      this.log(`Trillion report callback routed as command: ${command}`);
+      return;
+    }
+
+    if (data === 'trillion_report_more') {
+      if (this.telegramApi) {
+        try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Open the HTML report for the remaining items'); } catch { /* ignore */ }
+      }
+      this.log('Trillion report overflow callback acknowledged');
+      return;
+    }
+
     // Inject unhandled callbacks as a Telegram message so the agent can process custom button flows.
     // senderName (Telegram first_name) and callback_data are untrusted: sanitize both against
     // PTY-injection before interpolating, matching the text path (sanitizeForPtyInjection at the
