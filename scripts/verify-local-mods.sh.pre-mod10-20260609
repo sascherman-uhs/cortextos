@@ -285,57 +285,6 @@ check "dashboard.env has SUPABASE_KEY" \
 
 echo ""
 
-# ─── MOD #10: Trillion report callback bridge ───────────────────────────────
-echo "── MOD #10: Trillion report callback bridge"
-
-check "fast-checker routes Trillion report callbacks" \
-  "$CORTEXTOS_ROOT/src/daemon/fast-checker.ts" \
-  "trillion_(fix|skip|run)"
-
-check "fast-checker converts Trillion callback to yes fix command" \
-  "$CORTEXTOS_ROOT/src/daemon/fast-checker.ts" \
-  "Trillion report callback routed as command"
-
-echo ""
-
-# ─── MOD #11: Drag-to-agent task routing (Task #889 / L6-01) ─────────────────
-echo "── MOD #11: Drag-to-agent task routing"
-
-if [[ -f "$DASHBOARD_ROOT/src/components/uhs/agent-routing-board.tsx" ]]; then
-  green "agent-routing-board.tsx exists"
-  ((PASS++))
-else
-  red "agent-routing-board.tsx MISSING (UHS MOD #11 routing board)"
-  ((FAIL++))
-fi
-
-check "kanban-board.tsx has renderCard prop (MOD #11)" \
-  "$DASHBOARD_ROOT/src/components/tasks/kanban-board.tsx" \
-  "renderCard"
-
-check "tasks page renders AgentRoutingBoard (MOD #11)" \
-  "$DASHBOARD_ROOT/src/app/(dashboard)/tasks/page.tsx" \
-  "AgentRoutingBoard"
-
-check "route.ts PUT has supa_ assignee branch (MOD #11)" \
-  "$DASHBOARD_ROOT/src/app/api/tasks/[id]/route.ts" \
-  "supa_ PUT error"
-
-
-# ─── MOD #12: hook-crash-alert transient vs quota rate-limit split ─────────
-echo "── MOD #12: hook-crash-alert transient vs quota rate-limit split"
-check "detectRateLimitInLog returns quota|transient|null (MOD #12)" \
-  "$CORTEXTOS_ROOT/src/hooks/hook-crash-alert.ts" \
-  "ALWAYS_SILENT_TYPES"
-check "rate-limited-transient is always silent (MOD #12)" \
-  "$CORTEXTOS_ROOT/src/hooks/hook-crash-alert.ts" \
-  "rate-limited-transient"
-check "quota exhaustion message says quota not rate limit (MOD #12)" \
-  "$CORTEXTOS_ROOT/src/hooks/hook-crash-alert.ts" \
-  "quota exhausted"
-
-echo ""
-
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then

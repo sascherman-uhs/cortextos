@@ -17,6 +17,11 @@ const allowedDevOrigins = (process.env.DASHBOARD_ALLOWED_DEV_ORIGINS ?? '')
   .filter(Boolean);
 
 const nextConfig: NextConfig = {
+  // Pin the workspace root to this directory. Without it, Turbopack infers the
+  // root from the nearest lockfile and picks the parent monorepo
+  // (~/cortextos/package-lock.json) instead of the dashboard, emitting a
+  // "multiple lockfiles" warning on every dev start.
+  turbopack: { root: __dirname },
   serverExternalPackages: ['better-sqlite3'],
   ...(allowedDevOrigins.length > 0 && { allowedDevOrigins }),
   async headers() {

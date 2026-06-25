@@ -12,6 +12,10 @@ import {
   IconAlertCircle,
   IconLoader2,
   IconChevronDown,
+  IconUpload,
+  IconCircleCheck,
+  IconLock,
+  IconWorld,
 } from '@tabler/icons-react';
 import { KnowledgeBaseView } from './kb-view';
 
@@ -48,6 +52,14 @@ function shortPath(sourcePath: string): string {
   return parts.slice(-2).join('/');
 }
 
+interface IngestResult {
+  filename: string;
+  classification: 'internal' | 'external';
+  chunksAdded: number;
+  success: boolean;
+  error?: string;
+}
+
 export function KnowledgeBaseClient({ org, markdownContent, filePath }: KnowledgeBaseClientProps) {
   const [query, setQuery] = useState('');
   const [selectedCollection, setSelectedCollection] = useState('all');
@@ -59,6 +71,13 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
   const [collectionsLoading, setCollectionsLoading] = useState(true);
   const [totalDocs, setTotalDocs] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Ingest tab state
+  const [dragOver, setDragOver] = useState(false);
+  const [ingestClassification, setIngestClassification] = useState<'internal' | 'external'>('internal');
+  const [ingesting, setIngesting] = useState(false);
+  const [ingestResults, setIngestResults] = useState<IngestResult[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!org) { setCollectionsLoading(false); return; }
@@ -133,6 +152,33 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
     );
   };
 
+  const handleIngestFiles = async (files: File[]) => {
+    if (!files.length) return;
+    setIngesting(true);
+    const newResults: IngestResult[] = [];
+    for (const file of files) {
+      const form = new FormData();
+      form.append('file', file);
+      form.append('classification', ingestClassification);
+      form.append('collection', 'uhs');
+      try {
+        const res = await fetch('/api/kb/ingest', { method: 'POST', body: form });
+        const data = await res.json();
+        newResults.push({
+          filename: file.name,
+          classification: ingestClassification,
+          chunksAdded: data.chunksAdded ?? 0,
+          success: data.success ?? false,
+          error: data.error,
+        });
+      } catch {
+        newResults.push({ filename: file.name, classification: ingestClassification, chunksAdded: 0, success: false, error: 'Network error' });
+      }
+    }
+    setIngestResults((prev) => [...newResults, ...prev]);
+    setIngesting(false);
+  };
+
   return (
     <Tabs defaultValue="search">
       <TabsList variant="line">
@@ -152,6 +198,10 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
               {collections.length}
             </span>
           )}
+        </TabsTrigger>
+        <TabsTrigger value="ingest">
+          <IconUpload size={14} className="mr-1.5" />
+          Ingest
         </TabsTrigger>
       </TabsList>
 
@@ -369,6 +419,125 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
               </code>
             </CardContent>
           </Card>
+        )}
+      </TabsContent>
+      {/* Ingest Tab */}
+      <TabsContent value="ingest" className="mt-3 space-y-4">
+        {/* Classification toggle */}
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-medium">Document type:</span>
+          <div className="flex rounded-md border overflow-hidden">
+            <button
+              onClick={() => setIngestClassification('internal')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm transition-colors ${
+                ingestClassification === 'internal'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-background hover:bg-muted'
+              }`}
+            >
+              <IconLock size={13} />
+              Internal
+            </button>
+            <button
+              onClick={() => setIngestClassification('external')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm transition-colors ${
+                ingestClassification === 'external'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-background hover:bg-muted'
+              }`}
+            >
+              <IconWorld size={13} />
+              External
+            </button>
+          </div>
+          <span className="text-[11px] text-muted-foreground">
+            {ingestClassification === 'internal'
+              ? 'Internal docs (HR, AR, contracts) — never shared externally'
+              : 'External docs (market research, competitor, public content)'}
+          </span>
+        </div>
+
+        {/* Drop zone */}
+        <div
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            const files = Array.from(e.dataTransfer.files);
+            handleIngestFiles(files);
+          }}
+          onClick={() => fileInputRef.current?.click()}
+          className={`relative flex flex-col items-center justify-center gap-3 rounded-lg border-2 border-dashed p-10 text-center cursor-pointer transition-colors ${
+            dragOver
+              ? 'border-primary bg-primary/5'
+              : 'border-border hover:border-primary/50 hover:bg-muted/20'
+          }`}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg,.pptx,.xlsx,.mp4,.mp3,.wav"
+            onChange={(e) => {
+              const files = Array.from(e.target.files || []);
+              handleIngestFiles(files);
+              e.target.value = '';
+            }}
+          />
+          {ingesting ? (
+            <IconLoader2 size={28} className="text-primary animate-spin" />
+          ) : (
+            <div className="rounded-full bg-muted p-3">
+              <IconUpload size={22} className="text-muted-foreground/70" />
+            </div>
+          )}
+          <div>
+            <p className="text-sm font-medium">
+              {ingesting ? 'Ingesting...' : 'Drop files here or click to browse'}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              PDF, Word, Markdown, Images, PowerPoint, Audio, Video
+            </p>
+          </div>
+          {ingestClassification === 'internal' && (
+            <div className="flex items-center gap-1 text-[11px] text-amber-600 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+              <IconLock size={11} />
+              Will be saved to vault/inbox/internal — not shareable externally
+            </div>
+          )}
+        </div>
+
+        {/* Results */}
+        {ingestResults.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Ingestion log</p>
+            {ingestResults.map((r, i) => (
+              <Card key={i} className={r.success ? '' : 'border-destructive/30'}>
+                <CardContent className="py-2.5 flex items-center gap-3">
+                  {r.success
+                    ? <IconCircleCheck size={16} className="text-green-500 shrink-0" />
+                    : <IconAlertCircle size={16} className="text-destructive shrink-0" />}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{r.filename}</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      {r.success
+                        ? `${r.chunksAdded} chunk${r.chunksAdded !== 1 ? 's' : ''} added to knowledge base`
+                        : r.error}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Badge variant={r.classification === 'internal' ? 'secondary' : 'outline'} className="text-[10px]">
+                      {r.classification === 'internal'
+                        ? <><IconLock size={9} className="mr-0.5" />Internal</>
+                        : <><IconWorld size={9} className="mr-0.5" />External</>}
+                    </Badge>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
         )}
       </TabsContent>
     </Tabs>

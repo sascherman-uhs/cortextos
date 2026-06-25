@@ -5,6 +5,7 @@ import { useOrg } from '@/hooks/use-org';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { IconLayoutKanban, IconList, IconChecklist, IconRepeat } from '@tabler/icons-react';
+import { KanbanBoard } from '@/components/tasks/kanban-board';
 import { TaskListTable } from '@/components/tasks/task-list-table';
 import { TaskDetailSheet } from '@/components/tasks/task-detail-sheet';
 import { CreateTaskDialog } from '@/components/tasks/create-task-dialog';
@@ -12,8 +13,6 @@ import { TaskFilters } from '@/components/tasks/task-filters';
 // UHS MOD #7 — recurring tasks tab (components/uhs/ never overwritten by upstream)
 import { RecurringTasksTab } from '@/components/uhs/recurring-tasks-tab';
 import { getTaskNumber } from '@/components/uhs/task-number-badge';
-// UHS MOD #11 — drag-to-agent routing board (Task #889 / L6-01)
-import { AgentRoutingBoard } from '@/components/uhs/agent-routing-board';
 import type { Task, TaskStatus } from '@/lib/types';
 
 type ViewMode = 'kanban' | 'list';
@@ -250,13 +249,10 @@ export default function TasksPage() {
               </p>
             </div>
           ) : view === 'kanban' ? (
-            // UHS MOD #11 — routing board adds the drag-to-agent rail on top of
-            // the standard kanban; falls back to plain board behavior visually.
-            <AgentRoutingBoard
+            <KanbanBoard
               tasks={displayTasks}
               completedTodayTasks={completedToday}
               onTaskClick={handleTaskClick}
-              onRouted={fetchTasks}
             />
           ) : (
             <TaskListTable tasks={displayTasks} onTaskClick={handleTaskClick} />

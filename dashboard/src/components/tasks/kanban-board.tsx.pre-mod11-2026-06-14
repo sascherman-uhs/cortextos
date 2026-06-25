@@ -1,6 +1,5 @@
 'use client';
 
-import type { ReactNode } from 'react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { StatusBadge } from '@/components/shared';
 import { TaskCard } from './task-card';
@@ -16,12 +15,9 @@ interface KanbanBoardProps {
   tasks: Task[];
   completedTodayTasks: Task[];
   onTaskClick: (task: Task) => void;
-  // UHS MOD #11 — optional card renderer so the drag-to-agent routing board can
-  // inject draggable cards. Defaults to the standard TaskCard (upstream behavior).
-  renderCard?: (task: Task) => ReactNode;
 }
 
-export function KanbanBoard({ tasks, completedTodayTasks, onTaskClick, renderCard }: KanbanBoardProps) {
+export function KanbanBoard({ tasks, completedTodayTasks, onTaskClick }: KanbanBoardProps) {
   const columns: KanbanColumn[] = [
     {
       status: 'pending',
@@ -64,18 +60,13 @@ export function KanbanBoard({ tasks, completedTodayTasks, onTaskClick, renderCar
                   No tasks
                 </p>
               ) : (
-                col.tasks.map((task) =>
-                  // UHS MOD #11 — use injected renderer when provided
-                  renderCard ? (
-                    <div key={task.id}>{renderCard(task)}</div>
-                  ) : (
-                    <TaskCard
-                      key={task.id}
-                      task={task}
-                      onClick={onTaskClick}
-                    />
-                  ),
-                )
+                col.tasks.map((task) => (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    onClick={onTaskClick}
+                  />
+                ))
               )}
             </div>
           </ScrollArea>

@@ -15,15 +15,9 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execFileSync } from 'child_process';
 
 const ANTHROPIC_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CLAUDE_CREDS = path.join(os.homedir(), '.claude', '.credentials.json');
-// On macOS, Claude Code stores its OAuth credentials in the login Keychain
-// (service "Claude Code-credentials"), NOT in ~/.claude/.credentials.json
-// (that file path only exists on Linux/headless installs). Read it live so we
-// always pick up the rotated access token rather than freezing a stale one.
-const KEYCHAIN_SERVICE = 'Claude Code-credentials';
 
 const CACHE_DIR = path.join(
   process.env.CTX_ROOT ?? path.join(os.homedir(), '.cortextos', 'default'),
@@ -36,7 +30,7 @@ export interface QuotaSnapshot {
   five_hour_remaining_pct: number;
   seven_day_remaining_pct: number;
   fetched_at: string;
-  source: 'env' | 'credentials.json' | 'accounts.json' | 'keychain';
+  source: 'env' | 'credentials.json' | 'accounts.json';
 }
 
 export interface QuotaResponse extends QuotaSnapshot {
@@ -58,21 +52,6 @@ function getOAuthToken(): { token: string; source: QuotaSnapshot['source'] } | n
       if (token) return { token, source: 'credentials.json' };
     } catch {
       /* fall through */
-    }
-  }
-  // macOS Keychain fallback (the actual credential store on this Mac).
-  if (process.platform === 'darwin') {
-    try {
-      const raw = execFileSync(
-        'security',
-        ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-w'],
-        { encoding: 'utf-8', timeout: 5000 },
-      );
-      const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: string } };
-      const token = parsed.claudeAiOauth?.accessToken;
-      if (token) return { token, source: 'keychain' };
-    } catch {
-      /* no keychain item / not unlocked — fall through */
     }
   }
   return null;

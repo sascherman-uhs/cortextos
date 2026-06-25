@@ -34,6 +34,14 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'user-disable',
   'user-stop',
   'rate-limited',
+  'rate-limited-transient',
+]);
+
+// End types that are always silent — never send to Telegram regardless of hour.
+// Transient per-minute rate limits auto-resolve in seconds; alerting on them
+// was the source of false "out of tokens" alarms that misled the operator.
+const ALWAYS_SILENT_TYPES = new Set([
+  'rate-limited-transient',
 ]);
 
 function isQuietHoursLA(now: Date): boolean {
@@ -49,32 +57,43 @@ function isQuietHoursLA(now: Date): boolean {
 }
 
 /**
- * Scan the tail of stdout.log for Anthropic rate-limit or weekly-limit
- * signatures. Mirrors OutputBuffer.hasRateLimitSignature so the hook and the
- * daemon use the same detection logic.
+ * Scan the tail of stdout.log for true quota-exhaustion signatures.
+ * These are weekly/5h limits that require waiting for the window to reset.
+ * Returns 'quota' for account-level exhaustion, 'transient' for per-minute
+ * rate limits that auto-resolve in seconds, or null if nothing detected.
  */
-function detectRateLimitInLog(logPath: string): boolean {
+function detectRateLimitInLog(logPath: string): 'quota' | 'transient' | null {
   try {
     const size = statSync(logPath).size;
     const readBytes = Math.min(size, 200 * 1024); // last 200 KB
     const fd = readFileSync(logPath);
     const slice = fd.slice(Math.max(0, fd.length - readBytes)).toString('utf-8');
     const text = slice.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').toLowerCase();
-    return (
+    // True quota exhaustion — account-level, requires waiting for reset window
+    if (
+      text.includes('weekly limit') ||
+      text.includes('5-hour limit') ||
+      text.includes('5h limit') ||
+      text.includes('quota exceeded') ||
+      text.includes('usage limit') ||
+      /used \d+% of your/.test(text)
+    ) {
+      return 'quota';
+    }
+    // Transient per-minute/per-second rate limits — auto-resolve in seconds,
+    // no user action needed, should not alarm Scott
+    if (
       text.includes('overloaded_error') ||
       text.includes('rate_limit_error') ||
       text.includes('rate limit') ||
       text.includes('rate-limit') ||
-      text.includes('too many requests') ||
-      text.includes('quota exceeded') ||
-      text.includes('usage limit') ||
-      text.includes('weekly limit') ||
-      text.includes('5-hour limit') ||
-      text.includes('5h limit') ||
-      /used \d+% of your/.test(text)
-    );
+      text.includes('too many requests')
+    ) {
+      return 'transient';
+    }
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -300,13 +319,20 @@ async function main(): Promise<void> {
   let reason = classified.reason;
 
   // If no marker matched but the stdout tail shows a rate-limit signature,
-  // reclassify as rate-limited. Prevents the 30-minute 🚨 CRASH buzz storm
-  // when the weekly limit is exhausted.
+  // reclassify to prevent the 30-minute 🚨 CRASH buzz storm.
+  // 'quota' = account-level weekly/5h limit exhausted (warn Scott).
+  // 'transient' = per-minute API rate limit, auto-resolves, no alert needed.
   if (endType === 'crash') {
     const stdoutPath = join(logDir, 'stdout.log');
-    if (existsSync(stdoutPath) && detectRateLimitInLog(stdoutPath)) {
-      endType = 'rate-limited';
-      reason = 'anthropic rate limit detected in stdout.log';
+    if (existsSync(stdoutPath)) {
+      const rlType = detectRateLimitInLog(stdoutPath);
+      if (rlType === 'quota') {
+        endType = 'rate-limited';
+        reason = 'account quota exhausted (weekly or 5h limit)';
+      } else if (rlType === 'transient') {
+        endType = 'rate-limited-transient';
+        reason = 'transient per-minute rate limit (auto-resolves)';
+      }
     }
   }
 
@@ -355,6 +381,9 @@ async function main(): Promise<void> {
   } catch { /* ignore */ }
 
   // Decide whether to actually send to Telegram.
+  if (ALWAYS_SILENT_TYPES.has(endType)) {
+    return; // logged to crashes.log above; never Telegram-alerted
+  }
   const now = new Date();
   const quiet = isQuietHoursLA(now);
   if (quiet && QUIET_SUPPRESSED_TYPES.has(endType)) {
@@ -425,8 +454,9 @@ async function main(): Promise<void> {
       if (reason) message += `\nCrash time: ${reason}`;
       break;
     case 'rate-limited':
-      message = `⏳ ${agentName} paused — Anthropic rate limit hit. Will resume when the window resets.`;
+      message = `⏳ ${agentName} paused — weekly/5h quota exhausted. Will resume when the reset window opens.`;
       break;
+    // rate-limited-transient is in ALWAYS_SILENT_TYPES — never reaches here
     case 'crash':
       message = `🚨 CRASH: ${agentName} died unexpectedly.`;
       if (crashCount > 0) message += ` Crashes today: ${crashCount}.`;
