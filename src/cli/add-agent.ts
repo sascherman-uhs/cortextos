@@ -5,7 +5,7 @@ import { homedir } from 'os';
 import { OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
 
-const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server'] as const;
+const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server', 'kimi'] as const;
 type RuntimeKind = typeof VALID_RUNTIMES[number];
 
 // Templates that don't have a codex variant yet. Pairing any of these with
@@ -106,7 +106,8 @@ export const addAgentCommand = new Command('add-agent')
     // For codex-app-server, skills live under plugins/cortextos-agent-skills/skills
     // and are copied in by the template; .claude/skills is Claude-Code-only.
     const isCodexAppServer = options.runtime === 'codex-app-server';
-    if (!isCodexAppServer) {
+    const isKimi = options.runtime === 'kimi';
+    if (!isCodexAppServer && !isKimi) {
       mkdirSync(join(agentDir, '.claude', 'skills'), { recursive: true });
     }
 
@@ -115,6 +116,8 @@ export const addAgentCommand = new Command('add-agent')
     // --template choice is honored as-is so orchestrator/analyst/etc still work.
     const effectiveTemplate = (isCodexAppServer && options.template === 'agent')
       ? 'agent-codex'
+      : (isKimi && options.template === 'agent')
+        ? 'agent-kimi'
       : options.template;
 
     // Copy template files
