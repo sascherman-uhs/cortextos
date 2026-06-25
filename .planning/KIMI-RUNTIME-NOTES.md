@@ -8,6 +8,9 @@ Status: partial pass. Runtime wiring, template scaffolding, typecheck, and build
 - Actual branch: `feature/kimi-runtime`
 - Deviation: `git switch -c feat/kimi-runtime` failed with `fatal: cannot lock ref 'refs/heads/feat/kimi-runtime': unable to create directory for .git/refs/heads/feat/kimi-runtime`. A later `git branch -m feature/kimi-runtime feat/kimi-runtime` failed moving the reflog with `Operation not permitted`.
 - Commits made on `feature/kimi-runtime`:
+  - current HEAD: `feat(kimi): update runtime verification notes`
+  - `3711607 feat(kimi): verify build and smoke scaffolding`
+  - `6b898fc feat(kimi): document runtime verification notes`
   - `12f9b58 feat(kimi): add kimi to AgentConfig.runtime union`
   - `0168d6d feat(kimi): add KimiPTY print-mode adapter`
   - `602e28a feat(kimi): dispatch kimi runtime in agent-process`
