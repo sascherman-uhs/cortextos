@@ -5,6 +5,7 @@ import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
+import { KimiPTY } from '../pty/kimi-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
@@ -22,7 +23,7 @@ export class AgentProcess {
   readonly name: string;
   private env: CtxEnv;
   private config: AgentConfig;
-  private pty: AgentPTY | CodexAppServerPTY | null = null;
+  private pty: AgentPTY | CodexAppServerPTY | KimiPTY | null = null;
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private crashCount: number = 0;
   private maxCrashesPerDay: number = 10;
@@ -133,7 +134,9 @@ export class AgentProcess {
       ? new HermesPTY(this.env, this.config, logPath)
       : this.config.runtime === 'codex-app-server'
         ? new CodexAppServerPTY(this.env, this.config, logPath)
-        : new AgentPTY(this.env, this.config, logPath);
+        : this.config.runtime === 'kimi'
+          ? new KimiPTY(this.env, this.config, logPath)
+          : new AgentPTY(this.env, this.config, logPath);
 
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
@@ -229,14 +232,10 @@ export class AgentProcess {
           // so we use Ctrl+D which exits cleanly on the first press.
           pty.write('\x04'); // Ctrl+D
           await sleep(3000);
-        } else if (this.config.runtime === 'codex-app-server') {
-          // Codex uses an exec-per-turn model — there is no persistent REPL
-          // between turns, so /exit + sleep below are no-ops on CodexAppServerPTY
-          // (write() just buffers). The only meaningful stop step is
-          // pty.kill(), which terminates the in-flight `codex exec` (if any)
-          // and flips _alive=false. Skipping the 6s Claude-REPL dance makes
-          // `bus hard-restart` feel responsive instead of appearing to do
-          // nothing for several seconds.
+        } else if (this.config.runtime === 'codex-app-server' || this.config.runtime === 'kimi') {
+          // Codex and Kimi use non-REPL execution models, so /exit + sleep below
+          // are no-ops. The meaningful stop step is pty.kill(), which terminates
+          // any in-flight turn and flips the adapter's liveness state.
         } else {
           // BUG-032 fix: use CRLF (not lone CR) so Claude Code's REPL actually
           // recognizes the /exit line as a complete command, AND wait long
@@ -671,6 +670,12 @@ export class AgentProcess {
         'codex-app-server-thread.json',
       );
       return existsSync(threadStatePath);
+    }
+
+    // kimi: print-mode starts fresh on daemon boot. The adapter uses --continue
+    // for follow-up injected turns after a successful first invocation.
+    if (this.config.runtime === 'kimi') {
+      return false;
     }
 
     // Default (Claude runtime): existing conversation = JSONL files present.
