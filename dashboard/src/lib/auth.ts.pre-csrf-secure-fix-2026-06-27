@@ -15,36 +15,30 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   // X-Forwarded-Proto), but tunnel proxies may not forward Secure-prefixed
   // cookies reliably. The middleware checks for authjs.session-token, so this
   // must stay consistent.
-  //
-  // The Secure flag must follow the actual serving protocol, NOT NODE_ENV.
-  // `next start` forces NODE_ENV=production even when the dashboard is served
-  // over plain http://localhost; gating Secure on NODE_ENV then marked the
-  // csrf cookie Secure, so browsers dropped it on the http POST and Auth.js
-  // rejected the sign-in with MissingCSRF. Gate on AUTH_URL's scheme instead.
   cookies: {
     sessionToken: {
       name: 'authjs.session-token',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: (process.env.AUTH_URL ?? '').startsWith('https') },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
     },
     csrfToken: {
       name: 'authjs.csrf-token',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: (process.env.AUTH_URL ?? '').startsWith('https') },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
     },
     callbackUrl: {
       name: 'authjs.callback-url',
-      options: { sameSite: 'lax', path: '/', secure: (process.env.AUTH_URL ?? '').startsWith('https') },
+      options: { sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
     },
     pkceCodeVerifier: {
       name: 'authjs.pkce.code_verifier',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: (process.env.AUTH_URL ?? '').startsWith('https') },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
     },
     state: {
       name: 'authjs.state',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: (process.env.AUTH_URL ?? '').startsWith('https') },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
     },
     nonce: {
       name: 'authjs.nonce',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: (process.env.AUTH_URL ?? '').startsWith('https') },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
     },
   },
   providers: [

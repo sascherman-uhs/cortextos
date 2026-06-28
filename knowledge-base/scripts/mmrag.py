@@ -21,6 +21,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import time
@@ -42,7 +43,8 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 DOC_EXTS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}
 TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".py", ".js", ".ts", ".go",
              ".rs", ".java", ".cpp", ".c", ".sh", ".yaml", ".yml", ".toml",
-             ".html", ".css", ".sql", ".rb", ".swift", ".kt", ".r", ".lua"}
+             ".html", ".htm", ".css", ".sql", ".rb", ".swift", ".kt", ".r", ".lua"}
+HTML_EXTS = {".html", ".htm"}
 
 # Defaults
 DEFAULT_TEXT_CHUNK_SIZE = 1500
@@ -504,10 +506,50 @@ def already_exists(collection, doc_id):
     return bool(existing and existing["ids"])
 
 
+def html_to_text(html_str):
+    """Extract readable text from HTML, dropping <script>/<style> and tags.
+
+    Stdlib-only (html.parser) so there is no BeautifulSoup dependency. Collapses
+    runs of blank lines so chunking embeds clean prose instead of raw markup/CSS.
+    """
+    from html.parser import HTMLParser
+
+    class _Extractor(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts = []
+            self._skip = 0  # depth inside script/style/head-noise tags
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "head", "noscript", "svg"):
+                self._skip += 1
+            elif tag in ("br", "p", "div", "li", "tr", "h1", "h2", "h3",
+                         "h4", "h5", "h6", "section", "header", "footer"):
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style", "head", "noscript", "svg") and self._skip:
+                self._skip -= 1
+
+        def handle_data(self, data):
+            if not self._skip and data.strip():
+                self.parts.append(data)
+
+    parser = _Extractor()
+    parser.feed(html_str)
+    text = "".join(parser.parts)
+    # Collapse 3+ newlines and trailing spaces left by block-tag breaks.
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def ingest_text_file(client, config, collection, file_path):
     """Ingest a text-based file."""
     file_path = Path(file_path)
     text = file_path.read_text(errors="replace")
+    if file_path.suffix.lower() in HTML_EXTS:
+        text = html_to_text(text)
     if not text.strip():
         print(f"  SKIP (empty): {file_path}")
         return 0

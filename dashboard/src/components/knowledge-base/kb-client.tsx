@@ -479,7 +479,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
             type="file"
             multiple
             className="hidden"
-            accept=".pdf,.docx,.txt,.md,.png,.jpg,.jpeg,.pptx,.xlsx,.mp4,.mp3,.wav"
+            accept=".pdf,.docx,.txt,.md,.html,.htm,.png,.jpg,.jpeg,.pptx,.xlsx,.mp4,.mp3,.wav"
             onChange={(e) => {
               const files = Array.from(e.target.files || []);
               handleIngestFiles(files);
@@ -498,7 +498,7 @@ export function KnowledgeBaseClient({ org, markdownContent, filePath }: Knowledg
               {ingesting ? 'Ingesting...' : 'Drop files here or click to browse'}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5">
-              PDF, Word, Markdown, Images, PowerPoint, Audio, Video
+              PDF, Word, Markdown, HTML, Images, PowerPoint, Audio, Video
             </p>
           </div>
           {ingestClassification === 'internal' && (

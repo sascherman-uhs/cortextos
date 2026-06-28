@@ -11,7 +11,7 @@ const MMRAG = `${os.homedir()}/.claude/skills/multimodal-rag/scripts/mmrag.py`;
 const VAULT_INBOX = `${os.homedir()}/Utopia Home Staging Dropbox/UHS/Collective/uhsJARVIS/vault/inbox`;
 
 const ALLOWED_EXTENSIONS = new Set([
-  '.pdf', '.docx', '.txt', '.md', '.png', '.jpg', '.jpeg',
+  '.pdf', '.docx', '.txt', '.md', '.html', '.htm', '.png', '.jpg', '.jpeg',
   '.pptx', '.xlsx', '.mp4', '.mp3', '.wav',
 ]);
 

@@ -1,0 +1,1113 @@
+{
+  "source": "ideal-home-staging-knowledge-base.html",
+  "generated": "2026-06-27",
+  "total": 176,
+  "internalCategories": 21,
+  "externalCategories": 11,
+  "categories": [
+    {
+      "id": "company-foundation-identity",
+      "category": "Company Foundation & Identity",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "company-foundation-identity__mission-vision-core-values",
+          "name": "Mission, Vision & Core Values",
+          "purpose": "the company's reason for being and guardrails"
+        },
+        {
+          "id": "company-foundation-identity__founder-brand-story",
+          "name": "Founder & Brand Story",
+          "purpose": "origin narrative used across marketing and sales"
+        },
+        {
+          "id": "company-foundation-identity__positioning-statement-uvp",
+          "name": "Positioning Statement / UVP",
+          "purpose": "why a seller picks us over competitors"
+        },
+        {
+          "id": "company-foundation-identity__org-chart-roles",
+          "name": "Org Chart & Roles",
+          "purpose": "who does what and reporting lines"
+        },
+        {
+          "id": "company-foundation-identity__company-history-milestones",
+          "name": "Company History & Milestones",
+          "purpose": "timeline of growth, moves, and key wins"
+        },
+        {
+          "id": "company-foundation-identity__awards-accolades-stack",
+          "name": "Awards & Accolades Stack",
+          "purpose": "HGTV, RESA Top 100, Best of City, $1B sold proof"
+        },
+        {
+          "id": "company-foundation-identity__service-area-market-geography",
+          "name": "Service-Area / Market Geography",
+          "purpose": "the metros and zip footprint we serve"
+        }
+      ]
+    },
+    {
+      "id": "legal-entity-licensing-insurance",
+      "category": "Legal Entity, Licensing & Insurance",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "legal-entity-licensing-insurance__entity-structure-ein",
+          "name": "Entity Structure & EIN",
+          "purpose": "legal form, ownership, tax identifiers"
+        },
+        {
+          "id": "legal-entity-licensing-insurance__business-licenses-permits",
+          "name": "Business Licenses & Permits",
+          "purpose": "city/county/state operating licenses"
+        },
+        {
+          "id": "legal-entity-licensing-insurance__liability-inland-marine-insurance",
+          "name": "Liability & Inland-Marine Insurance",
+          "purpose": "coverage for sites and inventory in transit"
+        },
+        {
+          "id": "legal-entity-licensing-insurance__cpcn-moving-license",
+          "name": "CPCN / Moving License",
+          "purpose": "Nevada household-goods carrier authority"
+        },
+        {
+          "id": "legal-entity-licensing-insurance__bonds-workers-comp",
+          "name": "Bonds & Workers-Comp",
+          "purpose": "surety bonds and team coverage records"
+        }
+      ]
+    },
+    {
+      "id": "service-catalog-offerings",
+      "category": "Service Catalog & Offerings",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "service-catalog-offerings__service-definitions",
+          "name": "Service Definitions",
+          "purpose": "vacant, occupied, consults, photo styling"
+        },
+        {
+          "id": "service-catalog-offerings__tier-package-definitions",
+          "name": "Tier / Package Definitions",
+          "purpose": "Capsule, Curated, Ultra-Luxury scope by tier"
+        },
+        {
+          "id": "service-catalog-offerings__scope-of-work-templates",
+          "name": "Scope-of-Work Templates",
+          "purpose": "standard deliverables per engagement type"
+        },
+        {
+          "id": "service-catalog-offerings__inclusions-exclusions-matrix",
+          "name": "Inclusions / Exclusions Matrix",
+          "purpose": "what each tier does and does not cover"
+        },
+        {
+          "id": "service-catalog-offerings__service-period-renewal-terms",
+          "name": "Service-Period & Renewal Terms",
+          "purpose": "30/45-day periods and extension rules"
+        }
+      ]
+    },
+    {
+      "id": "pricing-estimating-proposals",
+      "category": "Pricing, Estimating & Proposals",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "pricing-estimating-proposals__pricing-methodology-formulas",
+          "name": "Pricing Methodology & Formulas",
+          "purpose": "$/sqft bands, $3K minimum, period logic"
+        },
+        {
+          "id": "pricing-estimating-proposals__rate-card",
+          "name": "Rate Card",
+          "purpose": "current published and internal price sheet"
+        },
+        {
+          "id": "pricing-estimating-proposals__estimate-proposal-templates",
+          "name": "Estimate & Proposal Templates",
+          "purpose": "branded documents sent to agents/owners"
+        },
+        {
+          "id": "pricing-estimating-proposals__discount-comp-policy",
+          "name": "Discount & Comp Policy",
+          "purpose": "when and how concessions are allowed"
+        },
+        {
+          "id": "pricing-estimating-proposals__vendor-markup-rules",
+          "name": "Vendor Markup Rules",
+          "purpose": "e.g. window treatments billed at 150% wholesale"
+        },
+        {
+          "id": "pricing-estimating-proposals__win-loss-history",
+          "name": "Win/Loss History",
+          "purpose": "quoted vs accepted, with reasons"
+        }
+      ]
+    },
+    {
+      "id": "inventory-asset-management",
+      "category": "Inventory & Asset Management",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "inventory-asset-management__inventory-catalog",
+          "name": "Inventory Catalog",
+          "purpose": "SKU, photos, dimensions, cost lots, valuation"
+        },
+        {
+          "id": "inventory-asset-management__warehouse-layout-storage-system",
+          "name": "Warehouse Layout & Storage System",
+          "purpose": "bin/zone map and put-away rules"
+        },
+        {
+          "id": "inventory-asset-management__stageforce-system-of-record",
+          "name": "Stageforce System-of-Record",
+          "purpose": "the canonical inventory + project platform"
+        },
+        {
+          "id": "inventory-asset-management__procurement-replenishment",
+          "name": "Procurement & Replenishment",
+          "purpose": "vendor reorder cadence and approval flow"
+        },
+        {
+          "id": "inventory-asset-management__damage-loss-depreciation-log",
+          "name": "Damage / Loss / Depreciation Log",
+          "purpose": "condition tracking and write-downs"
+        },
+        {
+          "id": "inventory-asset-management__inventory-exclusions-list",
+          "name": "Inventory Exclusions List",
+          "purpose": "items never sold or repurposed"
+        }
+      ]
+    },
+    {
+      "id": "operations-sops",
+      "category": "Operations & SOPs",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "operations-sops__project-lifecycle-map",
+          "name": "Project Lifecycle Map",
+          "purpose": "inquiry→estimate→contract→schedule→install→photo→destage"
+        },
+        {
+          "id": "operations-sops__staging-day-installer-checklist",
+          "name": "Staging-Day Installer Checklist",
+          "purpose": "step-by-step install standard (v10)"
+        },
+        {
+          "id": "operations-sops__destage-pickup-sop",
+          "name": "Destage / Pickup SOP",
+          "purpose": "removal, condition check, return-to-warehouse"
+        },
+        {
+          "id": "operations-sops__logistics-truck-routing",
+          "name": "Logistics & Truck Routing",
+          "purpose": "load plans and route efficiency rules"
+        },
+        {
+          "id": "operations-sops__scheduling-calendar-conventions",
+          "name": "Scheduling & Calendar Conventions",
+          "purpose": "UHS event naming and color standards"
+        },
+        {
+          "id": "operations-sops__quality-control-standards",
+          "name": "Quality-Control Standards",
+          "purpose": "the bar every staged home must clear"
+        },
+        {
+          "id": "operations-sops__vendor-invoice-processing",
+          "name": "Vendor-Invoice Processing",
+          "purpose": "parse, match, enter to Stageforce/QuickBooks"
+        }
+      ]
+    },
+    {
+      "id": "sales-client-pipeline",
+      "category": "Sales & Client Pipeline",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "sales-client-pipeline__crm-data-gohighlevel",
+          "name": "CRM Data (GoHighLevel)",
+          "purpose": "contacts, pipelines, opportunity stages"
+        },
+        {
+          "id": "sales-client-pipeline__lead-intake-honeybook",
+          "name": "Lead Intake (HoneyBook)",
+          "purpose": "inquiry forms and estimate requests"
+        },
+        {
+          "id": "sales-client-pipeline__sales-scripts-objection-handling",
+          "name": "Sales Scripts & Objection Handling",
+          "purpose": "responses to price/timing pushback"
+        },
+        {
+          "id": "sales-client-pipeline__follow-up-cadences",
+          "name": "Follow-Up Cadences",
+          "purpose": "timed touch sequences per lead stage"
+        },
+        {
+          "id": "sales-client-pipeline__conversion-funnel-metrics",
+          "name": "Conversion Funnel & Metrics",
+          "purpose": "lead→quote→booked rates and velocity"
+        },
+        {
+          "id": "sales-client-pipeline__referral-program",
+          "name": "Referral Program",
+          "purpose": "incentives and tracking for agent referrals"
+        },
+        {
+          "id": "sales-client-pipeline__contract-renewal-playbook",
+          "name": "Contract & Renewal Playbook",
+          "purpose": "agreement templates and extension scripts"
+        }
+      ]
+    },
+    {
+      "id": "client-relationship-records",
+      "category": "Client & Relationship Records",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "client-relationship-records__agent-client-contact-database",
+          "name": "Agent / Client Contact Database",
+          "purpose": "canonical people directory"
+        },
+        {
+          "id": "client-relationship-records__per-client-project-history",
+          "name": "Per-Client Project History",
+          "purpose": "every job, address, and outcome by client"
+        },
+        {
+          "id": "client-relationship-records__communication-logs",
+          "name": "Communication Logs",
+          "purpose": "email/text/call history per relationship"
+        },
+        {
+          "id": "client-relationship-records__testimonials-reviews",
+          "name": "Testimonials & Reviews",
+          "purpose": "SoTellUs, Google, and quotable wins"
+        },
+        {
+          "id": "client-relationship-records__referral-agent-roster-notes",
+          "name": "Referral-Agent Roster & Notes",
+          "purpose": "vetted partners and relationship context"
+        },
+        {
+          "id": "client-relationship-records__vip-key-account-profiles",
+          "name": "VIP / Key-Account Profiles",
+          "purpose": "top agents and their preferences"
+        }
+      ]
+    },
+    {
+      "id": "design-knowledge-standards",
+      "category": "Design Knowledge & Standards",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "design-knowledge-standards__design-philosophy-aesthetic-standard",
+          "name": "Design Philosophy & Aesthetic Standard",
+          "purpose": "the Ruby Sky benchmark of 'done right'"
+        },
+        {
+          "id": "design-knowledge-standards__style-guides-by-tier-property-type",
+          "name": "Style Guides by Tier / Property Type",
+          "purpose": "look-and-feel rules per segment"
+        },
+        {
+          "id": "design-knowledge-standards__color-lighting-standards",
+          "name": "Color & Lighting Standards",
+          "purpose": "cool 4000–5000K, palette discipline"
+        },
+        {
+          "id": "design-knowledge-standards__room-by-room-staging-playbooks",
+          "name": "Room-by-Room Staging Playbooks",
+          "purpose": "what each room needs to read its best"
+        },
+        {
+          "id": "design-knowledge-standards__vignette-styling-formulas",
+          "name": "Vignette / Styling Formulas",
+          "purpose": "repeatable accessory and layering recipes"
+        },
+        {
+          "id": "design-knowledge-standards__trend-research",
+          "name": "Trend Research",
+          "purpose": "current buyer and design preferences"
+        },
+        {
+          "id": "design-knowledge-standards__before-after-standards",
+          "name": "Before/After Standards",
+          "purpose": "documentation and comparison conventions"
+        }
+      ]
+    },
+    {
+      "id": "marketing-brand-content",
+      "category": "Marketing & Brand Content",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "marketing-brand-content__brand-voice-guide",
+          "name": "Brand Voice Guide",
+          "purpose": "no emojis, 5 hashtags, Angelic as approver"
+        },
+        {
+          "id": "marketing-brand-content__blog-library-calendar",
+          "name": "Blog Library & Calendar",
+          "purpose": "published posts (REST permalinks) and pipeline"
+        },
+        {
+          "id": "marketing-brand-content__social-playbook-assets",
+          "name": "Social Playbook & Assets",
+          "purpose": "channel strategy and reusable creative"
+        },
+        {
+          "id": "marketing-brand-content__newsletter-system-flodesk",
+          "name": "Newsletter System (Flodesk)",
+          "purpose": "list, segments, and send cadence"
+        },
+        {
+          "id": "marketing-brand-content__portfolio-best-photos-archive",
+          "name": "Portfolio / 'Best Photos' Archive",
+          "purpose": "curated top imagery for marketing"
+        },
+        {
+          "id": "marketing-brand-content__case-studies",
+          "name": "Case Studies",
+          "purpose": "data-driven proof from real projects"
+        },
+        {
+          "id": "marketing-brand-content__social-proof-award-badges",
+          "name": "Social-Proof / Award Badges",
+          "purpose": "logos and credentials for collateral"
+        },
+        {
+          "id": "marketing-brand-content__website-seo-assets",
+          "name": "Website & SEO Assets",
+          "purpose": "site copy, llms.txt, keyword map"
+        },
+        {
+          "id": "marketing-brand-content__email-templates-signature-block",
+          "name": "Email Templates & Signature Block",
+          "purpose": "approved client-facing email standards"
+        },
+        {
+          "id": "marketing-brand-content__video-content-library",
+          "name": "Video Content Library",
+          "purpose": "reels, tours, and educational clips"
+        }
+      ]
+    },
+    {
+      "id": "education-ce-program",
+      "category": "Education / CE Program",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "education-ce-program__ce-course-content-accreditation",
+          "name": "CE Course Content & Accreditation",
+          "purpose": "the licensed real-estate CE curriculum"
+        },
+        {
+          "id": "education-ce-program__registration-system",
+          "name": "Registration System",
+          "purpose": "ce.utopiahomestaging.com enrollment flow"
+        },
+        {
+          "id": "education-ce-program__decks-flyers",
+          "name": "Decks & Flyers",
+          "purpose": "presentation and promo assets per session"
+        },
+        {
+          "id": "education-ce-program__class-scheduling-enrollment",
+          "name": "Class Scheduling & Enrollment",
+          "purpose": "calendar, coordinators, open enrollment"
+        },
+        {
+          "id": "education-ce-program__certificate-delivery",
+          "name": "Certificate Delivery",
+          "purpose": "post-class credentialing to attendees"
+        },
+        {
+          "id": "education-ce-program__tsc-collective-materials",
+          "name": "TSC / Collective Materials",
+          "purpose": "The Staging Collective shared content"
+        }
+      ]
+    },
+    {
+      "id": "photography-media-production",
+      "category": "Photography & Media Production",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "photography-media-production__capture-edit-workflow",
+          "name": "Capture / Edit Workflow",
+          "purpose": "raw→processed→Web-MLS folder discipline"
+        },
+        {
+          "id": "photography-media-production__hdr-retouch-standards",
+          "name": "HDR / Retouch Standards",
+          "purpose": "USM only, no AI enhancement"
+        },
+        {
+          "id": "photography-media-production__photographer-editor-sops",
+          "name": "Photographer / Editor SOPs",
+          "purpose": "shot lists and delivery expectations"
+        },
+        {
+          "id": "photography-media-production__photo-license-agreements",
+          "name": "Photo-License Agreements",
+          "purpose": "usage rights for staged imagery"
+        },
+        {
+          "id": "photography-media-production__media-asset-library",
+          "name": "Media Asset Library",
+          "purpose": "organized, searchable image/video store"
+        }
+      ]
+    },
+    {
+      "id": "financial-accounting",
+      "category": "Financial & Accounting",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "financial-accounting__chart-of-accounts-quickbooks",
+          "name": "Chart of Accounts (QuickBooks)",
+          "purpose": "the books' structural backbone"
+        },
+        {
+          "id": "financial-accounting__margin-pricing-analysis",
+          "name": "Margin & Pricing Analysis",
+          "purpose": "profitability by job, tier, and client"
+        },
+        {
+          "id": "financial-accounting__ar-ap-invoicing",
+          "name": "AR / AP & Invoicing",
+          "purpose": "billing, collections, and payables"
+        },
+        {
+          "id": "financial-accounting__bank-reconciliation-procedures",
+          "name": "Bank Reconciliation Procedures",
+          "purpose": "NSB↔QBO monthly match process"
+        },
+        {
+          "id": "financial-accounting__kpis-financial-reports",
+          "name": "KPIs & Financial Reports",
+          "purpose": "revenue, utilization, cash dashboards"
+        },
+        {
+          "id": "financial-accounting__tax-posture-policy",
+          "name": "Tax Posture & Policy",
+          "purpose": "no rental/lease language; staging tax treatment"
+        },
+        {
+          "id": "financial-accounting__budget-forecasts",
+          "name": "Budget & Forecasts",
+          "purpose": "forward plan for revenue and spend"
+        }
+      ]
+    },
+    {
+      "id": "technology-systems-data",
+      "category": "Technology, Systems & Data",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "technology-systems-data__system-integration-inventory",
+          "name": "System & Integration Inventory",
+          "purpose": "Stageforce, GHL, Supabase, MLS, mmrag map"
+        },
+        {
+          "id": "technology-systems-data__credentials-access-map",
+          "name": "Credentials / Access Map",
+          "purpose": "who holds which keys, stored securely"
+        },
+        {
+          "id": "technology-systems-data__data-schemas",
+          "name": "Data Schemas",
+          "purpose": "table/field definitions across systems"
+        },
+        {
+          "id": "technology-systems-data__automation-agent-definitions",
+          "name": "Automation / Agent Definitions",
+          "purpose": "JARVIS fleet roles and runbooks"
+        },
+        {
+          "id": "technology-systems-data__dashboards-reporting",
+          "name": "Dashboards & Reporting",
+          "purpose": "operational and exec views"
+        }
+      ]
+    },
+    {
+      "id": "people-hr-team",
+      "category": "People, HR & Team",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "people-hr-team__job-descriptions-roles",
+          "name": "Job Descriptions & Roles",
+          "purpose": "each position's scope and expectations"
+        },
+        {
+          "id": "people-hr-team__onboarding-training",
+          "name": "Onboarding & Training",
+          "purpose": "ramp materials for new hires/contractors"
+        },
+        {
+          "id": "people-hr-team__subcontractor-agreements",
+          "name": "Subcontractor Agreements",
+          "purpose": "terms for installers, editors, movers"
+        },
+        {
+          "id": "people-hr-team__compensation-schedules",
+          "name": "Compensation & Schedules",
+          "purpose": "pay structures and availability"
+        }
+      ]
+    },
+    {
+      "id": "strategy-performance-governance",
+      "category": "Strategy, Performance & Governance",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "strategy-performance-governance__business-plan-annual-operating-plan",
+          "name": "Business Plan & Annual Operating Plan",
+          "purpose": "annual targets, budget, growth thesis"
+        },
+        {
+          "id": "strategy-performance-governance__kpi-dictionary-dashboards",
+          "name": "KPI Dictionary & Dashboards",
+          "purpose": "the metrics leadership watches, defined"
+        },
+        {
+          "id": "strategy-performance-governance__competitive-positioning-differentiation-matrix",
+          "name": "Competitive Positioning & Differentiation Matrix",
+          "purpose": "how we defend and extend our edge"
+        },
+        {
+          "id": "strategy-performance-governance__risk-register",
+          "name": "Risk Register",
+          "purpose": "tracked threats and mitigations"
+        },
+        {
+          "id": "strategy-performance-governance__lessons-learned-retrospectives",
+          "name": "Lessons-Learned / Retrospectives",
+          "purpose": "lessons.md and post-mortems"
+        },
+        {
+          "id": "strategy-performance-governance__decision-rights-signature-authority-matrix",
+          "name": "Decision-Rights / Signature-Authority Matrix",
+          "purpose": "who approves and binds what"
+        }
+      ]
+    },
+    {
+      "id": "risk-safety-claims-incident-management",
+      "category": "Risk, Safety, Claims & Incident Management",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "risk-safety-claims-incident-management__field-warehouse-safety-protocols",
+          "name": "Field & Warehouse Safety Protocols",
+          "purpose": "OSHA-aligned injury-prevention standards"
+        },
+        {
+          "id": "risk-safety-claims-incident-management__incident-report-log",
+          "name": "Incident Report Log",
+          "purpose": "documented site/warehouse incidents and resolutions"
+        },
+        {
+          "id": "risk-safety-claims-incident-management__liability-waiver-templates",
+          "name": "Liability Waiver Templates",
+          "purpose": "site-access and condition risk management"
+        },
+        {
+          "id": "risk-safety-claims-incident-management__claims-damage-loss-recovery-sop",
+          "name": "Claims, Damage & Loss Recovery SOP",
+          "purpose": "handle breakage, theft, and disputes"
+        },
+        {
+          "id": "risk-safety-claims-incident-management__coi-request-sop",
+          "name": "COI Request SOP",
+          "purpose": "issue certificates of insurance consistently"
+        }
+      ]
+    },
+    {
+      "id": "property-access-site-control",
+      "category": "Property Access & Site Control",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "property-access-site-control__key-lockbox-alarm-code-register",
+          "name": "Key / Lockbox / Alarm-Code Register",
+          "purpose": "secure record of property access credentials"
+        },
+        {
+          "id": "property-access-site-control__access-permissions-authorization-log",
+          "name": "Access Permissions & Authorization Log",
+          "purpose": "who may enter which site, when"
+        },
+        {
+          "id": "property-access-site-control__site-control-sop",
+          "name": "Site-Control SOP",
+          "purpose": "govern entry, securing, and handback of homes"
+        }
+      ]
+    },
+    {
+      "id": "data-privacy-security-continuity",
+      "category": "Data Privacy, Security & Continuity",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "data-privacy-security-continuity__data-handling-privacy-policy",
+          "name": "Data-Handling & Privacy Policy",
+          "purpose": "how client/financial data is protected"
+        },
+        {
+          "id": "data-privacy-security-continuity__access-control-matrix",
+          "name": "Access-Control Matrix",
+          "purpose": "system permissions by role"
+        },
+        {
+          "id": "data-privacy-security-continuity__credential-api-secret-register",
+          "name": "Credential / API Secret Register",
+          "purpose": "track secrets without exposing values"
+        },
+        {
+          "id": "data-privacy-security-continuity__backup-incident-response-plan",
+          "name": "Backup & Incident-Response Plan",
+          "purpose": "respond to outages and security events"
+        },
+        {
+          "id": "data-privacy-security-continuity__business-continuity-disaster-recovery",
+          "name": "Business Continuity / Disaster Recovery",
+          "purpose": "keep operating through emergencies"
+        }
+      ]
+    },
+    {
+      "id": "customer-success-post-project-experience",
+      "category": "Customer Success & Post-Project Experience",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "customer-success-post-project-experience__project-handoff-onboarding-flow",
+          "name": "Project Handoff & Onboarding Flow",
+          "purpose": "set expectations from booking to install"
+        },
+        {
+          "id": "customer-success-post-project-experience__satisfaction-nps-survey",
+          "name": "Satisfaction / NPS Survey",
+          "purpose": "measure and act on client sentiment"
+        },
+        {
+          "id": "customer-success-post-project-experience__post-staging-care-instructions",
+          "name": "Post-Staging Care Instructions",
+          "purpose": "prevent damage and confusion during service"
+        },
+        {
+          "id": "customer-success-post-project-experience__retention-referral-generation-playbook",
+          "name": "Retention & Referral-Generation Playbook",
+          "purpose": "turn happy clients into repeat/referral"
+        },
+        {
+          "id": "customer-success-post-project-experience__client-escalation-log",
+          "name": "Client Escalation Log",
+          "purpose": "preserve sensitive relationship history"
+        }
+      ]
+    },
+    {
+      "id": "knowledge-management-documentation-governance",
+      "category": "Knowledge Management & Documentation Governance",
+      "part": "Internal",
+      "docs": [
+        {
+          "id": "knowledge-management-documentation-governance__kb-taxonomy-ownership-map",
+          "name": "KB Taxonomy & Ownership Map",
+          "purpose": "this taxonomy — who owns and maintains each doc"
+        },
+        {
+          "id": "knowledge-management-documentation-governance__document-freshness-review-cadence",
+          "name": "Document Freshness / Review Cadence",
+          "purpose": "keep content current and trusted"
+        },
+        {
+          "id": "knowledge-management-documentation-governance__company-glossary",
+          "name": "Company Glossary",
+          "purpose": "normalize terminology across operations"
+        },
+        {
+          "id": "knowledge-management-documentation-governance__sop-change-log",
+          "name": "SOP Change Log",
+          "purpose": "versioned record of process updates"
+        }
+      ]
+    },
+    {
+      "id": "market-real-estate-data",
+      "category": "Market & Real-Estate Data",
+      "part": "External",
+      "docs": [
+        {
+          "id": "market-real-estate-data__mls-active-sold-listings-comps",
+          "name": "MLS Active / Sold Listings & Comps",
+          "purpose": "the staging market and pricing context"
+        },
+        {
+          "id": "market-real-estate-data__dom-absorption-metrics",
+          "name": "DOM / Absorption Metrics",
+          "purpose": "how fast inventory moves by area"
+        },
+        {
+          "id": "market-real-estate-data__property-parcel-assessor-records",
+          "name": "Property / Parcel & Assessor Records",
+          "purpose": "sqft, beds, owner, year-built by parcel"
+        },
+        {
+          "id": "market-real-estate-data__agent-broker-directories-licenses",
+          "name": "Agent / Broker Directories & Licenses",
+          "purpose": "who lists and how to reach them"
+        },
+        {
+          "id": "market-real-estate-data__home-price-indices",
+          "name": "Home Price Indices",
+          "purpose": "macro trend backdrop for advice"
+        },
+        {
+          "id": "market-real-estate-data__neighborhood-demographic-data",
+          "name": "Neighborhood / Demographic Data",
+          "purpose": "buyer profile per submarket"
+        }
+      ]
+    },
+    {
+      "id": "industry-standards-research",
+      "category": "Industry Standards & Research",
+      "part": "External",
+      "docs": [
+        {
+          "id": "industry-standards-research__resa-standards",
+          "name": "RESA Standards",
+          "purpose": "professional staging best-practice baseline"
+        },
+        {
+          "id": "industry-standards-research__staging-roi-dom-statistics",
+          "name": "Staging-ROI / DOM Statistics",
+          "purpose": "NAR & RESA proof of staging impact"
+        },
+        {
+          "id": "industry-standards-research__certification-bodies",
+          "name": "Certification Bodies",
+          "purpose": "RESA / ASP / IAHSP credential frameworks"
+        },
+        {
+          "id": "industry-standards-research__methodology-references",
+          "name": "Methodology References",
+          "purpose": "authoritative how-to sources"
+        },
+        {
+          "id": "industry-standards-research__industry-whitepapers",
+          "name": "Industry Whitepapers",
+          "purpose": "trend and market research reports"
+        }
+      ]
+    },
+    {
+      "id": "vendors-suppliers",
+      "category": "Vendors & Suppliers",
+      "part": "External",
+      "docs": [
+        {
+          "id": "vendors-suppliers__furniture-d-cor-vendors",
+          "name": "Furniture / Décor Vendors",
+          "purpose": "Coaster, Safavieh, Uttermost, Leftbank, etc."
+        },
+        {
+          "id": "vendors-suppliers__window-treatment-vendor",
+          "name": "Window-Treatment Vendor",
+          "purpose": "TwoPages — rep, wholesale, markup terms"
+        },
+        {
+          "id": "vendors-suppliers__catalogs-pricing-lead-times",
+          "name": "Catalogs / Pricing / Lead-Times",
+          "purpose": "current buying terms per vendor"
+        },
+        {
+          "id": "vendors-suppliers__photography-floor-plan-vendors",
+          "name": "Photography & Floor-Plan Vendors",
+          "purpose": "editors and CubiCasa plans"
+        },
+        {
+          "id": "vendors-suppliers__moving-logistics-partners",
+          "name": "Moving / Logistics Partners",
+          "purpose": "overflow trucking and labor"
+        },
+        {
+          "id": "vendors-suppliers__print-marketing-vendors",
+          "name": "Print / Marketing Vendors",
+          "purpose": "collateral and signage suppliers"
+        }
+      ]
+    },
+    {
+      "id": "competitive-intelligence",
+      "category": "Competitive Intelligence",
+      "part": "External",
+      "docs": [
+        {
+          "id": "competitive-intelligence__competitor-roster-profiles",
+          "name": "Competitor Roster & Profiles",
+          "purpose": "the verified LV staging field"
+        },
+        {
+          "id": "competitive-intelligence__competitor-pricing",
+          "name": "Competitor Pricing",
+          "purpose": "observed rates and packaging"
+        },
+        {
+          "id": "competitive-intelligence__competitor-sighting-attribution-data",
+          "name": "Competitor-Sighting / Attribution Data",
+          "purpose": "where rivals are active"
+        },
+        {
+          "id": "competitive-intelligence__market-share-differentiation-matrix",
+          "name": "Market-Share & Differentiation Matrix",
+          "purpose": "our position vs theirs"
+        }
+      ]
+    },
+    {
+      "id": "regulatory-legal-external",
+      "category": "Regulatory & Legal (external)",
+      "part": "External",
+      "docs": [
+        {
+          "id": "regulatory-legal-external__state-licensing-nv-red-cpcn",
+          "name": "State Licensing (NV RED, CPCN)",
+          "purpose": "real-estate and carrier license rules"
+        },
+        {
+          "id": "regulatory-legal-external__ce-accreditation-rules",
+          "name": "CE Accreditation Rules",
+          "purpose": "what keeps the CE course valid"
+        },
+        {
+          "id": "regulatory-legal-external__tax-codes",
+          "name": "Tax Codes",
+          "purpose": "external rules shaping our tax posture"
+        },
+        {
+          "id": "regulatory-legal-external__insurance-requirements",
+          "name": "Insurance Requirements",
+          "purpose": "mandated coverage thresholds"
+        },
+        {
+          "id": "regulatory-legal-external__real-estate-regulations",
+          "name": "Real-Estate Regulations",
+          "purpose": "disclosure and advertising rules"
+        }
+      ]
+    },
+    {
+      "id": "partner-referral-network",
+      "category": "Partner & Referral Network",
+      "part": "External",
+      "docs": [
+        {
+          "id": "partner-referral-network__brokerages-agents",
+          "name": "Brokerages & Agents",
+          "purpose": "the referral engine for new business"
+        },
+        {
+          "id": "partner-referral-network__photographers",
+          "name": "Photographers",
+          "purpose": "external capture partners"
+        },
+        {
+          "id": "partner-referral-network__contractors-painters-handymen",
+          "name": "Contractors / Painters / Handymen",
+          "purpose": "pre-stage prep trades"
+        },
+        {
+          "id": "partner-referral-network__cleaners",
+          "name": "Cleaners",
+          "purpose": "turn-ready cleaning partners"
+        },
+        {
+          "id": "partner-referral-network__complementary-service-providers",
+          "name": "Complementary-Service Providers",
+          "purpose": "inspectors, lenders, landscapers"
+        }
+      ]
+    },
+    {
+      "id": "professional-development-community",
+      "category": "Professional Development & Community",
+      "part": "External",
+      "docs": [
+        {
+          "id": "professional-development-community__ce-accreditation-courses",
+          "name": "CE Accreditation & Courses",
+          "purpose": "external credentialing pathways"
+        },
+        {
+          "id": "professional-development-community__industry-conferences",
+          "name": "Industry Conferences",
+          "purpose": "RESA convention and trade events"
+        },
+        {
+          "id": "professional-development-community__the-staging-collective-tsc",
+          "name": "The Staging Collective (TSC)",
+          "purpose": "peer network and shared playbooks"
+        },
+        {
+          "id": "professional-development-community__training-resources",
+          "name": "Training Resources",
+          "purpose": "external courses and certifications"
+        }
+      ]
+    },
+    {
+      "id": "customer-facing-reference",
+      "category": "Customer-Facing Reference",
+      "part": "External",
+      "docs": [
+        {
+          "id": "customer-facing-reference__staging-reports-market-analyses",
+          "name": "Staging Reports / Market Analyses",
+          "purpose": "Ruby-Sky-standard client deliverables"
+        },
+        {
+          "id": "customer-facing-reference__buyer-seller-education",
+          "name": "Buyer-Seller Education",
+          "purpose": "explainers that build trust and urgency"
+        },
+        {
+          "id": "customer-facing-reference__roi-calculators",
+          "name": "ROI Calculators",
+          "purpose": "staging-value math for prospects"
+        },
+        {
+          "id": "customer-facing-reference__client-agent-faq",
+          "name": "Client & Agent FAQ",
+          "purpose": "common questions answered once"
+        },
+        {
+          "id": "customer-facing-reference__homeowner-occupied-home-prep-guides",
+          "name": "Homeowner / Occupied-Home Prep Guides",
+          "purpose": "ready a property before staging"
+        },
+        {
+          "id": "customer-facing-reference__client-onboarding-tou-nda-materials",
+          "name": "Client Onboarding & ToU/NDA Materials",
+          "purpose": "intake and confidentiality docs"
+        }
+      ]
+    },
+    {
+      "id": "buyer-psychology-demographics",
+      "category": "Buyer Psychology & Demographics",
+      "part": "External",
+      "docs": [
+        {
+          "id": "buyer-psychology-demographics__buyer-persona-research",
+          "name": "Buyer-Persona Research",
+          "purpose": "who buys each segment and what they want"
+        },
+        {
+          "id": "buyer-psychology-demographics__demographic-lifestyle-data",
+          "name": "Demographic & Lifestyle Data",
+          "purpose": "match staging to the likely buyer"
+        },
+        {
+          "id": "buyer-psychology-demographics__emotional-merchandising-references",
+          "name": "Emotional-Merchandising References",
+          "purpose": "design choices that drive offers"
+        }
+      ]
+    },
+    {
+      "id": "sustainability-disposal-resources",
+      "category": "Sustainability & Disposal Resources",
+      "part": "External",
+      "docs": [
+        {
+          "id": "sustainability-disposal-resources__donation-partners",
+          "name": "Donation Partners",
+          "purpose": "responsible homes for retired inventory"
+        },
+        {
+          "id": "sustainability-disposal-resources__resale-liquidation-channels",
+          "name": "Resale / Liquidation Channels",
+          "purpose": "recover value from aged stock"
+        },
+        {
+          "id": "sustainability-disposal-resources__recycling-disposal-references",
+          "name": "Recycling & Disposal References",
+          "purpose": "compliant, low-waste removal"
+        }
+      ]
+    },
+    {
+      "id": "cross-check-additions-gpt",
+      "category": "Cross-Check Additions GPT",
+      "part": "External",
+      "docs": [
+        {
+          "id": "cross-check-additions-gpt__risk-safety-claims-incident-management",
+          "name": "Risk, Safety, Claims & Incident Management",
+          "purpose": "new internal category — safety, claims, incidents"
+        },
+        {
+          "id": "cross-check-additions-gpt__property-access-site-control",
+          "name": "Property Access & Site Control",
+          "purpose": "new internal category — keys, lockboxes, alarms, access"
+        },
+        {
+          "id": "cross-check-additions-gpt__data-privacy-security-continuity",
+          "name": "Data Privacy, Security & Continuity",
+          "purpose": "new internal category — infosec, backup, DR/BCP"
+        },
+        {
+          "id": "cross-check-additions-gpt__customer-success-post-project-experience",
+          "name": "Customer Success & Post-Project Experience",
+          "purpose": "new internal category — satisfaction, retention, referrals"
+        },
+        {
+          "id": "cross-check-additions-gpt__knowledge-management-documentation-governance",
+          "name": "Knowledge Management & Documentation Governance",
+          "purpose": "new internal category — taxonomy ownership and freshness"
+        },
+        {
+          "id": "cross-check-additions-gpt__buyer-psychology-demographics",
+          "name": "Buyer Psychology & Demographics",
+          "purpose": "new external category — buyer-persona research for design"
+        },
+        {
+          "id": "cross-check-additions-gpt__sustainability-disposal-resources",
+          "name": "Sustainability & Disposal Resources",
+          "purpose": "new external category — donation, resale, recycling"
+        },
+        {
+          "id": "cross-check-additions-gpt__standout-documents-merged-into-existing-categories",
+          "name": "Standout documents merged into existing categories",
+          "purpose": "occupied/vacant/partial staging SOPs, change-order & COI templates, KPI dictionary, decision-rights matrix, homeowner prep guides, glossary"
+        }
+      ]
+    }
+  ]
+}

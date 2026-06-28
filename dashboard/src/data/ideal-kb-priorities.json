@@ -1,0 +1,1065 @@
+{
+  "generated": "2026-06-27",
+  "model": "gemini-2.5-flash",
+  "rubric": "Impact = how much HAVING this document as a finished, reusable asset would improve business results for a luxury Las Vegas home-staging company. Weigh: (1) Revenue & conversion — does it directly help win/close more staging jobs or raise price? (2) Lead generation & brand — does it drive inbound leads, referrals, or reputation? (3) Operational leverage — is it used on most jobs, saving time or raising quality at scale? (4) Foundational dependency — does it standardize or unlock many other documents/workflows? Score 1-100. Tier: High = 70-100, Medium = 45-69, Low = 1-44. Compliance/admin docs that are necessary but do not move revenue should score Medium or Low.",
+  "scored": 168,
+  "missingDefaulted": 8,
+  "scores": {
+    "company-foundation-identity__mission-vision-core-values": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Aligns team, guides strategy, informs brand messaging, foundational.",
+      "rank": 124
+    },
+    "company-foundation-identity__founder-brand-story": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Builds brand connection, trust, and helps convert leads.",
+      "rank": 93
+    },
+    "company-foundation-identity__positioning-statement-uvp": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Defines competitive edge, drives sales messaging, and conversion.",
+      "rank": 34
+    },
+    "company-foundation-identity__org-chart-roles": {
+      "impact": 55,
+      "tier": "Low",
+      "why": "Clarifies responsibilities, improves internal efficiency and accountability.",
+      "rank": 166
+    },
+    "company-foundation-identity__company-history-milestones": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Builds credibility, supports brand narrative, and team pride.",
+      "rank": 159
+    },
+    "company-foundation-identity__awards-accolades-stack": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Strong social proof, builds trust, directly aids conversion and reputation.",
+      "rank": 11
+    },
+    "company-foundation-identity__service-area-market-geography": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Defines operational scope, guides sales targeting and efficiency.",
+      "rank": 141
+    },
+    "legal-entity-licensing-insurance__entity-structure-ein": {
+      "impact": 30,
+      "tier": "Low",
+      "why": "Essential for legal compliance and financial operations, no direct revenue.",
+      "rank": 176
+    },
+    "legal-entity-licensing-insurance__business-licenses-permits": {
+      "impact": 40,
+      "tier": "Low",
+      "why": "Essential for legal operation, avoids penalties, foundational compliance.",
+      "rank": 175
+    },
+    "legal-entity-licensing-insurance__liability-inland-marine-insurance": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Mitigates financial risk, protects assets, enables operations, builds trust.",
+      "rank": 114
+    },
+    "legal-entity-licensing-insurance__cpcn-moving-license": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Essential for legal operation of core service, avoids fines.",
+      "rank": 130
+    },
+    "legal-entity-licensing-insurance__bonds-workers-comp": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Ensures legal compliance, protects team, mitigates operational risk.",
+      "rank": 148
+    },
+    "service-catalog-offerings__service-definitions": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Standardizes offerings, clarifies sales, basis for pricing and SOWs.",
+      "rank": 89
+    },
+    "service-catalog-offerings__tier-package-definitions": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Drives tiered pricing, upselling, streamlines proposals, improves conversion.",
+      "rank": 60
+    },
+    "service-catalog-offerings__scope-of-work-templates": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Streamlines proposals, reduces disputes, ensures consistent service delivery.",
+      "rank": 59
+    },
+    "service-catalog-offerings__inclusions-exclusions-matrix": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Manages client expectations, prevents scope creep, aids sales clarity.",
+      "rank": 88
+    },
+    "service-catalog-offerings__service-period-renewal-terms": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Defines revenue cycles, enables renewals, standardizes contract management.",
+      "rank": 109
+    },
+    "pricing-estimating-proposals__pricing-methodology-formulas": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Ensures profitability, consistent pricing, foundational for all revenue generation.",
+      "rank": 27
+    },
+    "pricing-estimating-proposals__rate-card": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Ensures consistent pricing, speeds up quoting, crucial for sales.",
+      "rank": 55
+    },
+    "pricing-estimating-proposals__estimate-proposal-templates": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Directly impacts conversion, professionalizes sales, saves time.",
+      "rank": 26
+    },
+    "pricing-estimating-proposals__discount-comp-policy": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Protects margins, ensures consistent pricing, empowers sales.",
+      "rank": 118
+    },
+    "pricing-estimating-proposals__vendor-markup-rules": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Ensures profitability on vendor services, standardizes billing.",
+      "rank": 106
+    },
+    "pricing-estimating-proposals__win-loss-history": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Informs sales strategy, improves conversion rates, optimizes pricing.",
+      "rank": 83
+    },
+    "inventory-asset-management__inventory-catalog": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Foundational for operations, accurate costing, efficient asset utilization.",
+      "rank": 45
+    },
+    "inventory-asset-management__warehouse-layout-storage-system": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Improves operational efficiency, reduces labor time, supports scale.",
+      "rank": 100
+    },
+    "inventory-asset-management__stageforce-system-of-record": {
+      "impact": 98,
+      "tier": "High",
+      "why": "Foundational system, centralizes data, critical for efficiency and accuracy.",
+      "rank": 3
+    },
+    "inventory-asset-management__procurement-replenishment": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Optimizes inventory, prevents project delays, ensures design quality.",
+      "rank": 75
+    },
+    "inventory-asset-management__damage-loss-depreciation-log": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Tracks asset value, informs claims, supports financial accuracy.",
+      "rank": 129
+    },
+    "inventory-asset-management__inventory-exclusions-list": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Prevents inventory errors, streamlines asset management.",
+      "rank": 162
+    },
+    "operations-sops__project-lifecycle-map": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Standardizes operations, improves efficiency, foundational for all workflows.",
+      "rank": 52
+    },
+    "operations-sops__staging-day-installer-checklist": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Ensures consistent quality, reduces errors, improves client satisfaction.",
+      "rank": 24
+    },
+    "operations-sops__destage-pickup-sop": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Standardizes destaging, protects inventory, improves efficiency.",
+      "rank": 79
+    },
+    "operations-sops__logistics-truck-routing": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Optimizes logistics, reduces costs, increases operational capacity.",
+      "rank": 103
+    },
+    "operations-sops__scheduling-calendar-conventions": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Improves internal communication, reduces scheduling errors, boosts efficiency.",
+      "rank": 131
+    },
+    "operations-sops__quality-control-standards": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Ensures consistent high quality, drives client satisfaction and referrals.",
+      "rank": 23
+    },
+    "operations-sops__vendor-invoice-processing": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Streamlines financial operations, ensures accurate vendor payments.",
+      "rank": 149
+    },
+    "sales-client-pipeline__crm-data-gohighlevel": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Centralizes sales data, enables effective lead management and conversion.",
+      "rank": 28
+    },
+    "sales-client-pipeline__lead-intake-honeybook": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Streamlines lead capture, improves sales efficiency, prevents lost leads.",
+      "rank": 87
+    },
+    "sales-client-pipeline__sales-scripts-objection-handling": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Directly improves sales conversion, standardizes sales approach.",
+      "rank": 58
+    },
+    "sales-client-pipeline__follow-up-cadences": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Maximizes lead conversion, ensures consistent and timely follow-up.",
+      "rank": 57
+    },
+    "sales-client-pipeline__conversion-funnel-metrics": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Optimizes sales process, improves conversion rates, informs strategy.",
+      "rank": 56
+    },
+    "sales-client-pipeline__referral-program": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Drives high-quality inbound leads, strengthens agent relationships, cost-effective.",
+      "rank": 29
+    },
+    "sales-client-pipeline__contract-renewal-playbook": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Maximizes recurring revenue, simplifies renewals, improves client retention.",
+      "rank": 86
+    },
+    "client-relationship-records__agent-client-contact-database": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Foundational for sales, marketing, and relationship management efficiency.",
+      "rank": 33
+    },
+    "client-relationship-records__per-client-project-history": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Informs future sales, enables personalized service, improves client retention.",
+      "rank": 66
+    },
+    "client-relationship-records__communication-logs": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Ensures consistent communication, improves client satisfaction, reduces disputes.",
+      "rank": 92
+    },
+    "client-relationship-records__testimonials-reviews": {
+      "impact": 98,
+      "tier": "High",
+      "why": "Powerful social proof, drives leads, builds trust, directly aids conversion.",
+      "rank": 1
+    },
+    "client-relationship-records__referral-agent-roster-notes": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Drives high-quality referrals, strengthens key partnerships, boosts lead generation.",
+      "rank": 9
+    },
+    "client-relationship-records__vip-key-account-profiles": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Maximizes VIP client retention, drives referrals, ensures personalized service.",
+      "rank": 10
+    },
+    "design-knowledge-standards__design-philosophy-aesthetic-standard": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Ensures consistent luxury design, reinforces brand, drives client satisfaction.",
+      "rank": 15
+    },
+    "design-knowledge-standards__style-guides-by-tier-property-type": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Tailors design to buyers, increases appeal, standardizes design process.",
+      "rank": 42
+    },
+    "design-knowledge-standards__color-lighting-standards": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Enhances property appeal, ensures consistent professional aesthetic.",
+      "rank": 71
+    },
+    "design-knowledge-standards__room-by-room-staging-playbooks": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Standardizes staging, ensures optimal results, drives faster sales.",
+      "rank": 16
+    },
+    "design-knowledge-standards__vignette-styling-formulas": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Ensures consistent high-quality styling, elevates perceived value.",
+      "rank": 43
+    },
+    "design-knowledge-standards__trend-research": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Keeps staging current, maximizes buyer appeal, reinforces market leadership.",
+      "rank": 72
+    },
+    "design-knowledge-standards__before-after-standards": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Creates compelling marketing content, proves value, aids sales.",
+      "rank": 41
+    },
+    "marketing-brand-content__brand-voice-guide": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Ensures consistent brand messaging, builds strong identity and trust.",
+      "rank": 48
+    },
+    "marketing-brand-content__blog-library-calendar": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Drives organic traffic, establishes thought leadership, generates leads.",
+      "rank": 77
+    },
+    "marketing-brand-content__social-playbook-assets": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Drives social engagement, builds brand, generates leads efficiently.",
+      "rank": 49
+    },
+    "marketing-brand-content__newsletter-system-flodesk": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Nurtures leads, drives repeat business, maintains client relationships.",
+      "rank": 78
+    },
+    "marketing-brand-content__portfolio-best-photos-archive": {
+      "impact": 98,
+      "tier": "High",
+      "why": "Essential for marketing, showcases work, directly aids conversion.",
+      "rank": 4
+    },
+    "marketing-brand-content__case-studies": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Powerful proof of ROI, builds credibility, directly aids conversion.",
+      "rank": 21
+    },
+    "marketing-brand-content__social-proof-award-badges": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Reinforces credibility, builds trust, enhances all marketing collateral.",
+      "rank": 50
+    },
+    "marketing-brand-content__website-seo-assets": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Drives organic leads, establishes online presence, foundational for digital marketing.",
+      "rank": 22
+    },
+    "marketing-brand-content__email-templates-signature-block": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Standardizes professional communication, reinforces brand, saves time.",
+      "rank": 102
+    },
+    "marketing-brand-content__video-content-library": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Highly engaging, drives brand awareness, generates leads, showcases work.",
+      "rank": 51
+    },
+    "education-ce-program__ce-course-content-accreditation": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Positions as expert, builds agent relationships, direct lead generation.",
+      "rank": 17
+    },
+    "education-ce-program__registration-system": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Streamlines CE program enrollment, supports lead generation.",
+      "rank": 98
+    },
+    "education-ce-program__decks-flyers": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Promotes CE courses, attracts participants, supports lead generation.",
+      "rank": 73
+    },
+    "education-ce-program__class-scheduling-enrollment": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Manages CE program logistics, supports lead generation.",
+      "rank": 97
+    },
+    "education-ce-program__certificate-delivery": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Ensures CE compliance, maintains agent relationships, supports program.",
+      "rank": 126
+    },
+    "education-ce-program__tsc-collective-materials": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Leverages external resources, supports industry engagement.",
+      "rank": 160
+    },
+    "photography-media-production__capture-edit-workflow": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Ensures consistent high-quality imagery, streamlines production, boosts sales.",
+      "rank": 25
+    },
+    "photography-media-production__hdr-retouch-standards": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Ensures luxury photo quality, enhances buyer perception, maintains brand.",
+      "rank": 53
+    },
+    "photography-media-production__photographer-editor-sops": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Standardizes photo shoots, ensures marketing-ready images, saves time.",
+      "rank": 82
+    },
+    "photography-media-production__photo-license-agreements": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Protects intellectual property, enables commercial use of imagery.",
+      "rank": 132
+    },
+    "photography-media-production__media-asset-library": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Centralizes visual assets, saves marketing time, enables content creation.",
+      "rank": 54
+    },
+    "financial-accounting__chart-of-accounts-quickbooks": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Foundational for financial reporting, ensures accurate tracking and compliance.",
+      "rank": 143
+    },
+    "financial-accounting__margin-pricing-analysis": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Directly informs pricing strategy, maximizes profitability, guides business decisions.",
+      "rank": 19
+    },
+    "financial-accounting__ar-ap-invoicing": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Ensures timely revenue collection, manages cash flow, streamlines operations.",
+      "rank": 74
+    },
+    "financial-accounting__bank-reconciliation-procedures": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Ensures financial accuracy, prevents fraud, supports compliance.",
+      "rank": 161
+    },
+    "financial-accounting__kpis-financial-reports": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Provides critical insights, enables data-driven decisions to boost revenue.",
+      "rank": 18
+    },
+    "financial-accounting__tax-posture-policy": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Ensures tax compliance, optimizes tax burden, protects profitability.",
+      "rank": 127
+    },
+    "financial-accounting__budget-forecasts": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Guides financial planning, resource allocation, and revenue targets.",
+      "rank": 44
+    },
+    "technology-systems-data__system-integration-inventory": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Ensures smooth system operation, reduces tech issues, foundational for IT.",
+      "rank": 122
+    },
+    "technology-systems-data__credentials-access-map": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Essential for security, manages access, ensures compliance.",
+      "rank": 157
+    },
+    "technology-systems-data__data-schemas": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Ensures data consistency, foundational for reporting and system development.",
+      "rank": 158
+    },
+    "technology-systems-data__automation-agent-definitions": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Drives significant efficiency, reduces labor, scales operations.",
+      "rank": 62
+    },
+    "technology-systems-data__dashboards-reporting": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Provides real-time insights, enables data-driven decisions, boosts performance.",
+      "rank": 31
+    },
+    "people-hr-team__job-descriptions-roles": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Clarifies responsibilities, improves hiring, supports performance management.",
+      "rank": 165
+    },
+    "people-hr-team__onboarding-training": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Speeds up new hire productivity, ensures consistent quality, reduces errors.",
+      "rank": 105
+    },
+    "people-hr-team__subcontractor-agreements": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Manages external workforce, ensures compliance, protects company.",
+      "rank": 117
+    },
+    "people-hr-team__compensation-schedules": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Ensures fair compensation, supports employee retention, compliance.",
+      "rank": 164
+    },
+    "strategy-performance-governance__business-plan-annual-operating-plan": {
+      "impact": 98,
+      "tier": "High",
+      "why": "Foundational for setting targets, allocating resources, driving growth.",
+      "rank": 6
+    },
+    "strategy-performance-governance__kpi-dictionary-dashboards": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Enables data-driven decisions, improves performance, ensures accountability.",
+      "rank": 30
+    },
+    "strategy-performance-governance__competitive-positioning-differentiation-matrix": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Informs sales/marketing strategy, defines competitive edge, boosts win rates.",
+      "rank": 61
+    },
+    "strategy-performance-governance__risk-register": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Identifies and mitigates business threats, protects operations and revenue.",
+      "rank": 139
+    },
+    "strategy-performance-governance__lessons-learned-retrospectives": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Drives continuous improvement, enhances project success and client satisfaction.",
+      "rank": 121
+    },
+    "strategy-performance-governance__decision-rights-signature-authority-matrix": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Streamlines decision-making, prevents bottlenecks, ensures accountability.",
+      "rank": 155
+    },
+    "risk-safety-claims-incident-management__field-warehouse-safety-protocols": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Reduces accidents, protects employees, avoids legal liabilities and downtime.",
+      "rank": 108
+    },
+    "risk-safety-claims-incident-management__incident-report-log": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Tracks incidents, informs safety improvements, supports insurance claims.",
+      "rank": 154
+    },
+    "risk-safety-claims-incident-management__liability-waiver-templates": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Protects company from liability, reduces financial risk.",
+      "rank": 120
+    },
+    "risk-safety-claims-incident-management__claims-damage-loss-recovery-sop": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Recovers costs from damage/loss, protects assets, standardizes claims.",
+      "rank": 85
+    },
+    "risk-safety-claims-incident-management__coi-request-sop": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Streamlines COI issuance, ensures compliance, supports client needs.",
+      "rank": 138
+    },
+    "property-access-site-control__key-lockbox-alarm-code-register": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Ensures secure and efficient property access, prevents delays.",
+      "rank": 107
+    },
+    "property-access-site-control__access-permissions-authorization-log": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Enhances security, accountability, prevents unauthorized access.",
+      "rank": 151
+    },
+    "property-access-site-control__site-control-sop": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Standardizes site management, protects property, builds client trust.",
+      "rank": 84
+    },
+    "data-privacy-security-continuity__data-handling-privacy-policy": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Builds client trust, ensures compliance, protects reputation.",
+      "rank": 125
+    },
+    "data-privacy-security-continuity__access-control-matrix": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Enhances data security, prevents unauthorized access, ensures compliance.",
+      "rank": 142
+    },
+    "data-privacy-security-continuity__credential-api-secret-register": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Critical for system security, prevents data breaches, protects operations.",
+      "rank": 96
+    },
+    "data-privacy-security-continuity__backup-incident-response-plan": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Minimizes downtime, protects data, ensures business continuity and revenue.",
+      "rank": 40
+    },
+    "data-privacy-security-continuity__business-continuity-disaster-recovery": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Ensures business resilience, protects operations and revenue during emergencies.",
+      "rank": 14
+    },
+    "customer-success-post-project-experience__project-handoff-onboarding-flow": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Improves client satisfaction, reduces misunderstandings, leads to referrals.",
+      "rank": 70
+    },
+    "customer-success-post-project-experience__satisfaction-nps-survey": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Improves service, drives retention, generates referrals and testimonials.",
+      "rank": 39
+    },
+    "customer-success-post-project-experience__post-staging-care-instructions": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Reduces damage claims, improves client experience, protects inventory.",
+      "rank": 95
+    },
+    "customer-success-post-project-experience__retention-referral-generation-playbook": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Drives repeat business, generates high-quality referrals, maximizes client value.",
+      "rank": 13
+    },
+    "customer-success-post-project-experience__client-escalation-log": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Manages client issues effectively, protects reputation, aids retention.",
+      "rank": 112
+    },
+    "knowledge-management-documentation-governance__kb-taxonomy-ownership-map": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Ensures knowledge base is organized, current, and useful.",
+      "rank": 146
+    },
+    "knowledge-management-documentation-governance__document-freshness-review-cadence": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Ensures accuracy and relevance of documents, supports efficiency.",
+      "rank": 145
+    },
+    "knowledge-management-documentation-governance__company-glossary": {
+      "impact": 60,
+      "tier": "Low",
+      "why": "Improves internal communication, reduces misunderstandings, standardizes terminology.",
+      "rank": 163
+    },
+    "knowledge-management-documentation-governance__sop-change-log": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Tracks process evolution, aids compliance, supports continuous improvement.",
+      "rank": 147
+    },
+    "market-real-estate-data__mls-active-sold-listings-comps": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Informs pricing, strategy, and client advice, boosts win rates.",
+      "rank": 20
+    },
+    "market-real-estate-data__dom-absorption-metrics": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Provides market insights, demonstrates staging value, aids client advice.",
+      "rank": 46
+    },
+    "market-real-estate-data__property-parcel-assessor-records": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Essential for accurate estimating, project planning, and client research.",
+      "rank": 101
+    },
+    "market-real-estate-data__agent-broker-directories-licenses": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Supports targeted outreach, direct lead generation, builds partnerships.",
+      "rank": 76
+    },
+    "market-real-estate-data__home-price-indices": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Provides market context for client advice, reinforces company expertise.",
+      "rank": 115
+    },
+    "market-real-estate-data__neighborhood-demographic-data": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Informs design choices, increases staging effectiveness, boosts buyer appeal.",
+      "rank": 47
+    },
+    "industry-standards-research__resa-standards": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Ensures professional best practices, reinforces credibility, guides quality.",
+      "rank": 99
+    },
+    "industry-standards-research__staging-roi-dom-statistics": {
+      "impact": 98,
+      "tier": "High",
+      "why": "Powerful sales tool, proves staging value, directly aids conversion.",
+      "rank": 2
+    },
+    "industry-standards-research__certification-bodies": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Supports professional development, enhances company reputation.",
+      "rank": 144
+    },
+    "industry-standards-research__methodology-references": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Guides internal processes, ensures best practices, supports training.",
+      "rank": 128
+    },
+    "industry-standards-research__industry-whitepapers": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Informs strategic decisions, keeps company competitive, positions as knowledgeable.",
+      "rank": 113
+    },
+    "vendors-suppliers__furniture-d-cor-vendors": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Essential for procurement, ensures inventory quality, enables staging.",
+      "rank": 64
+    },
+    "vendors-suppliers__window-treatment-vendor": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Enables premium services, ensures design options, supports profitability.",
+      "rank": 91
+    },
+    "vendors-suppliers__catalogs-pricing-lead-times": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Essential for efficient procurement, cost control, accurate project costing.",
+      "rank": 63
+    },
+    "vendors-suppliers__photography-floor-plan-vendors": {
+      "impact": 90,
+      "tier": "Medium",
+      "why": "Ensures high-quality visual assets, directly impacts property appeal.",
+      "rank": 65
+    },
+    "vendors-suppliers__moving-logistics-partners": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Ensures operational capacity, prevents project delays, enables more jobs.",
+      "rank": 90
+    },
+    "vendors-suppliers__print-marketing-vendors": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Ensures professional marketing materials, reinforces brand.",
+      "rank": 123
+    },
+    "competitive-intelligence__competitor-roster-profiles": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Informs competitive strategy, helps differentiate services, improves win rates.",
+      "rank": 67
+    },
+    "competitive-intelligence__competitor-pricing": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Directly informs pricing strategy, ensures competitiveness and profitability.",
+      "rank": 35
+    },
+    "competitive-intelligence__competitor-sighting-attribution-data": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Informs sales targeting, identifies market opportunities, guides strategy.",
+      "rank": 111
+    },
+    "competitive-intelligence__market-share-differentiation-matrix": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Guides strategic decisions, improves market share and profitability.",
+      "rank": 36
+    },
+    "regulatory-legal-external__state-licensing-nv-red-cpcn": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Essential for legal operation, avoids severe penalties, enables core business.",
+      "rank": 137
+    },
+    "regulatory-legal-external__ce-accreditation-rules": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Ensures CE program validity, protects lead generation channel.",
+      "rank": 135
+    },
+    "regulatory-legal-external__tax-codes": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Ensures tax compliance, optimizes financial burden, protects profitability.",
+      "rank": 153
+    },
+    "regulatory-legal-external__insurance-requirements": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Ensures legal compliance, protects against liability, enables operations.",
+      "rank": 136
+    },
+    "regulatory-legal-external__real-estate-regulations": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Ensures legal compliance in marketing, protects company reputation.",
+      "rank": 152
+    },
+    "partner-referral-network__brokerages-agents": {
+      "impact": 98,
+      "tier": "High",
+      "why": "Primary source of high-quality leads, directly drives new business.",
+      "rank": 5
+    },
+    "partner-referral-network__photographers": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Ensures high-quality photography, critical for marketing and sales.",
+      "rank": 81
+    },
+    "partner-referral-network__contractors-painters-handymen": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Ensures properties are ready, prevents delays, enables full service.",
+      "rank": 80
+    },
+    "partner-referral-network__cleaners": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Ensures pristine properties, enhances appeal, supports luxury brand.",
+      "rank": 104
+    },
+    "partner-referral-network__complementary-service-providers": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Expands network, potential for reciprocal referrals, enhances client service.",
+      "rank": 116
+    },
+    "professional-development-community__ce-accreditation-courses": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Enhances team expertise, boosts company reputation.",
+      "rank": 150
+    },
+    "professional-development-community__industry-conferences": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Networking, trend insights, brand visibility, informs strategy.",
+      "rank": 133
+    },
+    "professional-development-community__the-staging-collective-tsc": {
+      "impact": 75,
+      "tier": "Medium",
+      "why": "Access to best practices, problem-solving, industry recognition.",
+      "rank": 119
+    },
+    "professional-development-community__training-resources": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Enhances team skills, improves service quality, supports professional growth.",
+      "rank": 134
+    },
+    "customer-facing-reference__staging-reports-market-analyses": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Justifies value, builds trust, reinforces expertise, aids conversion.",
+      "rank": 38
+    },
+    "customer-facing-reference__buyer-seller-education": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Educates clients, overcomes objections, builds trust, drives urgency.",
+      "rank": 37
+    },
+    "customer-facing-reference__roi-calculators": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Directly demonstrates financial value, powerful sales tool, aids conversion.",
+      "rank": 12
+    },
+    "customer-facing-reference__client-agent-faq": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Reduces inquiries, clarifies process, builds confidence, aids conversion.",
+      "rank": 68
+    },
+    "customer-facing-reference__homeowner-occupied-home-prep-guides": {
+      "impact": 85,
+      "tier": "Medium",
+      "why": "Ensures property readiness, prevents delays, improves staging outcome.",
+      "rank": 69
+    },
+    "customer-facing-reference__client-onboarding-tou-nda-materials": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Standardizes client intake, ensures legal compliance, builds trust.",
+      "rank": 94
+    },
+    "buyer-psychology-demographics__buyer-persona-research": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Informs design/marketing, targets buyers, increases conversion.",
+      "rank": 7
+    },
+    "buyer-psychology-demographics__demographic-lifestyle-data": {
+      "impact": 90,
+      "tier": "High",
+      "why": "Tailors staging to buyers, maximizes appeal, increases effectiveness.",
+      "rank": 32
+    },
+    "buyer-psychology-demographics__emotional-merchandising-references": {
+      "impact": 95,
+      "tier": "High",
+      "why": "Guides design to evoke emotions, drives offers, increases sales speed.",
+      "rank": 8
+    },
+    "sustainability-disposal-resources__donation-partners": {
+      "impact": 70,
+      "tier": "Low",
+      "why": "Enhances brand reputation, provides ethical disposal, reduces waste.",
+      "rank": 140
+    },
+    "sustainability-disposal-resources__resale-liquidation-channels": {
+      "impact": 80,
+      "tier": "Medium",
+      "why": "Recovers value from inventory, directly impacts profitability.",
+      "rank": 110
+    },
+    "sustainability-disposal-resources__recycling-disposal-references": {
+      "impact": 65,
+      "tier": "Low",
+      "why": "Supports brand reputation, ensures compliant waste management.",
+      "rank": 156
+    },
+    "cross-check-additions-gpt__risk-safety-claims-incident-management": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 172
+    },
+    "cross-check-additions-gpt__sustainability-disposal-resources": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 174
+    },
+    "cross-check-additions-gpt__buyer-psychology-demographics": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 167
+    },
+    "cross-check-additions-gpt__knowledge-management-documentation-governance": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 170
+    },
+    "cross-check-additions-gpt__customer-success-post-project-experience": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 168
+    },
+    "cross-check-additions-gpt__data-privacy-security-continuity": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 169
+    },
+    "cross-check-additions-gpt__property-access-site-control": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 171
+    },
+    "cross-check-additions-gpt__standout-documents-merged-into-existing-categories": {
+      "impact": 50,
+      "tier": "Low",
+      "why": "(unscored — default)",
+      "rank": 173
+    }
+  }
+}

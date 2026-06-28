@@ -172,6 +172,10 @@ export interface AgentConfig {
    * Only applies to the claude-code runtime (Hermes never passes the flag).
    */
   dangerously_skip_permissions?: boolean;
+  /** Path to a role-scoped .mcp.json. When set, Claude Code is launched with
+   *  --mcp-config <path> --strict-mcp-config so only the listed servers load,
+   *  preventing the global ~/.mcp.json from multiplying across all sessions. */
+  mcp_config?: string;
   working_directory?: string;
   enabled?: boolean;
   crons?: CronEntry[];

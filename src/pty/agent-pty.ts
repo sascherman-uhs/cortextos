@@ -251,6 +251,12 @@ export class AgentPTY {
       args.push('--model', this.config.model);
     }
 
+    // Role-scoped MCP: only load the servers this agent actually needs.
+    // --strict-mcp-config suppresses ~/.mcp.json so the count stays bounded.
+    if (this.config.mcp_config) {
+      args.push('--mcp-config', this.config.mcp_config, '--strict-mcp-config');
+    }
+
     // Local override pattern (feat #20): concatenate {agentDir}/local/*.md files
     // and append as system prompt. The local/ dir is gitignored so users can customize
     // agent behavior without merge conflicts on framework updates.

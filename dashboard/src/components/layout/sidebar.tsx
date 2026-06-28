@@ -12,6 +12,7 @@ import {
   IconChartDots3,
   IconFlask,
   IconBook2,
+  IconChecklist,
   IconPuzzle,
   IconSettings,
   IconSearch,
@@ -48,6 +49,7 @@ const navItems: NavItem[] = [
 
   // Intelligence
   { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2, section: 'intel' },
+  { label: 'KB Checklist', href: '/knowledge-base/checklist', icon: IconChecklist, section: 'intel' },
   { label: 'Wiki', href: '/wiki', icon: IconNotes, section: 'intel' },
   { label: 'Experiments', href: '/experiments', icon: IconFlask, section: 'intel' },
   { label: 'Skills', href: '/skills', icon: IconPuzzle, section: 'intel' },
@@ -84,7 +86,14 @@ export function Sidebar({
 
   function isActive(href: string) {
     if (href === '/') return pathname === '/';
-    return pathname.startsWith(href);
+    if (pathname !== href && !pathname.startsWith(`${href}/`)) return false;
+    // Only the most specific (longest) matching nav href stays active, so a
+    // parent route (/knowledge-base) doesn't light up on a child (/knowledge-base/checklist).
+    const longestMatch = navItems
+      .map((i) => i.href)
+      .filter((h) => h !== '/' && (pathname === h || pathname.startsWith(`${h}/`)))
+      .reduce((a, b) => (b.length > a.length ? b : a), '');
+    return href === longestMatch;
   }
 
   function getBadge(item: NavItem): number {

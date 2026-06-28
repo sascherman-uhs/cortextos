@@ -14,6 +14,7 @@ import {
   IconActivity,
   IconMessages,
   IconBook2,
+  IconChecklist,
   IconFlask,
   IconPuzzle,
   IconSettings,
@@ -36,6 +37,7 @@ const morePages = [
   { label: 'Comms', href: '/comms', icon: IconMessages },
   { label: 'Activity', href: '/activity', icon: IconActivity },
   { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2 },
+  { label: 'KB Checklist', href: '/knowledge-base/checklist', icon: IconChecklist },
   { label: 'Wiki', href: '/wiki', icon: IconNotes },
   { label: 'Workflows', href: '/workflows', icon: IconClock },
   { label: 'Strategy', href: '/strategy', icon: IconTarget },
@@ -58,7 +60,12 @@ export function BottomNav() {
 
   function isActive(href: string) {
     if (href === '/') return pathname === '/';
-    return pathname.startsWith(href);
+    if (pathname !== href && !pathname.startsWith(`${href}/`)) return false;
+    const all = [...mainTabs, ...morePages].map((p) => p.href);
+    const longestMatch = all
+      .filter((h) => h !== '/' && (pathname === h || pathname.startsWith(`${h}/`)))
+      .reduce((a, b) => (b.length > a.length ? b : a), '');
+    return href === longestMatch;
   }
 
   const isMoreActive = morePages.some(p => isActive(p.href));
