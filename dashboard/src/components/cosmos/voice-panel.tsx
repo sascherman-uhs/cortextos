@@ -1,0 +1,293 @@
+// === JARVIS MOD #20 — Cosmos voice loop: frosted transcript panel (2026-07-03) ===
+// New file (isolated). Owns:
+//  - the useVoice hook (STT + amplitude + state machine),
+//  - the outbound SSE lifecycle: fetch a 5-min token from /api/uhs/stream-token,
+//    open EventSource on /api/messages/stream/jarvis-telegram?token=..., and on
+//    error (incl. token expiry) re-fetch a token and reopen,
+//  - reply routing: outbound lines are the agent's replies (they ALSO land in
+//    Scott's real Telegram — expected). We show a baseline of pre-existing
+//    outbound history as already-seen, then surface anything new as a reply.
+//  - hidden Playwright hooks (synth-transcript / synth-send) feeding the exact
+//    same send path as the mic.
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useVoice, type VoiceState } from './use-voice';
+// === JARVIS MOD #21 — Cosmos TTS playback ===
+import { useTts } from './use-tts';
+// === END JARVIS MOD #21 ===
+
+interface VoicePanelProps {
+  /** Lets the parent Scene mirror voice state → orb color, amplitude → breathing. */
+  onStateChange?: (state: VoiceState) => void;
+  onAmplitudeChange?: (amplitude: number) => void;
+  // === JARVIS MOD #21: TTS playback amplitude → orb breathing while speaking ===
+  onTtsAmplitudeChange?: (amplitude: number) => void;
+  // === END JARVIS MOD #21 ===
+}
+
+const STATE_LABEL: Record<VoiceState, string> = {
+  idle: 'Tap to speak',
+  listening: 'Listening…',
+  processing: 'Sending…',
+  responding: 'JARVIS is thinking…',
+};
+
+export function VoicePanel({
+  onStateChange,
+  onAmplitudeChange,
+  onTtsAmplitudeChange,
+}: VoicePanelProps) {
+  const voice = useVoice();
+  const {
+    state,
+    supported,
+    amplitude,
+    interim,
+    log,
+    startListening,
+    stopListening,
+    sendText,
+    pushAgentReply,
+  } = voice;
+
+  // === JARVIS MOD #21: TTS — speak new agent replies through the three-tier route ===
+  const { muted, toggleMute, speak, ttsAmplitude } = useTts();
+  // Track which reply ids we've already spoken so a re-render never double-speaks.
+  const spokenIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    onTtsAmplitudeChange?.(ttsAmplitude);
+  }, [ttsAmplitude, onTtsAmplitudeChange]);
+  useEffect(() => {
+    // Speak only the most recent, not-yet-spoken agent line. Speaking is a no-op
+    // while muted (and no /api/uhs/tts call fires) — enforced inside useTts.
+    for (let i = log.length - 1; i >= 0; i--) {
+      const entry = log[i];
+      if (entry.role !== 'agent') continue;
+      if (!spokenIdsRef.current.has(entry.id)) {
+        spokenIdsRef.current.add(entry.id);
+        void speak(entry.text);
+      }
+      break; // only consider the latest agent entry
+    }
+  }, [log, speak]);
+  // === END JARVIS MOD #21 ===
+
+  const [synthValue, setSynthValue] = useState('');
+  const esRef = useRef<EventSource | null>(null);
+  // Baseline: outbound lines seen at connect time are pre-existing history,
+  // not replies to this session. Once we've sent at least one turn, new
+  // outbound lines are treated as replies.
+  const sentCountRef = useRef(0);
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const closedRef = useRef(false);
+
+  // Bubble state + amplitude up to the Scene for the orb.
+  useEffect(() => {
+    onStateChange?.(state);
+  }, [state, onStateChange]);
+  useEffect(() => {
+    onAmplitudeChange?.(amplitude);
+  }, [amplitude, onAmplitudeChange]);
+
+  // --- Outbound SSE lifecycle ------------------------------------------------
+  const openStream = useCallback(async () => {
+    if (closedRef.current) return;
+    try {
+      const res = await fetch('/api/uhs/stream-token');
+      if (!res.ok) {
+        // Retry shortly (auth may be mid-refresh).
+        setTimeout(() => openStream(), 3000);
+        return;
+      }
+      const { token } = (await res.json()) as { token: string };
+      if (closedRef.current) return;
+
+      const es = new EventSource(
+        `/api/messages/stream/jarvis-telegram?token=${encodeURIComponent(token)}`,
+      );
+      esRef.current = es;
+
+      es.onmessage = (evt) => {
+        let parsed: { id?: string; text?: string; direction?: string };
+        try {
+          parsed = JSON.parse(evt.data);
+        } catch {
+          return;
+        }
+        const id = parsed.id ?? `out-${Date.now()}`;
+        if (seenIdsRef.current.has(id)) return;
+        seenIdsRef.current.add(id);
+        // Only surface outbound lines that arrive AFTER we've sent a turn.
+        if (sentCountRef.current > 0 && parsed.text) {
+          pushAgentReply(parsed.text, id);
+        }
+      };
+
+      es.onerror = () => {
+        // EventSource auto-reconnects on transient errors, but a 401 (expired
+        // 5-min token) is terminal for this connection — close and re-mint.
+        es.close();
+        esRef.current = null;
+        if (!closedRef.current) {
+          setTimeout(() => openStream(), 1000);
+        }
+      };
+    } catch {
+      if (!closedRef.current) setTimeout(() => openStream(), 3000);
+    }
+  }, [pushAgentReply]);
+
+  useEffect(() => {
+    closedRef.current = false;
+    openStream();
+    return () => {
+      closedRef.current = true;
+      esRef.current?.close();
+      esRef.current = null;
+    };
+  }, [openStream]);
+
+  // Wrap send so we can bump the "sends pending" gate for reply routing.
+  const doSend = useCallback(
+    (text: string) => {
+      if (!text.trim()) return;
+      sentCountRef.current += 1;
+      sendText(text);
+    },
+    [sendText],
+  );
+
+  const handleSynthSend = useCallback(() => {
+    const v = synthValue.trim();
+    if (!v) return;
+    doSend(v);
+    setSynthValue('');
+  }, [synthValue, doSend]);
+
+  const micActive = state === 'listening';
+
+  return (
+    <div className="pointer-events-none fixed inset-x-0 bottom-0 z-20 flex justify-center px-4 pb-8">
+      <div className="pointer-events-auto w-full max-w-xl rounded-2xl border border-white/15 bg-[#2D2928]/60 p-4 text-[#EDE8DF] shadow-2xl backdrop-blur-xl">
+        {/* Conversation log */}
+        <div
+          className="mb-3 max-h-48 space-y-2 overflow-y-auto pr-1"
+          data-testid="cosmos-log"
+        >
+          {log.length === 0 && (
+            <p className="text-center text-xs text-[#CFB383]/50">
+              Ask JARVIS anything.
+            </p>
+          )}
+          {log.map((entry) => (
+            <div
+              key={entry.id}
+              className={
+                entry.role === 'user'
+                  ? 'text-right text-sm text-[#EDE8DF]'
+                  : 'text-left text-sm text-[#CFB383]'
+              }
+              data-testid={entry.role === 'agent' ? 'cosmos-reply' : 'cosmos-user'}
+            >
+              <span className="inline-block rounded-lg bg-white/5 px-3 py-1.5">
+                {entry.text}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Live interim transcript */}
+        {interim && (
+          <p className="mb-2 truncate text-center text-xs italic text-[#EDE8DF]/70">
+            {interim}
+          </p>
+        )}
+
+        {/* Controls row */}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={micActive ? stopListening : startListening}
+            disabled={!supported || state === 'processing'}
+            aria-label={micActive ? 'Stop listening' : 'Start voice input'}
+            data-testid="cosmos-mic"
+            className={[
+              'flex h-11 w-11 shrink-0 items-center justify-center rounded-full border transition-colors',
+              micActive
+                ? 'animate-pulse border-[#F5F0E6] bg-[#F5F0E6]/20 text-[#F5F0E6]'
+                : 'border-[#CFB383]/50 bg-[#CFB383]/10 text-[#CFB383] hover:bg-[#CFB383]/20',
+              !supported ? 'opacity-40' : '',
+            ].join(' ')}
+          >
+            {/* Simple mic glyph (no icon dep needed here) */}
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="23" />
+            </svg>
+          </button>
+
+          <span className="flex-1 text-sm text-[#EDE8DF]/80" data-testid="cosmos-status">
+            {supported ? STATE_LABEL[state] : 'Voice not supported — use the box below'}
+          </span>
+
+          {/* === JARVIS MOD #21: TTS mute toggle (persisted in localStorage) === */}
+          <button
+            onClick={toggleMute}
+            aria-label={muted ? 'Unmute JARVIS voice' : 'Mute JARVIS voice'}
+            aria-pressed={muted}
+            data-testid="cosmos-mute"
+            title={muted ? 'JARVIS voice muted' : 'JARVIS voice on'}
+            className={[
+              'flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-colors',
+              muted
+                ? 'border-white/20 bg-white/5 text-[#EDE8DF]/40'
+                : 'border-[#CFB383]/50 bg-[#CFB383]/10 text-[#CFB383] hover:bg-[#CFB383]/20',
+            ].join(' ')}
+          >
+            {muted ? (
+              // Muted speaker glyph
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <line x1="23" y1="9" x2="17" y2="15" />
+                <line x1="17" y1="9" x2="23" y2="15" />
+              </svg>
+            ) : (
+              // Speaker-on glyph
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+              </svg>
+            )}
+          </button>
+          {/* === END JARVIS MOD #21 === */}
+        </div>
+
+        {/* Hidden Playwright test hooks — feed the EXACT same send path as voice.
+            Kept visually minimal but not display:none so tests can interact. */}
+        <div className="mt-3 flex items-center gap-2 opacity-60">
+          <input
+            type="text"
+            value={synthValue}
+            onChange={(e) => setSynthValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleSynthSend();
+            }}
+            placeholder="Type a message…"
+            data-testid="synth-transcript"
+            className="flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-sm text-[#EDE8DF] placeholder:text-[#EDE8DF]/30 focus:border-[#CFB383]/50 focus:outline-none"
+          />
+          <button
+            onClick={handleSynthSend}
+            data-testid="synth-send"
+            className="rounded-lg border border-[#9E7331]/60 bg-[#9E7331]/20 px-3 py-1.5 text-sm text-[#CFB383] hover:bg-[#9E7331]/30"
+          >
+            Send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+// === END JARVIS MOD #20 ===

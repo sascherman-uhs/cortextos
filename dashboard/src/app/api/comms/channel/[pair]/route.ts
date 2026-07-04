@@ -29,9 +29,18 @@ export async function GET(
 ) {
   const { pair } = await params;
   const agents = pair.split('--');
-  if (agents.length !== 2 || !agents.every(a => /^[a-z0-9_-]+$/.test(a))) {
+  // === JARVIS MOD #18 (2026-07-03): allow email-shaped identities in pair halves ===
+  // Human↔agent channels use the operator's email (e.g. scott@utopiahomestaging.com)
+  // as one half of the pair key (see buildPairKey/resolveIdentity), but the old
+  // /^[a-z0-9_-]+$/ validation rejected '@' and '.', so every human↔agent channel
+  // 400'd and the feed rendered empty. Halves are used in path.join below, so the
+  // char class still excludes '/' and we explicitly reject '..' and leading dots.
+  const validHalf = (a: string) =>
+    /^[a-z0-9][a-z0-9._@-]*$/i.test(a) && !a.includes('..');
+  if (agents.length !== 2 || !agents.every(validHalf)) {
     return Response.json({ error: 'Invalid pair format. Use agent1--agent2' }, { status: 400 });
   }
+  // === END JARVIS MOD #18 ===
 
   const { searchParams } = request.nextUrl;
   const limit = Math.min(Math.max(parseInt(searchParams.get('limit') ?? '100', 10) || 100, 1), 500);

@@ -45,6 +45,15 @@ export function VoiceMode() {
   const [supported, setSupported] = useState(false);
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  // === JARVIS MOD #15: fix stale-closure transcript drop ===
+  // recognition.onend is bound once at start time and captured `transcript`
+  // from a stale closure (empty at click time), silently dropping the final
+  // transcript. Mirror the latest transcript into a ref so onend reads live.
+  const transcriptRef = useRef('');
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+  // === END JARVIS MOD #15 ===
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animFrameRef = useRef<number>(0);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -143,7 +152,9 @@ export function VoiceMode() {
 
     recognition.onend = () => {
       stopWaveform();
-      const final = transcript;
+      // === JARVIS MOD #15: fix stale-closure transcript drop ===
+      const final = transcriptRef.current;
+      // === END JARVIS MOD #15 ===
       if (final.trim()) {
         sendToAgent(final);
       } else {

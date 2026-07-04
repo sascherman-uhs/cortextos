@@ -24,6 +24,7 @@ import {
   IconRefresh,
   IconTrash,
   IconLoader2,
+  IconBolt, // === JARVIS MOD #17: Wake icon ===
 } from '@tabler/icons-react';
 import type { HealthStatus } from '@/lib/types';
 
@@ -103,6 +104,34 @@ export function AgentActions({
     }
   }
 
+  // === JARVIS MOD #17 — Wake handler (IPC fast-checker wake via api/uhs route) ===
+  async function handleWake() {
+    setLoading(true);
+    setFeedback(null);
+    try {
+      const res = await fetch(`/api/uhs/agents/${encodeURIComponent(agentName)}/wake`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ org }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error ?? `Wake failed (${res.status})`);
+      }
+      setFeedback({ type: 'success', message: 'wake sent' });
+      onAction?.();
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Unknown error',
+      });
+    } finally {
+      setLoading(false);
+      setTimeout(() => setFeedback(null), 3000);
+    }
+  }
+  // === END JARVIS MOD #17 ===
+
   const isDown = health === 'down' || health === 'stale';
   const isHealthy = health === 'healthy';
 
@@ -143,6 +172,12 @@ export function AgentActions({
           <DropdownMenuItem onClick={() => handleLifecycle('restart_fresh')}>
             <IconRefresh className="h-4 w-4" />
             Restart (Fresh)
+          </DropdownMenuItem>
+
+          {/* === JARVIS MOD #17: Wake (nudge fast checker, no restart) === */}
+          <DropdownMenuItem onClick={handleWake}>
+            <IconBolt className="h-4 w-4" />
+            Wake
           </DropdownMenuItem>
 
           <DropdownMenuSeparator />

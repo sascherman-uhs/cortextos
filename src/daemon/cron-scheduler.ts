@@ -487,7 +487,20 @@ export class CronScheduler {
         );
       }
 
+      // === JARVIS MOD #17 — slow-fire warning (2026-07-03) ===
+      // Time the full dispatch (incl. retries). A single cron taking >2s to
+      // fire is a latency signal worth surfacing — the tick loop is sequential
+      // by design, so a slow fire delays every later-due cron on this agent.
+      const dispatchStart = Date.now();
       const success = await fireWithRetry(cron, this.agentName, this.onFire, this.logger);
+      const dispatchMs = Date.now() - dispatchStart;
+      if (dispatchMs > 2000) {
+        this.logger(
+          `[cron-scheduler] WARNING: slow cron fire — agent "${this.agentName}" ` +
+          `cron "${name}" took ${dispatchMs}ms (>2000ms) to dispatch`
+        );
+      }
+      // === END JARVIS MOD #17 ===
 
       if (success) {
         // Persist last_fired_at + fire_count to disk.

@@ -20,6 +20,9 @@ import {
   IconTarget,
   IconMessages,
   IconNotes,
+  // === JARVIS MOD #19 (2026-07-03): Cosmos tab nav icon ===
+  IconPlanet,
+  // === END JARVIS MOD #19 ===
 } from '@tabler/icons-react';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
@@ -36,6 +39,9 @@ interface NavItem {
 const navItems: NavItem[] = [
   // Core
   { label: 'Overview', href: '/', icon: IconLayoutDashboard, section: 'core' },
+  // === JARVIS MOD #19 (2026-07-03): Cosmos voice-first JARVIS tab ===
+  { label: 'JARVIS', href: '/jarvis', icon: IconPlanet, section: 'core' },
+  // === END JARVIS MOD #19 ===
   { label: 'Agents', href: '/agents', icon: IconRobot, section: 'core' },
   { label: 'Tasks', href: '/tasks', icon: IconListCheck, section: 'core' },
   { label: 'Activity', href: '/activity', icon: IconActivity, section: 'core' },

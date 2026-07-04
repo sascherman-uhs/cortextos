@@ -8,6 +8,7 @@ import { CreateAgentDialog } from './create-agent-dialog';
 import { HealthDot } from '@/components/shared/health-dot';
 import { IconUsers } from '@tabler/icons-react';
 import { useSSE } from '@/hooks/use-sse';
+import { FleetControls } from '@/components/uhs/fleet-controls'; // === JARVIS MOD #17 ===
 import type { HealthStatus, SSEEvent } from '@/lib/types';
 
 interface AgentsGridProps {
@@ -43,6 +44,9 @@ export function AgentsGrid({ initialAgents }: AgentsGridProps) {
 
   return (
     <div className="space-y-4">
+      {/* === JARVIS MOD #17: fleet controls (Restart All + 10s auto-refresh) === */}
+      <FleetControls agents={agents} />
+
       {/* Health summary row */}
       <div className="flex items-center gap-4 text-sm text-muted-foreground">
         <span className="flex items-center gap-1.5">
