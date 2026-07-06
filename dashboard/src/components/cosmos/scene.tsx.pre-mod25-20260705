@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { Orb } from './orb';
 import { Particles } from './particles';
-import { PerfToggle, readStoredPerfMode, type PerfMode } from './perf-toggle';
+import { PerfToggle, readPerfMode, type PerfMode } from './perf-toggle';
 // === JARVIS MOD #20: voice loop wiring ===
 import { VoicePanel } from './voice-panel';
 import type { VoiceState } from './use-voice';
@@ -13,44 +13,24 @@ import type { VoiceState } from './use-voice';
 import { OrbitSystem, AgentOrbitsOverlay, useAgentOrbits } from './agent-orbits';
 import { DataPanels } from './data-panels';
 // === END JARVIS MOD #22 ===
-// === JARVIS MOD #29: Trillion cosmic-orb scene layers + palette ===
-import { NebulaBackground, GlowPool } from './nebula';
-import { NodeWeb } from './node-web';
-import { TEAL, CYAN, AQUA, MINT, PURPLE, SPACE } from './palette';
-// === END JARVIS MOD #29 ===
 
-// === JARVIS MOD #29: deep-space background replaces UHS charcoal in this scene ===
-const SPACE_BG = SPACE;
+const CHARCOAL = '#2D2928';
 
-// High-perf star count; low mode uses ~1/4.
+// High-perf particle count; low mode uses ~1/4.
 const HIGH_PARTICLES = 4000;
 const LOW_PARTICLES = 1000;
 
-// === JARVIS MOD #29: state → orb color/rim/brightness (Trillion palette).
-// idle dim teal, listening bright cyan, processing teal→purple drift + helix,
-// responding bright teal. NOTE: the voice hook currently emits only these four
-// states; an 'error' red-shift would slot in here if use-voice ever emits it. ===
-const STATE_CORE: Record<VoiceState, string> = {
-  idle: TEAL,
-  listening: CYAN,
-  processing: AQUA,
-  responding: TEAL,
-};
-const STATE_RIM: Record<VoiceState, string> = {
-  idle: MINT,
-  listening: MINT,
-  processing: PURPLE,
-  responding: MINT,
-};
-const STATE_BRIGHT: Record<VoiceState, number> = {
-  idle: 0.72,
-  listening: 1.05,
-  processing: 0.95,
-  responding: 1.18,
+// === JARVIS MOD #20: state → orb color map ===
+// idle gold, listening bright white-ish, processing warm amber, responding gold.
+const STATE_COLOR: Record<VoiceState, string> = {
+  idle: '#CFB383',
+  listening: '#F5F0E6',
+  processing: '#9E7331',
+  responding: '#CFB383',
 };
 // Idle breathing amplitude; live mic amplitude scales above this while speaking.
 const IDLE_AMPLITUDE = 0.035;
-// === END JARVIS MOD #29 ===
+// === END JARVIS MOD #20 ===
 
 declare global {
   interface Window {
@@ -72,14 +52,6 @@ declare global {
       ttsQueueDepth?: number;
       cosmosBaseTurnId?: number;
       // === END JARVIS MOD #24 ===
-      // === JARVIS MOD #25: eager, canonically-named turn seam. `baseTurnId` mirrors
-      // `cosmosBaseTurnId` but is written at hook mount (initial 0) so the regression
-      // suite sees the key before any TTS activity, and bumps on every user turn. ===
-      baseTurnId?: number;
-      // === END JARVIS MOD #25 ===
-      // === JARVIS MOD #31: last playback-path failure (null = healthy) ===
-      ttsLastError?: string | null;
-      // === END JARVIS MOD #31 ===
     };
     // === END JARVIS MOD #21 ===
   }
@@ -91,21 +63,7 @@ export default function Scene() {
   const [mode, setMode] = useState<PerfMode>('high');
 
   useEffect(() => {
-    // === JARVIS MOD #25 — mobile defaults to 'low' particles for perf/battery.
-    // An explicit toggle (stored value) always wins on either device; only when
-    // there is NO stored preference do we fall back to 'low' on a phone-sized
-    // viewport and 'high' on desktop. Desktop-with-no-preference stays 'high',
-    // so desktop behavior is byte-for-byte unchanged. ===
-    const stored = readStoredPerfMode();
-    if (stored) {
-      setMode(stored);
-    } else {
-      const isMobile =
-        typeof window !== 'undefined' &&
-        window.matchMedia('(max-width: 767px)').matches;
-      setMode(isMobile ? 'low' : 'high');
-    }
-    // === END JARVIS MOD #25 ===
+    setMode(readPerfMode());
   }, []);
 
   // === JARVIS MOD #20: live voice state + amplitude drive the orb ===
@@ -120,10 +78,7 @@ export default function Scene() {
   const [ttsAmplitude, setTtsAmplitude] = useState(0);
   const handleTtsAmplitudeChange = useCallback((a: number) => setTtsAmplitude(a), []);
 
-  const orbColor = STATE_CORE[voiceState];
-  const orbRim = STATE_RIM[voiceState];
-  const orbBrightness = STATE_BRIGHT[voiceState];
-  const ringStrength = voiceState === 'processing' ? 1 : 0;
+  const orbColor = STATE_COLOR[voiceState];
   // Orb breathing:
   //   - listening → blend idle + live mic amplitude
   //   - responding + TTS audible → blend idle + playback amplitude
@@ -140,18 +95,9 @@ export default function Scene() {
   const { agents, selected, selectedName, onSelect, onClose } = useAgentOrbits();
   // === END JARVIS MOD #22 ===
 
-  const lowPerf = mode === 'low';
-  const particleCount = lowPerf ? LOW_PARTICLES : HIGH_PARTICLES;
+  const particleCount = mode === 'low' ? LOW_PARTICLES : HIGH_PARTICLES;
   // Cap dpr in low mode; allow up to 2 in high mode for crisp wireframe.
-  const dpr: [number, number] = lowPerf ? [1, 1] : [1, 2];
-
-  // === JARVIS MOD #29: perf-driven scene budgets (mobile GPU must stay fluid) ===
-  const webNodes = lowPerf ? 40 : 100;
-  const webClusters = lowPerf ? 5 : 8;
-  const orbDetail = lowPerf ? 3 : 6;
-  const internalNodes = lowPerf ? 12 : 24;
-  const showGlow = !lowPerf;
-  // === END JARVIS MOD #29 ===
+  const dpr: [number, number] = mode === 'low' ? [1, 1] : [1, 2];
 
   useEffect(() => {
     // Debug global so tests can assert the active particle count.
@@ -165,56 +111,27 @@ export default function Scene() {
   }, [particleCount, voiceState]);
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden" style={{ background: SPACE_BG }}>
+    <div className="relative h-screen w-screen overflow-hidden" style={{ background: CHARCOAL }}>
       <Canvas
         camera={{ position: [0, 0, 6], fov: 55 }}
         dpr={dpr}
         gl={{ antialias: mode === 'high' }}
-        style={{ background: SPACE_BG }}
+        style={{ background: CHARCOAL }}
       >
-        <ambientLight intensity={0.6} />
-        {/* === JARVIS MOD #29: Trillion cosmic-orb layers === */}
-        <NebulaBackground />
-        <GlowPool color={orbRim} />
+        <ambientLight intensity={0.5} />
+        {/* === JARVIS MOD #22: point light so orbit spheres catch highlights === */}
+        <pointLight position={[0, 0, 6]} intensity={0.6} />
         <Particles count={particleCount} />
-        {/* Distant glowing node-web behind the orb */}
-        <NodeWeb
-          nodeCount={webNodes}
-          clusters={webClusters}
-          radiusMin={5}
-          radiusMax={13}
-          linkDist={3.4}
-          nodeSize={lowPerf ? 0.08 : 0.1}
-          lineColor={CYAN}
-          lineOpacity={0.16}
-          driftSpeed={0.02}
-          seed={1}
-          pulse={!lowPerf}
-        />
-        {/* === JARVIS MOD #20/#29: voice state drives orb color/rim/brightness/rings === */}
-        <Orb
-          amplitude={orbAmplitude}
-          color={orbColor}
-          rim={orbRim}
-          brightness={orbBrightness}
-          ringStrength={ringStrength}
-          detail={orbDetail}
-          showGlow={showGlow}
-          internalNodes={internalNodes}
-        />
-        {/* === JARVIS MOD #22/#29: agent avatar orbits (Tier 4) === */}
-        <OrbitSystem
-          agents={agents}
-          selectedName={selectedName}
-          lowPerf={lowPerf}
-          onSelect={onSelect}
-        />
+        {/* === JARVIS MOD #20: voice state drives orb color + amplitude === */}
+        <Orb amplitude={orbAmplitude} color={orbColor} />
+        {/* === JARVIS MOD #22: agent orbit spheres (Tier 4) === */}
+        <OrbitSystem agents={agents} selectedName={selectedName} onSelect={onSelect} />
         {/* === END JARVIS MOD #22 === */}
       </Canvas>
 
       {/* JARVIS label under the orb */}
       <div className="pointer-events-none absolute inset-x-0 bottom-[18%] flex justify-center">
-        <span className="text-2xl font-light tracking-[0.5em] text-[#5eead4] [text-shadow:0_0_20px_rgba(45,212,191,0.5)]">
+        <span className="text-2xl font-light tracking-[0.5em] text-[#CFB383] [text-shadow:0_0_20px_rgba(207,179,131,0.4)]">
           JARVIS
         </span>
       </div>

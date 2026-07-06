@@ -52,24 +52,11 @@ export function VoicePanel({
     stopListening,
     sendText,
     pushAgentReply,
-    // === JARVIS MOD #33: the hook's counter — incremented by EVERY send path ===
-    sentTurnsRef,
-    // === END JARVIS MOD #33 ===
   } = voice;
 
   // === JARVIS MOD #21: TTS — speak new agent replies through the three-tier route ===
   // === JARVIS MOD #24: also pull interrupt() for barge-in (mic press / new turn) ===
-  const { muted, toggleMute, speak, interrupt, ttsAmplitude, lastError } = useTts();
-
-  // === JARVIS MOD #31: one-tap audio pipeline check. Runs INSIDE the tap
-  // gesture (unlock + unmute + speak), so it isolates faults on the phone:
-  // hear it → delivery problem; silent → the lastError line says why. ===
-  const handleVoiceTest = useCallback(() => {
-    unlockSharedAudio();
-    if (muted) toggleMute();
-    void speak('Voice check, sir. If you can hear this, the audio pipeline is alive and well.');
-  }, [muted, toggleMute, speak]);
-  // === END JARVIS MOD #31 ===
+  const { muted, toggleMute, speak, interrupt, ttsAmplitude } = useTts();
   // Track which reply ids we've already spoken so a re-render never double-speaks.
   const spokenIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -95,9 +82,7 @@ export function VoicePanel({
   // Baseline: outbound lines seen at connect time are pre-existing history,
   // not replies to this session. Once we've sent at least one turn, new
   // outbound lines are treated as replies.
-  // === JARVIS MOD #33: panel-local counter REMOVED — it only counted typed
-  // sends, so voice-only sessions gated every reply out as history. The gate
-  // now reads sentTurnsRef from useVoice (incremented inside sendText). ===
+  const sentCountRef = useRef(0);
   const seenIdsRef = useRef<Set<string>>(new Set());
   const closedRef = useRef(false);
 
@@ -108,44 +93,6 @@ export function VoicePanel({
   useEffect(() => {
     onAmplitudeChange?.(amplitude);
   }, [amplitude, onAmplitudeChange]);
-
-  // === JARVIS MOD #30 (2026-07-06): history backfill — the missed-reply fix ===
-  // The SSE tail only delivers lines written WHILE connected. iOS suspends the
-  // PWA the instant the screen locks or the user app-switches, and JARVIS takes
-  // 10-40s to think — so the reply routinely lands while the stream is dead and
-  // was never re-delivered (silent app, reply visible in Telegram). Backfill
-  // from /api/messages/history on every (re)connect and on visibility resume.
-  // First call (before any send) runs in seed mode: marks existing outbound ids
-  // as seen WITHOUT speaking them, so history is never replayed aloud.
-  const backfill = useCallback(async (): Promise<number> => {
-    let surfaced = 0;
-    try {
-      const res = await fetch('/api/messages/history/jarvis-telegram?limit=20', {
-        credentials: 'same-origin',
-        cache: 'no-store',
-      });
-      if (!res.ok) return 0;
-      const items = (await res.json()) as {
-        id?: string;
-        direction?: string;
-        text?: string;
-      }[];
-      for (const it of items) {
-        if (it.direction !== 'outbound') continue;
-        const id = it.id ?? '';
-        if (!id || seenIdsRef.current.has(id)) continue;
-        seenIdsRef.current.add(id);
-        if (sentTurnsRef.current > 0 && it.text) {
-          pushAgentReply(it.text, id);
-          surfaced += 1;
-        }
-      }
-    } catch {
-      /* transient — next reconnect/backfill will retry */
-    }
-    return surfaced;
-  }, [pushAgentReply]);
-  // === END JARVIS MOD #30 ===
 
   // --- Outbound SSE lifecycle ------------------------------------------------
   const openStream = useCallback(async () => {
@@ -165,11 +112,6 @@ export function VoicePanel({
       );
       esRef.current = es;
 
-      // === JARVIS MOD #30: catch anything written while we were disconnected.
-      // (Seed mode on first connect; speaks only post-send replies after that.) ===
-      void backfill();
-      // === END JARVIS MOD #30 ===
-
       es.onmessage = (evt) => {
         let parsed: { id?: string; text?: string; direction?: string };
         try {
@@ -181,7 +123,7 @@ export function VoicePanel({
         if (seenIdsRef.current.has(id)) return;
         seenIdsRef.current.add(id);
         // Only surface outbound lines that arrive AFTER we've sent a turn.
-        if (sentTurnsRef.current > 0 && parsed.text) {
+        if (sentCountRef.current > 0 && parsed.text) {
           pushAgentReply(parsed.text, id);
         }
       };
@@ -203,44 +145,12 @@ export function VoicePanel({
   useEffect(() => {
     closedRef.current = false;
     openStream();
-    // === JARVIS MOD #30: iOS resume — the suspended PWA's EventSource is dead
-    // but onerror may not fire for up to a heartbeat (30s). On visibility
-    // resume, tear the stream down and reopen immediately (openStream also
-    // backfills), so a reply that landed during the suspension speaks within
-    // ~1s of the user returning to the app. ===
-    const onVisible = () => {
-      if (document.visibilityState !== 'visible' || closedRef.current) return;
-      esRef.current?.close();
-      esRef.current = null;
-      openStream();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    // === END JARVIS MOD #30 ===
-    // === JARVIS MOD #32 (2026-07-06): zombie-stream safety net. iOS/proxies can
-    // sever the SSE connection WITHOUT firing onerror — EventSource believes
-    // it's open, no reconnect fires, and if the user never backgrounds the app
-    // the visibility backfill never runs either (observed live: reply written
-    // 9s after the question, app foregrounded and silent for 3+ minutes).
-    // Poll backfill every 20s while visible; if the poll surfaces a reply the
-    // stream should have delivered, the stream is a zombie — bounce it. ===
-    const pollTimer = setInterval(async () => {
-      if (closedRef.current || document.visibilityState !== 'visible') return;
-      const missed = await backfill();
-      if (missed > 0 && !closedRef.current) {
-        esRef.current?.close();
-        esRef.current = null;
-        openStream();
-      }
-    }, 20_000);
-    // === END JARVIS MOD #32 ===
     return () => {
       closedRef.current = true;
-      document.removeEventListener('visibilitychange', onVisible);
-      clearInterval(pollTimer);
       esRef.current?.close();
       esRef.current = null;
     };
-  }, [openStream, backfill]);
+  }, [openStream]);
 
   // Wrap send so we can bump the "sends pending" gate for reply routing.
   const doSend = useCallback(
@@ -249,7 +159,8 @@ export function VoicePanel({
       // === JARVIS MOD #24: a new user turn cuts off any reply still being spoken ===
       interrupt();
       // === END JARVIS MOD #24 ===
-      sendText(text); // sendText increments sentTurnsRef itself (MOD #33)
+      sentCountRef.current += 1;
+      sendText(text);
     },
     [sendText, interrupt],
   );
@@ -355,18 +266,6 @@ export function VoicePanel({
             {supported ? STATE_LABEL[state] : 'Voice not supported — use the box below'}
           </span>
 
-          {/* === JARVIS MOD #31: one-tap audio pipeline check === */}
-          <button
-            onClick={handleVoiceTest}
-            aria-label="Test JARVIS voice"
-            data-testid="cosmos-voice-test"
-            title="Play a test line through the voice pipeline"
-            className="shrink-0 rounded-full border border-white/20 bg-white/5 px-3 py-1.5 text-xs text-[#EDE8DF]/70 transition-colors hover:bg-white/10"
-          >
-            Test voice
-          </button>
-          {/* === END JARVIS MOD #31 === */}
-
           {/* === JARVIS MOD #21: TTS mute toggle (persisted in localStorage) === */}
           <button
             onClick={toggleMute}
@@ -399,16 +298,6 @@ export function VoicePanel({
           </button>
           {/* === END JARVIS MOD #21 === */}
         </div>
-
-        {/* === JARVIS MOD #31: on-phone diagnostics — no console on iOS, so the
-            audio pipeline's last failure (and the mute state) must be VISIBLE. === */}
-        {(lastError || muted) && (
-          <p className="mt-2 text-xs" data-testid="cosmos-tts-error">
-            {muted && <span className="text-amber-300/80">Voice muted — tap the speaker icon. </span>}
-            {lastError && <span className="text-red-400/90">Audio: {lastError}</span>}
-          </p>
-        )}
-        {/* === END JARVIS MOD #31 === */}
 
         {/* Hidden Playwright test hooks — feed the EXACT same send path as voice.
             Kept visually minimal but not display:none so tests can interact. */}

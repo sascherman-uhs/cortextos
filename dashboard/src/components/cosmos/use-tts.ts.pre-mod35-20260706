@@ -153,28 +153,8 @@ export function useTts(): UseTtsResult {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number>(0);
   const pulseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // === JARVIS MOD #35 — per-loop rAF ownership + deduped amplitude (2026-07-06) ===
-  // ROOT CAUSE of "Maximum update depth exceeded": the analyser tick, holdPulse,
-  // and speakBrowser loops all shared ONE rafRef, so a barge-in (stopAll) cleared
-  // pulseTimerRef and cancelled whichever rAF id was written LAST — the superseded
-  // loop had no stop flag and ran forever, firing setTtsAmplitude with a moving
-  // sine every frame. Leaked loops accumulated per interrupted reply (MOD #28/#30
-  // made iOS speech + backfill interrupts frequent) until React's nested-update
-  // guard tripped. Fix: every loop owns a `stopped` flag + its own rAF id and
-  // registers a stop fn here; stopAmplitudeLoop drains the set. Amplitude writes
-  // are quantized to 0.01 and skipped when unchanged so identical frames never
-  // schedule a render.
-  const loopStopsRef = useRef<Set<() => void>>(new Set());
-  const lastAmpRef = useRef(0);
-  const setAmp = useCallback((v: number) => {
-    const q = Math.round(Math.min(1, Math.max(0, v)) * 100) / 100;
-    if (q === lastAmpRef.current) return;
-    lastAmpRef.current = q;
-    setTtsAmplitude(q);
-  }, []);
-  // === END JARVIS MOD #35 ===
   // === JARVIS MOD #25 — shared-context bookkeeping ===
   // The analyser now lives on the shared context and is reused for the whole
   // session, so we track the amplitude rAF's running state and the current
@@ -241,11 +221,7 @@ export function useTts(): UseTtsResult {
   }, []);
 
   const stopAmplitudeLoop = useCallback(() => {
-    // === JARVIS MOD #35: stop EVERY registered loop (each cancels its own rAF
-    // and resolves its own promise) — no shared id, no wrong-loop cancellation. ===
-    for (const stop of loopStopsRef.current) stop();
-    loopStopsRef.current.clear();
-    // === END JARVIS MOD #35 ===
+    cancelAnimationFrame(rafRef.current);
     // === JARVIS MOD #25 — do NOT close the shared context (it must survive for
     // the next reply and stay unlocked on iOS). Just stop the amplitude rAF and
     // disconnect the finished segment's source; keep the analyser wired to the
@@ -260,8 +236,8 @@ export function useTts(): UseTtsResult {
       currentSourceRef.current = null;
     }
     // === END JARVIS MOD #25 ===
-    setAmp(0);
-  }, [setAmp]);
+    setTtsAmplitude(0);
+  }, []);
 
   const stopAll = useCallback(() => {
     if (pulseTimerRef.current) {
@@ -320,35 +296,18 @@ export function useTts(): UseTtsResult {
     const analyser = analyserRef.current;
     if (!analyser) return;
     tickRunningRef.current = true;
-    // === JARVIS MOD #35: own rAF id + stopped flag; registered so
-    // stopAmplitudeLoop kills THIS loop deterministically. First sample is
-    // deferred one frame so setState never fires synchronously from the caller's
-    // stack. ===
-    let raf = 0;
-    let stopped = false;
-    const stop = () => {
-      stopped = true;
-      cancelAnimationFrame(raf);
-      loopStopsRef.current.delete(stop);
-    };
-    loopStopsRef.current.add(stop);
     const data = new Uint8Array(analyser.frequencyBinCount);
     const tick = () => {
-      if (stopped) return;
       const a = analyserRef.current;
-      if (!a) {
-        stop();
-        return;
-      }
+      if (!a || !tickRunningRef.current) return;
       a.getByteFrequencyData(data);
       let sum = 0;
       for (let i = 0; i < data.length; i++) sum += data[i];
-      setAmp(Math.min(1, sum / data.length / 255));
-      raf = requestAnimationFrame(tick);
+      setTtsAmplitude(Math.min(1, sum / data.length / 255));
+      rafRef.current = requestAnimationFrame(tick);
     };
-    raf = requestAnimationFrame(tick);
-    // === END JARVIS MOD #35 ===
-  }, [setAmp]);
+    tick();
+  }, []);
 
   const ensureAudioGraph = useCallback((): AnalyserNode | null => {
     // === JARVIS MOD #25 — reuse the shared, gesture-unlocked context. The
@@ -503,32 +462,20 @@ export function useTts(): UseTtsResult {
       new Promise<void>((resolve) => {
         const durationMs = Math.min(words * 400, 20_000);
         const start = performance.now();
-        // === JARVIS MOD #35: own rAF id + stop registered in loopStopsRef, so a
-        // barge-in (which clears pulseTimerRef) still kills this loop AND
-        // resolves the promise — the old shared rafRef leaked it forever. ===
-        let raf = 0;
-        let stopped = false;
-        const stop = () => {
-          if (stopped) return;
-          stopped = true;
-          cancelAnimationFrame(raf);
-          loopStopsRef.current.delete(stop);
-          setAmp(0);
-          resolve();
-        };
-        loopStopsRef.current.add(stop);
         const tick = () => {
-          if (stopped) return;
           const t = (performance.now() - start) / 1000;
           // Slow sine breathing between ~0.15 and ~0.55.
-          setAmp(0.35 + 0.2 * Math.sin(t * 2.2));
-          raf = requestAnimationFrame(tick);
+          setTtsAmplitude(0.35 + 0.2 * Math.sin(t * 2.2));
+          rafRef.current = requestAnimationFrame(tick);
         };
-        raf = requestAnimationFrame(tick);
-        pulseTimerRef.current = setTimeout(stop, durationMs);
-        // === END JARVIS MOD #35 ===
+        tick();
+        pulseTimerRef.current = setTimeout(() => {
+          cancelAnimationFrame(rafRef.current);
+          setTtsAmplitude(0);
+          resolve();
+        }, durationMs);
       }),
-    [setAmp],
+    [],
   );
 
   /** Tier 3: browser speechSynthesis with onend. */
@@ -545,28 +492,17 @@ export function useTts(): UseTtsResult {
           const words = text.trim().split(/\s+/).length;
           const start = performance.now();
           const durationMs = Math.min(words * 400, 20_000);
-          // === JARVIS MOD #35: own rAF id + idempotent finish registered in
-          // loopStopsRef — a barge-in kills this loop and resolves the promise
-          // even if speechSynthesis.cancel() never fires onend/onerror. ===
-          let raf = 0;
-          let stopped = false;
+          const tick = () => {
+            const t = (performance.now() - start) / 1000;
+            setTtsAmplitude(0.35 + 0.2 * Math.sin(t * 2.2));
+            rafRef.current = requestAnimationFrame(tick);
+          };
+          tick();
           const finish = () => {
-            if (stopped) return;
-            stopped = true;
-            cancelAnimationFrame(raf);
-            loopStopsRef.current.delete(finish);
-            setAmp(0);
+            cancelAnimationFrame(rafRef.current);
+            setTtsAmplitude(0);
             resolve();
           };
-          loopStopsRef.current.add(finish);
-          const tick = () => {
-            if (stopped) return;
-            const t = (performance.now() - start) / 1000;
-            setAmp(0.35 + 0.2 * Math.sin(t * 2.2));
-            raf = requestAnimationFrame(tick);
-          };
-          raf = requestAnimationFrame(tick);
-          // === END JARVIS MOD #35 ===
           // === JARVIS MOD #24: browser speech is client-audible → close the metric ===
           utter.onstart = () => {
             if (typeof turnId === 'number') recordFirstAudible(turnId);
@@ -581,7 +517,7 @@ export function useTts(): UseTtsResult {
           resolve();
         }
       }),
-    [recordFirstAudible, setAmp],
+    [recordFirstAudible],
   );
 
   // === JARVIS MOD #24 — turn lifecycle + elevenlabs pipeline ===

@@ -59,18 +59,6 @@ export class FastChecker {
   // Persisted to disk so --continue restarts don't reset the circuit breaker
   private ctxCircuitFile: string = '';
 
-  // === JARVIS MOD #23 — personality voice cue (2026-07-05) ===
-  // Per-agent opt-in: if VOICE_CUE.md exists in the agent workspace, its content
-  // is appended to every injected message block at DELIVERY TIME only. The cue
-  // never touches inbox files, inbound-messages.jsonl, or outbound history —
-  // recency-positioned per the anti-drift technique (personality drift is
-  // positional: the model imitates its own recent outputs over the system
-  // prompt, so the voice reminder must be the LAST thing it reads each turn).
-  // mtime-cached so edits to VOICE_CUE.md apply on the next poll, no restart.
-  private voiceCueText: string | null = null;
-  private voiceCueMtimeMs: number = -1;
-  // === END JARVIS MOD #23 (fields) ===
-
   constructor(
     agent: AgentProcess,
     paths: BusPaths,
@@ -212,16 +200,6 @@ export class FastChecker {
       ackIds.push(msg.id);
     }
 
-    // === JARVIS MOD #23 — append recency voice cue (delivery-time only) ===
-    // Appended AFTER dedup hashing and AFTER the block is assembled so the cue
-    // is the last text the agent reads (recency position) and never affects
-    // duplicate detection or any stored history.
-    if (messageBlock) {
-      const cue = this.readVoiceCue();
-      if (cue) messageBlock += `\n${cue}\n`;
-    }
-    // === END JARVIS MOD #23 (pollCycle) ===
-
     // Inject if there's anything
     if (messageBlock) {
       const injected = this.agent.injectMessage(messageBlock);
@@ -250,34 +228,6 @@ export class FastChecker {
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
   }
-
-  // === JARVIS MOD #23 — voice cue loader (2026-07-05) ===
-  /**
-   * Read VOICE_CUE.md from the agent workspace, mtime-cached. Returns the
-   * trimmed cue text, or null when the file is absent/empty (the common case
-   * for worker agents — they never opt in). Any fs error disables the cue for
-   * that poll rather than blocking message delivery.
-   */
-  private readVoiceCue(): string | null {
-    try {
-      const cuePath = join(this.agent.getAgentDir(), 'VOICE_CUE.md');
-      if (!existsSync(cuePath)) {
-        this.voiceCueText = null;
-        this.voiceCueMtimeMs = -1;
-        return null;
-      }
-      const mtimeMs = statSync(cuePath).mtimeMs;
-      if (mtimeMs !== this.voiceCueMtimeMs) {
-        const raw = readFileSync(cuePath, 'utf-8').trim();
-        this.voiceCueText = raw.length > 0 ? raw : null;
-        this.voiceCueMtimeMs = mtimeMs;
-      }
-      return this.voiceCueText;
-    } catch {
-      return null;
-    }
-  }
-  // === END JARVIS MOD #23 (loader) ===
 
   /**
    * Format an inbox message for injection.

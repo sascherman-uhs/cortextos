@@ -73,21 +73,11 @@ export async function proxy(request: NextRequest) {
   // GAP-0034: /api/workflows/health is an unauthenticated health probe — must be
   // reachable from monitoring contexts (load balancers, watcher crons, external
   // watchdogs) without requiring a session cookie. Auth-gating defeats the purpose.
-  // === JARVIS MOD #25 (2026-07-05): PWA install assets must be fetchable BEFORE
-  // sign-in — a browser requests the manifest + icons on the login page, and the
-  // service worker is registered pre-auth. These are static branding + a public
-  // manifest/SW with no sensitive data (the SW's navigations still hit the network
-  // and remain session-gated). Everything else stays behind auth. ===
   if (
     pathname.startsWith('/login') ||
     pathname.startsWith('/api/auth') ||
     pathname.startsWith('/_next') ||
     pathname === '/favicon.ico' ||
-    pathname === '/manifest.webmanifest' ||
-    pathname === '/sw.js' ||
-    pathname === '/icon-192.png' ||
-    pathname === '/icon-512.png' ||
-    pathname === '/apple-touch-icon.png' ||
     pathname === '/api/workflows/health' ||
     pathname === '/api/setup'
   ) {

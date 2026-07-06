@@ -23,7 +23,7 @@ const JARVIS_SPEAK_SH =
 // ElevenLabs defaults. Voice/model are sensible low-latency choices; both can be
 // overridden by env without a code change if Scott wants a specific voice later.
 const EL_DEFAULT_VOICE_ID =
-  process.env.ELEVENLABS_VOICE_ID ?? 'pNInz6obpgDQGcFmaJgB'; // "Adam" — stock EL voice
+  process.env.ELEVENLABS_VOICE_ID ?? 'onwK4e9ZLuTAKqWW03F9'; // "Daniel" — stock EL British voice, matches the SOUL.md butler persona + macOS `say -v Daniel` fallback
 const EL_DEFAULT_MODEL =
   process.env.ELEVENLABS_MODEL_ID ?? 'eleven_turbo_v2_5'; // low-latency
 const EL_TIMEOUT_MS = 12_000;

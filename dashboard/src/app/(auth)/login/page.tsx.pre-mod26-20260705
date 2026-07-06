@@ -95,101 +95,50 @@ export default function LoginPage() {
     } catch {
       // Fall back to the mount-time token if the refetch fails.
     }
-    // === JARVIS MOD #26 addendum (2026-07-06): cookie is the source of truth ===
-    // Even the atomic refetch above can lose: any concurrent /api/auth/* response
-    // (the session poller also mints CSRF cookies) can rotate the cookie between
-    // our refetch and the POST → intermittent MissingCSRF. The cookie is not
-    // httpOnly, so read the token straight out of it at the last possible moment —
-    // body and cookie then agree by construction. Cookie format: "<token>|<hash>".
-    const cookieTok = document.cookie
-      .split('; ')
-      .find((c) => c.startsWith('authjs.csrf-token=') || c.startsWith('__Host-authjs.csrf-token='))
-      ?.split('=')
-      .slice(1)
-      .join('=');
-    if (cookieTok) {
-      const decoded = decodeURIComponent(cookieTok);
-      const tok = decoded.split('|')[0];
-      if (tok) submitToken = tok;
-    }
-    // === END JARVIS MOD #26 addendum ===
+
+    const body = new URLSearchParams();
+    body.set('csrfToken', submitToken || '');
+    body.set('username', usernameInput?.value || '');
+    body.set('password', passwordInput?.value || '');
 
     try {
-      // === JARVIS MOD #26 (2026-07-05): redirect 'manual', outcome via session ===
-      // Behind tailscale serve, Next dev absolutizes request.url to
-      // http(s)://localhost:3000, so NextAuth's post-signin Location header
-      // points at the WRONG ORIGIN. redirect:'follow' then makes this fetch
-      // chase a cross-origin URL with no CORS headers and it throws — login
-      // died with "Network error" on any non-localhost origin (phone/PWA).
-      // Instead: never follow the untrustworthy Location. POST with
-      // redirect:'manual' (success and failure both come back as an
-      // opaqueredirect we can't read), then ask /api/auth/session — same
-      // origin, cookie-based, proxy-agnostic — whether the sign-in stuck.
-      // === JARVIS MOD #26 addendum 2 (2026-07-06): single automatic retry ===
-      // Auth.js can still rotate the CSRF cookie mid-flight (its own session
-      // endpoint mints tokens), producing a spurious MissingCSRF on the first
-      // POST. One silent retry with a freshly-read token closes the race for
-      // good; a second failure is a genuine credential/rate-limit rejection.
-      const attempt = async (token: string): Promise<'ok' | 'rejected' | number> => {
-        const body = new URLSearchParams();
-        body.set('csrfToken', token || '');
-        body.set('username', usernameInput?.value || '');
-        body.set('password', passwordInput?.value || '');
-        const res = await fetch(form.action, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: body.toString(),
-          credentials: 'same-origin',
-          redirect: 'manual',
-        });
-        if (!(res.type === 'opaqueredirect' || res.redirected || res.ok)) return res.status;
-        try {
-          const sres = await fetch('/api/auth/session', {
-            credentials: 'same-origin',
-            cache: 'no-store',
-          });
-          const session = (await sres.json()) as { user?: unknown } | null;
-          return session?.user ? 'ok' : 'rejected';
-        } catch {
-          return 'rejected';
+      const res = await fetch(form.action, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+        credentials: 'same-origin',
+        redirect: 'follow',
+      });
+      if (res.redirected) {
+        const target = new URL(res.url);
+        if (target.pathname.startsWith('/login')) {
+          const code = target.searchParams.get('error') || 'Unknown';
+          // CallbackRouteError usually means the rate limiter blocked the request.
+          // Show a human-readable message instead of the raw error code.
+          const msg = code === 'CallbackRouteError'
+            ? 'Too many attempts. Please wait a few minutes and try again.'
+            : `Sign-in failed: ${code}`;
+          setError(msg);
+          setLoading(false);
+          return;
         }
-      };
-
-      let outcome = await attempt(submitToken);
-      if (outcome === 'rejected') {
-        // Re-read the freshest token (cookie first, then endpoint) and retry once.
-        let retryToken = '';
-        try {
-          const rf = await fetch('/api/auth/csrf', { credentials: 'same-origin', cache: 'no-store' });
-          retryToken = (await rf.json())?.csrfToken ?? '';
-        } catch {
-          /* fall through to cookie read */
-        }
-        const ck = document.cookie
-          .split('; ')
-          .find((c) => c.startsWith('authjs.csrf-token=') || c.startsWith('__Host-authjs.csrf-token='));
-        const ckTok = ck ? decodeURIComponent(ck.split('=').slice(1).join('=')).split('|')[0] : '';
-        outcome = await attempt(ckTok || retryToken || submitToken);
-      }
-
-      if (outcome === 'ok') {
-        // Navigate to the original destination the user tried to reach, or
-        // / if none was recorded. Relative-only target: must start with /
-        // but not // (protocol-relative would escape the origin).
+        // Navigate to the original destination the user tried to reach, or /
+        // if none was recorded. Use window.location.origin to build a safe
+        // relative-only target — res.url can be http://localhost:3000/ behind
+        // a reverse proxy (when AUTH_URL is not set), which would send the
+        // browser to the wrong host.
         const callbackParam = new URL(window.location.href).searchParams.get('callbackUrl');
+        // Validate same-origin: must start with / but not // (which is a protocol-relative URL)
         const safeTarget = callbackParam && callbackParam.startsWith('/') && !callbackParam.startsWith('//') ? callbackParam : '/';
         window.location.href = safeTarget;
         return;
       }
-      if (outcome === 'rejected') {
-        // Two opaque rejections = genuine bad credentials or the rate limiter.
-        setError('Sign-in failed. Check credentials — or wait a few minutes if you have retried repeatedly.');
-        setLoading(false);
+      if (res.ok) {
+        window.location.href = '/';
         return;
       }
-      setError(`Sign-in failed with status ${outcome}`);
+      setError(`Sign-in failed with status ${res.status}`);
       setLoading(false);
-      // === END JARVIS MOD #26 (+ addendum 2) ===
     } catch (err) {
       console.error('[login] submit error:', err);
       setError('Network error. Please try again.');
@@ -237,9 +186,6 @@ export default function LoginPage() {
                   type="text"
                   required
                   autoFocus
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  autoComplete="username"
                   placeholder="admin"
                   suppressHydrationWarning
                 />

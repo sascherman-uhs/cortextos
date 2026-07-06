@@ -76,7 +76,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         await seedAdminUser();
 
         const user = db
-          .prepare('SELECT * FROM users WHERE username = ?')
+          .prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)')
           .get(credentials.username as string) as User | undefined;
         if (!user) return null;
 

@@ -64,22 +64,6 @@ export interface UseVoiceResult {
   sendText: (text: string) => void;
   /** Called by the SSE consumer when an agent reply line arrives. */
   pushAgentReply: (text: string, id: string) => void;
-  // === JARVIS MOD #33: turns sent this session, incremented inside sendText so
-  // EVERY path (mic, Whisper, typed, synth) counts. The SSE/backfill reply gate
-  // must read THIS, never a panel-local counter. ===
-  sentTurnsRef: React.MutableRefObject<number>;
-  // === END JARVIS MOD #33 ===
-}
-
-// === JARVIS MOD #27 addendum — iOS PWA standalone detection ===
-// On iOS, webkitSpeechRecognition is present in window but silently fails in
-// standalone (home-screen) PWA mode. Detect standalone to skip it entirely and
-// go straight to the MediaRecorder → /api/uhs/stt Whisper path.
-function isIosPwaStandalone(): boolean {
-  if (typeof window === 'undefined') return false;
-  return (
-    (window.navigator as Navigator & { standalone?: boolean }).standalone === true
-  );
 }
 
 export function useVoice(): UseVoiceResult {
@@ -90,16 +74,9 @@ export function useVoice(): UseVoiceResult {
   const [log, setLog] = useState<ConversationEntry[]>([]);
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  // === JARVIS MOD #33: authoritative sent-turn counter (see interface note) ===
-  const sentTurnsRef = useRef(0);
-  // === END JARVIS MOD #33 ===
   // MOD #15 fix: onend binds once and captures a stale (empty) transcript.
   // Mirror the latest interim into a ref so onend reads the live value.
   const interimRef = useRef('');
-  // === JARVIS MOD #27: MediaRecorder refs for iOS PWA fallback ===
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  // === END MOD #27 ===
   useEffect(() => {
     interimRef.current = interim;
   }, [interim]);
@@ -110,13 +87,9 @@ export function useVoice(): UseVoiceResult {
   const streamRef = useRef<MediaStream | null>(null);
 
   useEffect(() => {
-    // iOS PWA standalone: SpeechRecognition is in window but silently fails.
-    // Use MediaRecorder → Whisper instead — supported as long as getUserMedia exists.
-    if (isIosPwaStandalone()) {
-      setSupported(typeof navigator.mediaDevices?.getUserMedia === 'function');
-    } else {
-      setSupported('SpeechRecognition' in window || 'webkitSpeechRecognition' in window);
-    }
+    setSupported(
+      'SpeechRecognition' in window || 'webkitSpeechRecognition' in window,
+    );
   }, []);
 
   const stopAmplitude = useCallback(() => {
@@ -171,26 +144,6 @@ export function useVoice(): UseVoiceResult {
   const sendText = useCallback((text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
-    // === JARVIS MOD #33 (2026-07-06): the sent-turn counter lives HERE, the one
-    // choke point every send path crosses. It previously lived in voice-panel's
-    // doSend(), which only the typed/synth path used — MIC sends (Web Speech
-    // onend and the iOS MediaRecorder→Whisper path) call sendText directly, so
-    // voice-only sessions (Scott's phone, always) kept the counter at 0 and the
-    // SSE/backfill gate discarded EVERY reply as "pre-existing history": never
-    // spoken, never shown. Typed messages worked — which is why every automated
-    // test passed while real phone usage stayed silent. ===
-    sentTurnsRef.current += 1;
-    // === END JARVIS MOD #33 ===
-    // === JARVIS MOD #24: stamp when the user's turn ended (mic onend → sendText, or
-    // synth/typed submit) so use-tts can measure user-stopped-talking → first-audible.
-    // MERGE into __cosmosStats — never reassign (would clobber ttsPath/particles). ===
-    if (typeof window !== 'undefined') {
-      window.__cosmosStats = {
-        ...(window.__cosmosStats ?? {}),
-        lastUserStopMs: performance.now(),
-      };
-    }
-    // === END JARVIS MOD #24 ===
     const id = `user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     setLog((prev) => [...prev, { id, role: 'user', text: trimmed, ts: Date.now() }]);
     setInterim('');
@@ -211,69 +164,7 @@ export function useVoice(): UseVoiceResult {
       .catch(() => setState('idle'));
   }, []);
 
-  // === JARVIS MOD #27: MediaRecorder → Whisper path for iOS PWA standalone ===
-  const startListeningMediaRecorder = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      audioChunksRef.current = [];
-
-      // Pick the best supported MIME type — iOS prefers audio/mp4.
-      const mimeType = MediaRecorder.isTypeSupported('audio/mp4')
-        ? 'audio/mp4'
-        : MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : '';
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = async () => {
-        stopAmplitude();
-        const blob = new Blob(audioChunksRef.current, {
-          type: recorder.mimeType || 'audio/webm',
-        });
-        if (blob.size < 1000) {
-          // Too short — nothing meaningful recorded.
-          setState('idle');
-          return;
-        }
-        setState('processing');
-        setInterim('Transcribing…');
-        try {
-          const form = new FormData();
-          form.append('audio', blob, 'audio.' + (mimeType.includes('mp4') ? 'm4a' : 'webm'));
-          const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
-          const data = (await res.json()) as { transcript?: string; error?: string };
-          setInterim('');
-          if (data.transcript?.trim()) {
-            sendText(data.transcript);
-          } else {
-            setState('idle');
-          }
-        } catch {
-          setInterim('');
-          setState('idle');
-        }
-      };
-
-      mediaRecorderRef.current = recorder;
-      recorder.start();
-      setState('listening');
-      startAmplitude();
-    } catch {
-      setState('idle');
-    }
-  }, [startAmplitude, stopAmplitude, sendText]);
-
   const startListening = useCallback(() => {
-    if (isIosPwaStandalone()) {
-      startListeningMediaRecorder();
-      return;
-    }
-
     const w = window as typeof window & {
       SpeechRecognition?: SpeechRecognitionConstructor;
       webkitSpeechRecognition?: SpeechRecognitionConstructor;
@@ -314,14 +205,10 @@ export function useVoice(): UseVoiceResult {
     recognition.start();
     setState('listening');
     startAmplitude();
-  }, [startAmplitude, stopAmplitude, sendText, startListeningMediaRecorder]);
+  }, [startAmplitude, stopAmplitude, sendText]);
 
   const stopListening = useCallback(() => {
-    // Triggers onend (SpeechRecognition) or onstop (MediaRecorder) → sendText.
-    if (mediaRecorderRef.current?.state === 'recording') {
-      mediaRecorderRef.current.stop();
-      mediaRecorderRef.current = null;
-    }
+    // Triggers onend, which sends the accumulated transcript if any.
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     stopAmplitude();
@@ -330,9 +217,6 @@ export function useVoice(): UseVoiceResult {
   useEffect(() => {
     return () => {
       recognitionRef.current?.abort();
-      if (mediaRecorderRef.current?.state === 'recording') {
-        mediaRecorderRef.current.stop();
-      }
       stopAmplitude();
     };
   }, [stopAmplitude]);
@@ -347,9 +231,6 @@ export function useVoice(): UseVoiceResult {
     stopListening,
     sendText,
     pushAgentReply,
-    // === JARVIS MOD #33: authoritative sent-turn counter (all send paths) ===
-    sentTurnsRef,
-    // === END JARVIS MOD #33 ===
   };
 }
 // === END JARVIS MOD #20 ===

@@ -1,9 +1,6 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-// === JARVIS MOD #25 — PWA boot (SW registration + iOS audio unlock) ===
-import { PwaBoot } from '@/components/cosmos/pwa-boot';
-// === END JARVIS MOD #25 ===
 
 // R3F Canvas must run client-only; ssr:false is allowed here (client component).
 const Scene = dynamic(() => import('@/components/cosmos/scene'), {
@@ -16,11 +13,5 @@ const Scene = dynamic(() => import('@/components/cosmos/scene'), {
 });
 
 export function CosmosClient() {
-  return (
-    <>
-      {/* === JARVIS MOD #25: mount PWA boot alongside the scene (renders nothing) === */}
-      <PwaBoot />
-      <Scene />
-    </>
-  );
+  return <Scene />;
 }
