@@ -229,6 +229,7 @@ export function useVoice(): UseVoiceResult {
   const engineStreamRef = useRef<MediaStream | null>(null);
   const engineCtxRef = useRef<AudioContext | null>(null);
   const engineSourceRef = useRef<MediaStreamAudioSourceNode | null>(null); // MOD #39
+  const ampSourceRef = useRef<MediaStreamAudioSourceNode | null>(null); // MOD #39b
   const engineAnalyserRef = useRef<AnalyserNode | null>(null);
   const engineFrameRef = useRef<number>(0);
   const engineRecogRef = useRef<SpeechRecognitionInstance | null>(null);
@@ -279,20 +280,31 @@ export function useVoice(): UseVoiceResult {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     analyserRef.current = null;
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {});
-      audioCtxRef.current = null;
-    }
+    // MOD #39b: the context is the SHARED session singleton — disconnect our
+    // source node, never close the context (TTS + open-mic engine ride it too).
+    ampSourceRef.current?.disconnect();
+    ampSourceRef.current = null;
+    audioCtxRef.current = null;
     setAmplitude(0);
   }, []);
 
-  const startAmplitude = useCallback(async () => {
+  // MOD #39b: `existing` lets the tap-recorder path REUSE its stream. Two
+  // concurrent getUserMedia captures made iOS silently mute one — the recorder
+  // then shipped silence and whisper returned an empty transcript (Scott's
+  // 2026-07-08 tap test: STT 200 in 1331ms, no text, no send, no reply).
+  const startAmplitude = useCallback(async (existing?: MediaStream) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream =
+        existing ?? (await navigator.mediaDevices.getUserMedia({ audio: true }));
       streamRef.current = stream;
-      const audioCtx = new AudioContext();
+      // MOD #39b: shared gesture-unlocked context, never a private one (a
+      // private ctx is born suspended on iOS → analyser reads zeros → orb dead).
+      const audioCtx = getSharedAudioContext();
+      if (!audioCtx) return;
+      resumeSharedAudio();
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
+      ampSourceRef.current = source;
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 64;
       source.connect(analyser);
@@ -883,7 +895,9 @@ export function useVoice(): UseVoiceResult {
       mediaRecorderRef.current = recorder;
       recorder.start();
       setState('listening');
-      startAmplitude();
+      // MOD #39b: REUSE the recorder's stream — a second getUserMedia here made
+      // iOS mute one capture and the recorder shipped silence to whisper.
+      void startAmplitude(stream);
     } catch {
       setState(restState());
     }
