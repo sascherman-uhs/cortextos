@@ -40,12 +40,6 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-// MOD #39: the open-mic engine MUST ride the shared gesture-unlocked context.
-// A privately-constructed AudioContext is born `suspended` on iOS (no gesture
-// at mount), the analyser then reads all-zeros forever, VAD never fires, and
-// zero utterances reach STT — exactly Scott's 2026-07-08 silent phone test.
-// Same lesson as MOD #25/#28; PwaBoot's first-gesture unlock now heals the mic.
-import { getSharedAudioContext, resumeSharedAudio } from './audio-unlock';
 import {
   SPEECH_THRESHOLD,
   FOLLOW_UP_MS,
@@ -228,7 +222,6 @@ export function useVoice(): UseVoiceResult {
   const engineRunningRef = useRef(false);
   const engineStreamRef = useRef<MediaStream | null>(null);
   const engineCtxRef = useRef<AudioContext | null>(null);
-  const engineSourceRef = useRef<MediaStreamAudioSourceNode | null>(null); // MOD #39
   const engineAnalyserRef = useRef<AnalyserNode | null>(null);
   const engineFrameRef = useRef<number>(0);
   const engineRecogRef = useRef<SpeechRecognitionInstance | null>(null);
@@ -474,11 +467,10 @@ export function useVoice(): UseVoiceResult {
     engineStreamRef.current?.getTracks().forEach((t) => t.stop());
     engineStreamRef.current = null;
     engineAnalyserRef.current = null;
-    // MOD #39: the context is the SHARED session singleton (TTS rides it too) —
-    // disconnect our source node but NEVER close the context.
-    engineSourceRef.current?.disconnect();
-    engineSourceRef.current = null;
-    engineCtxRef.current = null;
+    if (engineCtxRef.current) {
+      engineCtxRef.current.close().catch(() => {});
+      engineCtxRef.current = null;
+    }
     setAmplitude(0);
     setInterim('');
   }, []);
@@ -645,13 +637,9 @@ export function useVoice(): UseVoiceResult {
         return;
       }
       engineStreamRef.current = stream;
-      // MOD #39: shared unlocked context, never a private one (iOS suspension).
-      const ctx = getSharedAudioContext();
-      if (!ctx) throw new Error('no-webaudio');
-      resumeSharedAudio(); // no-op if already running; real resume post-gesture
+      const ctx = new AudioContext();
       engineCtxRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
-      engineSourceRef.current = source;
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 64;
       source.connect(analyser);
@@ -686,14 +674,7 @@ export function useVoice(): UseVoiceResult {
             if (stateRef.current === 'wakeListening') setState('listening');
           }
         }
-        // MOD #39: live VAD + audio-context state on the seam so a dead mic is
-        // visible on-phone (suspended ctx = all-zero analyser = silent failure).
-        mergeStats2Throttled(now, {
-          vadSpeechActive: speech,
-          vadEnergy: Math.round(avg * 1000) / 1000,
-          micCtxState: a.context.state,
-        });
-        if (a.context.state === 'suspended') resumeSharedAudio();
+        mergeStats2Throttled(now, { vadSpeechActive: speech });
 
         // --- Layered end-of-turn detection (smooth-voice Tier 2) ---
         if (utterSpeechSeenRef.current) {

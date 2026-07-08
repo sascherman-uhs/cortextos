@@ -107,12 +107,6 @@ declare global {
         lastUtterance?: string;
       };
       // === END JARVIS MOD #36 ===
-      // === JARVIS MOD #39: mic-pipeline visibility (2026-07-08) ===
-      // vadEnergy: live analyser avg (0..1); micCtxState: shared AudioContext
-      // state ('suspended' = iOS gesture-gate → analyser reads zeros).
-      vadEnergy?: number;
-      micCtxState?: string;
-      // === END JARVIS MOD #39 ===
       // === JARVIS MOD #38: sync fast-lane + latency-percentile seams (2026-07-07) ===
       // fastReplies: count of replies delivered synchronously in the POST response.
       // voiceLatency: session p50/p95 of user-stopped-talking → first audible (ms).

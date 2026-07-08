@@ -28,6 +28,18 @@ describe('wakeMatch', () => {
     expect(wakeMatch('I told jarvis about it').woke).toBe(false);
     expect(wakeMatch('the install crew is here').woke).toBe(false);
   });
+  it('tolerates Whisper comma after the greeting (2026-07-08 live miss)', () => {
+    expect(wakeMatch('Hey, Jarvis. What is on the calendar?')).toEqual({
+      woke: true,
+      remainder: 'What is on the calendar?',
+    });
+    expect(wakeMatch('Okay, Jarvis, status report').remainder).toBe('status report');
+  });
+  it('tolerates common Whisper mis-hearings of the name', () => {
+    expect(wakeMatch('Hey Jervis, any messages?').woke).toBe(true);
+    expect(wakeMatch('Javis, run the report').woke).toBe(true);
+    expect(wakeMatch('hey jarvus').woke).toBe(true);
+  });
   it('containsWakeWord finds the name anywhere (barge-in path)', () => {
     expect(containsWakeWord('um Jarvis stop')).toBe(true);
     expect(containsWakeWord('nothing to see')).toBe(false);

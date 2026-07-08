@@ -492,12 +492,6 @@ export function VoicePanel({
         )}
         {/* === END JARVIS MOD #31 === */}
 
-        {/* === JARVIS MOD #39: mic-debug line — the mic pipeline's live state,
-            always visible (dim). A suspended AudioContext + dead VAD was
-            indistinguishable from "working" on 2026-07-08; never again. === */}
-        <MicDebugLine openMic={openMic} />
-        {/* === END JARVIS MOD #39 === */}
-
         {/* Hidden Playwright test hooks — feed the EXACT same send path as voice.
             Kept visually minimal but not display:none so tests can interact. */}
         <div className="mt-3 flex items-center gap-2 opacity-60">
@@ -525,45 +519,3 @@ export function VoicePanel({
   );
 }
 // === END JARVIS MOD #20 ===
-
-// === JARVIS MOD #39 — on-phone mic diagnostics (2026-07-08) ===
-// Polls window.__cosmosStats (the existing seam) at 2Hz and renders one dim
-// line: mic on/off · audio-context state · live VAD energy vs threshold ·
-// last wake-gate decision. MOD #31's rule generalized: every silent failure
-// mode of the audio pipeline must be readable off the phone screen.
-function MicDebugLine({ openMic }: { openMic: boolean }) {
-  const [line, setLine] = useState('');
-  useEffect(() => {
-    const read = () => {
-      const s = (window as unknown as {
-        __cosmosStats?: {
-          micCtxState?: string;
-          vadEnergy?: number;
-          openMicError?: string | null;
-          wakeGate?: { lastDecision?: string; lastUtterance?: string };
-        };
-      }).__cosmosStats;
-      const ctxState = s?.micCtxState ?? '—';
-      const vad = s?.vadEnergy !== undefined ? s.vadEnergy.toFixed(3) : '—';
-      const err = s?.openMicError ? ` · ERR ${s.openMicError}` : '';
-      const gate = s?.wakeGate?.lastDecision
-        ? ` · ${s.wakeGate.lastDecision}: “${(s.wakeGate.lastUtterance ?? '').slice(0, 32)}”`
-        : '';
-      setLine(
-        `mic ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
-      );
-    };
-    read();
-    const t = setInterval(read, 500);
-    return () => clearInterval(t);
-  }, [openMic]);
-  return (
-    <p
-      className="mt-1 truncate text-[10px] text-[#EDE8DF]/30"
-      data-testid="mic-debug"
-    >
-      {line}
-    </p>
-  );
-}
-// === END JARVIS MOD #39 ===

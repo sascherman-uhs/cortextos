@@ -45,7 +45,16 @@ function norm(text: string): string {
 }
 
 // --- Wake gate ---------------------------------------------------------------
-const WAKE_RE = /^(?:hey |ok |okay )?jarvis\b[,.!?]?\s*/i;
+// Punctuation-tolerant: Whisper habitually writes "Hey, Jarvis." — the comma
+// after the greeting must not defeat the gate (found live 2026-07-08: Scott's
+// first real-mic test produced zero sends). Also tolerate common Whisper
+// mis-hearings of the name (same fix class as "Cleo"=Claude): Jervis, Javis,
+// Jarvus, Jarves, Jarvas.
+const WAKE_NAME = '(?:jarvis|jervis|javis|jarvus|jarves|jarvas)';
+const WAKE_RE = new RegExp(
+  `^(?:hey|ok|okay)?[,.!]?\\s*${WAKE_NAME}\\b[,.!?]?\\s*`,
+  'i'
+);
 
 export interface WakeMatch {
   woke: boolean;
@@ -63,8 +72,9 @@ export function wakeMatch(text: string): WakeMatch {
 
 /** True when the wake word appears anywhere in the text — used for barge-in
  *  detection on the INTERIM transcript while JARVIS is speaking. */
+const CONTAINS_WAKE_RE = new RegExp(`\\b${WAKE_NAME}\\b`, 'i');
 export function containsWakeWord(text: string): boolean {
-  return /\bjarvis\b/i.test(text);
+  return CONTAINS_WAKE_RE.test(text);
 }
 
 // --- Layered end-of-turn detection (smooth-voice Tier 2) ----------------------
