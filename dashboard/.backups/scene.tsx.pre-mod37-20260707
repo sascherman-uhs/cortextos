@@ -75,9 +75,6 @@ declare global {
       // === JARVIS MOD #22: agent count + live screen positions (debug seam) ===
       orbitAgents?: number;
       orbitPositions?: Record<string, { x: number; y: number; z: number }>;
-      // === JARVIS MOD #37: live per-agent working flags (dispatch choreography seam) ===
-      orbitWorking?: Record<string, boolean>;
-      // === END JARVIS MOD #37 ===
       // === JARVIS MOD #24: per-sentence TTS queue seams (2026-07-05) ===
       // lastUserStopMs: performance.now() when the user's turn ended (set by
       //   use-voice.sendText). timeSinceUserStoppedTalkingMs: that → first audible.
@@ -107,13 +104,6 @@ declare global {
         lastUtterance?: string;
       };
       // === END JARVIS MOD #36 ===
-      // === JARVIS MOD #38: sync fast-lane + latency-percentile seams (2026-07-07) ===
-      // fastReplies: count of replies delivered synchronously in the POST response.
-      // voiceLatency: session p50/p95 of user-stopped-talking → first audible (ms).
-      fastReplies?: number;
-      escalations?: number;
-      voiceLatency?: { p50: number; p95: number; n: number };
-      // === END JARVIS MOD #38 ===
     };
     // === END JARVIS MOD #21 ===
     // === JARVIS MOD #36: micless wake-gate test seam (Playwright drives the

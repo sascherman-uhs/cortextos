@@ -111,7 +111,6 @@ declare global {
       // fastReplies: count of replies delivered synchronously in the POST response.
       // voiceLatency: session p50/p95 of user-stopped-talking → first audible (ms).
       fastReplies?: number;
-      escalations?: number;
       voiceLatency?: { p50: number; p95: number; n: number };
       // === END JARVIS MOD #38 ===
     };

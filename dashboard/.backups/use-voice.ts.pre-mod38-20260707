@@ -145,11 +145,6 @@ export interface UseVoiceResult {
   /** voice-panel mirrors useTts.speaking here; falling edge opens follow-up window. */
   notifyTtsSpeaking: (speaking: boolean) => void;
   // === END MOD #36 ===
-  // === JARVIS MOD #38: outbound ids already delivered synchronously by the
-  // fast lane — the SSE/backfill consumers must mark-seen-and-skip these so
-  // the same reply is never spoken twice. ===
-  fastReplyIdsRef: React.MutableRefObject<Set<string>>;
-  // === END MOD #38 ===
 }
 
 // === JARVIS MOD #27 addendum — iOS PWA standalone detection ===
@@ -169,23 +164,6 @@ function mergeStats(patch: Record<string, unknown>) {
   window.__cosmosStats = { ...(window.__cosmosStats ?? {}), ...patch } as Window['__cosmosStats'];
 }
 // === END MOD #36 ===
-
-// === JARVIS MOD #38: escalation acknowledgments — spoken LOCALLY the instant
-// the send response says the turn went to the full agent (10-60s think time),
-// so the wait never feels like dead air. Rotation avoids the same line twice
-// in a row. speakLocal no-ops while muted (enforced inside useTts). ===
-const ESCALATION_ACKS = [
-  'On it — give me a minute.',
-  'Working. This one needs the full engine.',
-  'One moment, sir — pulling the real numbers.',
-];
-let ackCursor = 0;
-function nextAck(): string {
-  const line = ESCALATION_ACKS[ackCursor % ESCALATION_ACKS.length];
-  ackCursor += 1;
-  return line;
-}
-// === END MOD #38 ===
 
 export function useVoice(): UseVoiceResult {
   const [state, setState] = useState<VoiceState>('idle');
@@ -240,10 +218,6 @@ export function useVoice(): UseVoiceResult {
   const followUpUntilMsRef = useRef(0);
   const hadAgentTurnRef = useRef(false);
   const ttsBridgeRef = useRef<TtsBridge | null>(null);
-  // === JARVIS MOD #38: reply ids delivered synchronously by the fast lane ===
-  const fastReplyIdsRef = useRef<Set<string>>(new Set());
-  const escalationsRef = useRef(0);
-  // === END MOD #38 ===
   const signoffIdxRef = useRef(0);
   const wakeStatsRef = useRef({ accepted: 0, discarded: 0 });
   // ===========================================================================
@@ -345,43 +319,16 @@ export function useVoice(): UseVoiceResult {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent: AGENT, text: `[Cosmos] ${trimmed}` }),
     })
-      // === JARVIS MOD #38: consume the synchronous fast-lane reply. The POST
-      // response now carries replyText/replyId on a fast-path hit — speak it
-      // immediately (pushAgentReply → voice-panel's log effect speaks it)
-      // instead of waiting up to ~1s for the SSE tail to notice the file.
-      // On escalation, speak a local ack so the full-agent wait isn't silent.
-      .then(async (r) => {
-        if (!r.ok) {
+      .then((r) => {
+        if (r.ok) {
+          // Move to responding; the SSE consumer flips back to rest on reply.
+          setState('responding');
+        } else {
           setState(restState());
-          return;
         }
-        let payload: {
-          fastpath?: boolean;
-          replyText?: string;
-          replyId?: string;
-          escalated?: boolean;
-        } = {};
-        try {
-          payload = await r.json();
-        } catch { /* body optional — fall through to SSE behavior */ }
-
-        if (payload.fastpath && payload.replyText && payload.replyId) {
-          fastReplyIdsRef.current.add(payload.replyId);
-          mergeStats({ fastReplies: fastReplyIdsRef.current.size });
-          pushAgentReply(payload.replyText, payload.replyId);
-          return; // pushAgentReply already restored the rest state
-        }
-        if (payload.escalated) {
-          escalationsRef.current += 1;
-          mergeStats({ escalations: escalationsRef.current });
-          ttsBridgeRef.current?.speakLocal(nextAck());
-        }
-        // Full lane: the SSE consumer flips back to rest on reply.
-        setState('responding');
       })
-      // === END MOD #38 ===
       .catch(() => setState(restState()));
-  }, [restState, pushAgentReply]);
+  }, [restState]);
 
   // === JARVIS MOD #36: the wake gate — every SPOKEN utterance lands here ======
   const handleUtterance = useCallback(
@@ -985,9 +932,6 @@ export function useVoice(): UseVoiceResult {
     bindTts,
     notifyTtsSpeaking,
     // === END MOD #36 ===
-    // === JARVIS MOD #38: sync fast-reply dedupe set ===
-    fastReplyIdsRef,
-    // === END MOD #38 ===
   };
 }
 // === END JARVIS MOD #20 ===

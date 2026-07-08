@@ -87,32 +87,6 @@ function writeStats(patch: Partial<NonNullable<Window['__cosmosStats']>>) {
   window.__cosmosStats = { ...(window.__cosmosStats ?? {}), ...patch };
 }
 
-// === JARVIS MOD #38 (B5): voice-latency ring buffer + percentiles ===========
-// Last 50 user-stopped-talking → first-audible samples for this page session;
-// p50/p95 merged into __cosmosStats for the metrics line + Playwright asserts.
-const LATENCY_BUFFER_CAP = 50;
-const latencySamples: number[] = [];
-
-export function percentile(sorted: number[], p: number): number {
-  if (!sorted.length) return 0;
-  const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
-  return sorted[Math.max(0, idx)];
-}
-
-function recordLatencySample(ms: number): void {
-  latencySamples.push(ms);
-  if (latencySamples.length > LATENCY_BUFFER_CAP) latencySamples.shift();
-  const sorted = [...latencySamples].sort((a, b) => a - b);
-  writeStats({
-    voiceLatency: {
-      p50: percentile(sorted, 50),
-      p95: percentile(sorted, 95),
-      n: sorted.length,
-    },
-  });
-}
-// === END JARVIS MOD #38 ======================================================
-
 // === JARVIS MOD #24 — sentence splitter ===
 /**
  * Split a reply into speakable segments on sentence boundaries, merging fragments
@@ -406,11 +380,9 @@ export function useTts(): UseTtsResult {
     firstAudibleRecordedRef.current = true;
     const stop = window.__cosmosStats?.lastUserStopMs;
     if (typeof stop === 'number') {
-      const ms = Math.max(0, Math.round(performance.now() - stop));
-      writeStats({ timeSinceUserStoppedTalkingMs: ms });
-      // === JARVIS MOD #38 (B5): feed the session percentile buffer ===
-      recordLatencySample(ms);
-      // === END MOD #38 ===
+      writeStats({
+        timeSinceUserStoppedTalkingMs: Math.max(0, Math.round(performance.now() - stop)),
+      });
     }
   }, []);
 

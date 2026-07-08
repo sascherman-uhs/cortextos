@@ -19,9 +19,6 @@ import { useTts } from './use-tts';
 // === JARVIS MOD #25 — iOS audio unlock on the primary (mic) gesture ===
 import { unlockSharedAudio } from './audio-unlock';
 // === END JARVIS MOD #25 ===
-// === JARVIS MOD #38 — single decision point for SSE/backfill reply surfacing ===
-import { shouldSurfaceReply } from './reply-dedupe';
-// === END JARVIS MOD #38 ===
 
 interface VoicePanelProps {
   /** Lets the parent Scene mirror voice state → orb color, amplitude → breathing. */
@@ -69,9 +66,6 @@ export function VoicePanel({
     bindTts,
     notifyTtsSpeaking,
     // === END MOD #36 ===
-    // === JARVIS MOD #38: ids already delivered via the synchronous fast lane ===
-    fastReplyIdsRef,
-    // === END MOD #38 ===
   } = voice;
 
   // === JARVIS MOD #21: TTS — speak new agent replies through the three-tier route ===
@@ -170,21 +164,13 @@ export function VoicePanel({
       }[];
       for (const it of items) {
         if (it.direction !== 'outbound') continue;
-        // === JARVIS MOD #38: shared decision point (marks seen, skips
-        // fast-lane-delivered ids, keeps the MOD #33 sent-turn gate). ===
-        if (
-          shouldSurfaceReply({
-            id: it.id,
-            text: it.text,
-            seen: seenIdsRef.current,
-            fastReplyIds: fastReplyIdsRef.current,
-            sentTurns: sentTurnsRef.current,
-          })
-        ) {
-          pushAgentReply(it.text as string, it.id as string);
+        const id = it.id ?? '';
+        if (!id || seenIdsRef.current.has(id)) continue;
+        seenIdsRef.current.add(id);
+        if (sentTurnsRef.current > 0 && it.text) {
+          pushAgentReply(it.text, id);
           surfaced += 1;
         }
-        // === END MOD #38 ===
       }
     } catch {
       /* transient — next reconnect/backfill will retry */
@@ -224,20 +210,12 @@ export function VoicePanel({
           return;
         }
         const id = parsed.id ?? `out-${Date.now()}`;
-        // === JARVIS MOD #38: shared decision point — also skips replies the
-        // synchronous fast lane already spoke (same outbound line echoes here). ===
-        if (
-          shouldSurfaceReply({
-            id,
-            text: parsed.text,
-            seen: seenIdsRef.current,
-            fastReplyIds: fastReplyIdsRef.current,
-            sentTurns: sentTurnsRef.current,
-          })
-        ) {
-          pushAgentReply(parsed.text as string, id);
+        if (seenIdsRef.current.has(id)) return;
+        seenIdsRef.current.add(id);
+        // Only surface outbound lines that arrive AFTER we've sent a turn.
+        if (sentTurnsRef.current > 0 && parsed.text) {
+          pushAgentReply(parsed.text, id);
         }
-        // === END MOD #38 ===
       };
 
       es.onerror = () => {

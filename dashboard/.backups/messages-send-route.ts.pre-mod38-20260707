@@ -117,22 +117,11 @@ export async function POST(request: NextRequest) {
 
     if (result.kind === 'reply') {
       try {
-        // === JARVIS MOD #38: return the reply synchronously so the client can
-        // speak it immediately (replyId lets it dedupe the SSE echo of the
-        // same outbound line). ===
-        const replyId = appendOutbound(ctxRoot, agent, result.text);
+        appendOutbound(ctxRoot, agent, result.text);
         return Response.json(
-          {
-            success: true,
-            messageId,
-            fastpath: true,
-            latencyMs: result.latencyMs,
-            replyText: result.text,
-            replyId,
-          },
+          { success: true, messageId, fastpath: true, latencyMs: result.latencyMs },
           { status: 200 }
         );
-        // === END MOD #38 ===
       } catch (err: unknown) {
         // Could not deliver the fast reply — fall through to the agent so the
         // user still gets an answer (slower, never silent).
@@ -155,12 +144,6 @@ export async function POST(request: NextRequest) {
     // 'unavailable' (no key) / 'error' / failed append → normal path, untouched text.
   }
   // === END MOD #34 ===========================================================
-
-  // === JARVIS MOD #38: any [Cosmos] turn that reaches the inbox path went to
-  // the full agent (10-60s think time) — tell the client so it can speak an
-  // immediate acknowledgment instead of dead air. ===
-  const escalated = isCosmos;
-  // === END MOD #38 ===
 
   // Priority 2 = normal (matches bus/send-message.sh mapping)
   const filename = `2-${epochMs}-from-${from}-${rand}.json`;
@@ -218,11 +201,7 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    return Response.json(
-      // === JARVIS MOD #38: escalated flag (see above) ===
-      { success: true, messageId, ...(escalated ? { escalated: true } : {}) },
-      { status: 200 },
-    );
+    return Response.json({ success: true, messageId }, { status: 200 });
   } catch (err: unknown) {
     // Clean up temp file on error
     try {

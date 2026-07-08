@@ -1,23 +1,9 @@
 import { NextRequest } from 'next/server';
 import fs from 'fs/promises';
 import path from 'path';
-import { getFrameworkRoot, getCTXRoot, getAllAgents, getLogDir } from '@/lib/config';
+import { getFrameworkRoot, getCTXRoot, getAllAgents } from '@/lib/config';
 import { IPCClient } from '@/lib/ipc-client';
 import { getHeartbeat, getHealthStatus } from '@/lib/data/heartbeats';
-
-// === JARVIS MOD #37 — live-activity signal for the Cosmos orbit scene ===
-// stdout.log mtime is the cheapest truthful "is this agent doing something
-// right now" signal (heartbeat freshness is a 5-hour liveness window, far too
-// coarse for dispatch choreography). Returns ms-since-last-write or null.
-async function getLastActivityMs(agentName: string): Promise<number | null> {
-  try {
-    const st = await fs.stat(path.join(getLogDir(agentName), 'stdout.log'));
-    return Math.max(0, Date.now() - st.mtimeMs);
-  } catch {
-    return null;
-  }
-}
-// === END JARVIS MOD #37 (helper) ===
 
 export const dynamic = 'force-dynamic';
 
@@ -40,15 +26,12 @@ export async function GET() {
       agents.map(async (agent) => {
         const hb = await getHeartbeat(agent.name);
         const health = hb ? getHealthStatus(hb) : 'down';
-        // MOD #37: lastActivityMs feeds the orbit dispatch choreography.
-        const lastActivityMs = await getLastActivityMs(agent.name);
         return {
           ...agent,
           health,
           lastHeartbeat: hb?.last_heartbeat ?? undefined,
           currentTask: hb?.current_task ?? undefined,
           status: hb?.status ?? undefined,
-          lastActivityMs: lastActivityMs ?? undefined,
         };
       })
     );

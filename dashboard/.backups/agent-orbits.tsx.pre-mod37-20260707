@@ -10,24 +10,9 @@
 // an agent when its health status changes. Name labels track the sphere and
 // dim/recede when the agent passes behind the orb.
 //
-// === JARVIS MOD #37 — dispatch choreography + avatar art + live activity ===
-// (2026-07-07, Trillion cosmic-orb-ui Tier 5 parity)
-//  - "Working" detection: currentTask present OR stdout activity < 60s
-//    (lastActivityMs, new field from /api/agents). Poll tightened 10s → 3s.
-//  - Dispatch: when an agent flips idle → working, a luminous beam races from
-//    the orb out to the agent in its accent color, the agent flares, and a
-//    sonar ring expands at the peak. Nothing snaps — all envelopes eased.
-//  - Working: faster, brighter halo pulse; agent eases OUT of orbit toward a
-//    dock slot near the right-side panel (in quickly), and drifts back to its
-//    orbit slowly when the task finishes.
-//  - Avatar art: real portrait PNGs from /agents/<name>.png composited into
-//    the avatar disc (letter-disc renders first and remains the fallback).
-//    GATED behind AVATAR_ART_ENABLED until Scott approves the art set.
-//  - Seam: window.__cosmosStats.orbitWorking = { [name]: boolean } (MERGED).
-//
-// Preserved seams (do not regress): polls /api/agents (visibility aware);
-// publishes window.__cosmosStats.orbitAgents = N and .orbitPositions (live
-// screen coords) for the E2E suite; clicking opens the frosted-glass panel
+// Preserved seams (do not regress): polls /api/agents every 10s (visibility
+// aware); publishes window.__cosmosStats.orbitAgents = N and .orbitPositions
+// (live screen coords) for the E2E suite; clicking opens the frosted-glass panel
 // with /api/uhs/agent-tail log lines; data-testids agent-orbit-panel(-log).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -41,14 +26,6 @@ const COLOR_OK = GREEN;
 const COLOR_IDLE = TEAL;
 const COLOR_DOWN = RED;
 
-// MOD #37: avatar art set enabled 2026-07-07 (Scott "continue" go-ahead;
-// jarvis-accounting regenerated glyph-free for series consistency).
-// PNGs staged in public/agents/; letter-disc fallback for any missing file.
-const AVATAR_ART_ENABLED = true;
-
-// MOD #37: stdout activity fresher than this = "working right now".
-const ACTIVITY_WORKING_MS = 60_000;
-
 type Health = 'healthy' | 'stale' | 'down' | string;
 
 interface AgentApi {
@@ -58,24 +35,17 @@ interface AgentApi {
   status?: string;
   lastHeartbeat?: string;
   currentTask?: string;
-  lastActivityMs?: number; // MOD #37
 }
 
 export interface OrbitAgent extends AgentApi {
   color: string; // status/halo color
   accent: string; // per-agent avatar accent
-  working: boolean; // MOD #37: actively doing something right now
 }
 
 function healthColor(health?: Health): string {
   if (health === 'healthy') return COLOR_OK;
   if (health === 'stale') return COLOR_IDLE;
   return COLOR_DOWN; // 'down' or unknown
-}
-
-function isWorking(a: AgentApi): boolean {
-  if (a.currentTask) return true;
-  return a.lastActivityMs !== undefined && a.lastActivityMs < ACTIVITY_WORKING_MS;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,31 +94,6 @@ function makeAvatarTexture(name: string, accent: string): THREE.CanvasTexture | 
   const tex = new THREE.CanvasTexture(cv);
   tex.colorSpace = THREE.SRGBColorSpace;
   avatarCache.set(key, tex);
-
-  // MOD #37: asynchronously composite the real avatar portrait into the SAME
-  // canvas once it loads — texture identity is stable so no React state is
-  // touched; the letter disc simply becomes the portrait on the next frame.
-  // Missing/failed PNG = silent no-op (letter disc remains the fallback).
-  if (AVATAR_ART_ENABLED) {
-    const img = new Image();
-    img.onload = () => {
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(s / 2, s / 2, s / 2 - 2, 0, Math.PI * 2);
-      ctx.clip();
-      ctx.drawImage(img, 0, 0, s, s);
-      ctx.restore();
-      // Re-stroke the accent rim over the portrait edge.
-      ctx.beginPath();
-      ctx.arc(s / 2, s / 2, s / 2 - 2, 0, Math.PI * 2);
-      ctx.lineWidth = 4;
-      ctx.strokeStyle = light;
-      ctx.stroke();
-      tex.needsUpdate = true;
-    };
-    img.src = `/agents/${encodeURIComponent(name)}.png`;
-  }
-
   return tex;
 }
 
@@ -171,8 +116,7 @@ function makeGlowTexture(): THREE.CanvasTexture | null {
 }
 
 // ---------------------------------------------------------------------------
-// Visibility-aware poll of /api/agents (client-side fetch, authed session).
-// MOD #37: 3s cadence (was 10s) so dispatch choreography reacts while you watch.
+// Visibility-aware 10s poll of /api/agents (client-side fetch, authed session).
 // ---------------------------------------------------------------------------
 function useAgentPoll(intervalMs: number): OrbitAgent[] {
   const [agents, setAgents] = useState<OrbitAgent[]>([]);
@@ -188,7 +132,6 @@ function useAgentPoll(intervalMs: number): OrbitAgent[] {
           ...a,
           color: healthColor(a.health),
           accent: AGENT_ACCENTS[hashIndex(a.name, AGENT_ACCENTS.length)],
-          working: isWorking(a),
         })),
       );
     } catch {
@@ -236,14 +179,10 @@ interface AgentNodeProps {
   yTilt: number;
   tiltAxis: number; // ring tilt orientation (radians)
   phase: number; // breathing phase offset
-  dockSlot: number; // MOD #37: stable slot index for the dock position
   selected: boolean;
   lowPerf: boolean;
   onSelect: (a: OrbitAgent) => void;
 }
-
-// MOD #37: dispatch beam timing (seconds).
-const BEAM_DURATION = 2.4;
 
 function AgentNode({
   agent,
@@ -253,7 +192,6 @@ function AgentNode({
   yTilt,
   tiltAxis,
   phase,
-  dockSlot,
   selected,
   lowPerf,
   onSelect,
@@ -263,10 +201,6 @@ function AgentNode({
   const haloRef = useRef<THREE.Sprite>(null);
   const pingRef = useRef<THREE.Mesh>(null);
   const pingMatRef = useRef<THREE.MeshBasicMaterial>(null);
-  // MOD #37: beam is a sibling of the group (parented at the orbit-system
-  // origin = the orb's center) so it can stretch orb → agent in local space.
-  const beamRef = useRef<THREE.Mesh>(null);
-  const beamMatRef = useRef<THREE.MeshBasicMaterial>(null);
   const [hovered, setHovered] = useState(false);
   const [labelDim, setLabelDim] = useState(false);
   const { camera, size } = useThree();
@@ -282,38 +216,12 @@ function AgentNode({
     prevHealth.current = agent.health;
   }, [agent.health]);
 
-  // MOD #37: dispatch bookkeeping — idle → working starts the beam + flare,
-  // and fires the same sonar ping used for health changes.
-  const prevWorking = useRef(agent.working);
-  const dispatchStart = useRef<number>(-1);
-  const dockBlend = useRef(0); // 0 = on orbit, 1 = docked
-  useEffect(() => {
-    if (!prevWorking.current && agent.working) {
-      dispatchStart.current = performance.now();
-      pingStart.current = performance.now();
-    }
-    prevWorking.current = agent.working;
-  }, [agent.working]);
-
   const avatarTex = useMemo(
     () => makeAvatarTexture(agent.name, agent.accent),
     [agent.name, agent.accent],
   );
   const glow = useMemo(() => makeGlowTexture(), []);
   const haloColor = useMemo(() => new THREE.Color(agent.color), [agent.color]);
-  const accentColor = useMemo(() => new THREE.Color(agent.accent), [agent.accent]);
-
-  // MOD #37: dock anchor — right side, toward the frosted panel, staggered per
-  // slot so simultaneous workers don't overlap. Kept forward of the orb (z>0).
-  const dockPos = useMemo(
-    () =>
-      new THREE.Vector3(
-        3.4,
-        1.4 - (dockSlot % 4) * 0.85,
-        1.4 + Math.floor(dockSlot / 4) * 0.35,
-      ),
-    [dockSlot],
-  );
 
   useFrame((state) => {
     if (!groupRef.current) return;
@@ -325,58 +233,29 @@ function AgentNode({
     const ez = Math.sin(angle) * radius * 0.72; // ellipse
     const ca = Math.cos(tiltAxis);
     const sa = Math.sin(tiltAxis);
-    const ox = ex * ca - ez * sa;
-    const oz = ex * sa + ez * ca;
-    const oy = yTilt + Math.sin(angle) * radius * 0.28;
-
-    // MOD #37: docking — ease toward the dock anchor while working ("in
-    // quickly"), drift back to orbit when done ("out slowly"). Nothing snaps.
-    const target = agent.working ? 1 : 0;
-    const rate = agent.working ? 0.045 : 0.012;
-    dockBlend.current += (target - dockBlend.current) * rate;
-    const b = dockBlend.current;
-    const x = ox * (1 - b) + dockPos.x * b;
-    const y = oy * (1 - b) + dockPos.y * b;
-    const zr = oz * (1 - b) + dockPos.z * b;
+    const x = ex * ca - ez * sa;
+    const zr = ex * sa + ez * ca;
+    const y = yTilt + Math.sin(angle) * radius * 0.28;
     groupRef.current.position.set(x, y, zr);
 
     // Depth fade: agents on the far side of the orb recede (dim + shrink) so
     // they sink into the sphere instead of blooming white over the bright core.
     const depthFade = zr >= 0 ? 1 : Math.max(0.32, 1 + zr / 4);
 
-    // MOD #37: dispatch flare envelope — peaks mid-beam, eases back.
-    let flare = 0;
-    if (dispatchStart.current >= 0) {
-      const dt = (performance.now() - dispatchStart.current) / 1000;
-      if (dt > BEAM_DURATION) {
-        dispatchStart.current = -1;
-      } else {
-        flare = Math.sin((dt / BEAM_DURATION) * Math.PI); // 0 → 1 → 0
-      }
-    }
-
-    // Out-of-phase breathing (working agents breathe faster and bigger).
-    const breatheHz = agent.working ? 2.6 : 1.6;
-    const breathe = 1 + Math.sin(t * breatheHz + phase) * 0.09;
-    const base =
-      (selected ? 0.62 : hovered ? 0.56 : 0.46) * (0.6 + 0.4 * depthFade) * (1 + flare * 0.45);
+    // Out-of-phase breathing.
+    const breathe = 1 + Math.sin(t * 1.6 + phase) * 0.09;
+    const base = (selected ? 0.62 : hovered ? 0.56 : 0.46) * (0.6 + 0.4 * depthFade);
     if (avatarRef.current) {
       avatarRef.current.scale.setScalar(base * breathe);
       const am = avatarRef.current.material as THREE.SpriteMaterial;
       am.opacity = 0.35 + 0.65 * depthFade;
     }
     if (haloRef.current) {
-      // MOD #37: working = faster, brighter pulse tinted toward the accent.
-      const pulse = agent.working
-        ? 0.95 + Math.sin(t * 5 + phase) * 0.35
-        : agent.health === 'healthy'
-          ? 0.8 + Math.sin(t * 3 + phase) * 0.2
-          : 0.6;
+      const pulse = agent.health === 'healthy' ? 0.8 + Math.sin(t * 3 + phase) * 0.2 : 0.6;
       haloRef.current.scale.setScalar(base * breathe * 2.1);
       const m = haloRef.current.material as THREE.SpriteMaterial;
-      m.opacity = Math.min(1, ((selected ? 0.9 : 0.6) * pulse + flare * 0.5) * depthFade);
+      m.opacity = (selected ? 0.9 : 0.6) * pulse * depthFade;
       m.color.copy(haloColor);
-      if (agent.working) m.color.lerp(accentColor, 0.6);
     }
 
     // Label recedes when the agent is on the far side of the orb.
@@ -402,32 +281,6 @@ function AgentNode({
       }
     }
 
-    // MOD #37: dispatch beam — a thin glowing cylinder from the orb's center
-    // (system origin) out to the agent, racing out then fading. The beam mesh
-    // is a sibling of the agent group, so it lives in origin-space directly.
-    if (beamRef.current && beamMatRef.current) {
-      if (dispatchStart.current >= 0) {
-        const dt = (performance.now() - dispatchStart.current) / 1000;
-        const p = Math.min(1, dt / (BEAM_DURATION * 0.4)); // race out in 40%
-        const agentPos = groupRef.current.position;
-        const len = agentPos.length() * p;
-        if (len > 0.01) {
-          beamRef.current.visible = true;
-          // Cylinder default axis is Y; scale to length, midpoint placement.
-          beamRef.current.scale.set(1, len, 1);
-          beamRef.current.position.copy(agentPos).multiplyScalar(p * 0.5);
-          beamRef.current.quaternion.setFromUnitVectors(
-            new THREE.Vector3(0, 1, 0),
-            agentPos.clone().normalize(),
-          );
-          beamMatRef.current.color.copy(accentColor);
-          beamMatRef.current.opacity = 0.75 * Math.sin(Math.min(1, dt / BEAM_DURATION) * Math.PI);
-        }
-      } else {
-        beamRef.current.visible = false;
-      }
-    }
-
     // Debug seam: publish each node's live screen position (E2E deterministic click).
     projected.current.copy(groupRef.current.position).project(camera);
     const sx = (projected.current.x * 0.5 + 0.5) * size.width;
@@ -435,97 +288,77 @@ function AgentNode({
     const stats = (window.__cosmosStats = window.__cosmosStats ?? {});
     stats.orbitPositions = stats.orbitPositions ?? {};
     stats.orbitPositions[agent.name] = { x: sx, y: sy, z: projected.current.z };
-    // MOD #37 seam: live working flags (MERGE into the map, never reassign).
-    stats.orbitWorking = stats.orbitWorking ?? {};
-    stats.orbitWorking[agent.name] = agent.working;
   });
 
-  const showLabel = hovered || selected || agent.working;
+  const showLabel = hovered || selected;
 
   return (
-    <>
-      {/* MOD #37: dispatch beam (origin-space sibling — NOT inside the moving group) */}
+    <group ref={groupRef}>
+      {/* Halo (status color) */}
+      {!lowPerf && glow && (
+        <sprite ref={haloRef}>
+          <spriteMaterial
+            map={glow}
+            transparent
+            depthWrite={false}
+            blending={THREE.AdditiveBlending}
+            opacity={0.6}
+          />
+        </sprite>
+      )}
+
+      {/* Avatar disc (billboard) — carries pointer interaction */}
+      <sprite
+        ref={avatarRef}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHovered(true);
+          document.body.style.cursor = 'pointer';
+        }}
+        onPointerOut={() => {
+          setHovered(false);
+          document.body.style.cursor = 'auto';
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onSelect(agent);
+        }}
+      >
+        <spriteMaterial map={avatarTex ?? undefined} transparent depthWrite={false} />
+      </sprite>
+
+      {/* Sonar ping ring (status change) */}
       {!lowPerf && (
-        <mesh ref={beamRef} visible={false}>
-          <cylinderGeometry args={[0.035, 0.035, 1, 8, 1, true]} />
+        <mesh ref={pingRef} visible={false}>
+          <ringGeometry args={[0.9, 1.0, 48]} />
           <meshBasicMaterial
-            ref={beamMatRef}
+            ref={pingMatRef}
+            color={agent.color}
             transparent
             opacity={0}
+            side={THREE.DoubleSide}
             depthWrite={false}
             blending={THREE.AdditiveBlending}
           />
         </mesh>
       )}
 
-      <group ref={groupRef}>
-        {/* Halo (status color; accent-tinted while working) */}
-        {!lowPerf && glow && (
-          <sprite ref={haloRef}>
-            <spriteMaterial
-              map={glow}
-              transparent
-              depthWrite={false}
-              blending={THREE.AdditiveBlending}
-              opacity={0.6}
-            />
-          </sprite>
-        )}
-
-        {/* Avatar disc (billboard) — carries pointer interaction */}
-        <sprite
-          ref={avatarRef}
-          onPointerOver={(e) => {
-            e.stopPropagation();
-            setHovered(true);
-            document.body.style.cursor = 'pointer';
-          }}
-          onPointerOut={() => {
-            setHovered(false);
-            document.body.style.cursor = 'auto';
-          }}
-          onClick={(e) => {
-            e.stopPropagation();
-            onSelect(agent);
-          }}
-        >
-          <spriteMaterial map={avatarTex ?? undefined} transparent depthWrite={false} />
-        </sprite>
-
-        {/* Sonar ping ring (status change / dispatch) */}
-        {!lowPerf && (
-          <mesh ref={pingRef} visible={false}>
-            <ringGeometry args={[0.9, 1.0, 48]} />
-            <meshBasicMaterial
-              ref={pingMatRef}
-              color={agent.color}
-              transparent
-              opacity={0}
-              side={THREE.DoubleSide}
-              depthWrite={false}
-              blending={THREE.AdditiveBlending}
-            />
-          </mesh>
-        )}
-
-        {showLabel && (
-          <Html position={[0, 0.42, 0]} center distanceFactor={8} zIndexRange={[10, 0]}>
-            <div
-              className="pointer-events-none select-none whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[11px] transition-opacity"
-              style={{
-                background: 'rgba(5,11,20,0.72)',
-                color: '#e7fbff',
-                border: `1px solid ${agent.working ? agent.accent : CYAN}55`,
-                opacity: labelDim ? 0.35 : 1,
-              }}
-            >
-              {agent.name}
-              {agent.working ? ' ⚡' : ''}
-            </div>
-          </Html>
-        )}
-      </group>
-    </>
+      {showLabel && (
+        <Html position={[0, 0.42, 0]} center distanceFactor={8} zIndexRange={[10, 0]}>
+          <div
+            className="pointer-events-none select-none whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[11px] transition-opacity"
+            style={{
+              background: 'rgba(5,11,20,0.72)',
+              color: '#e7fbff',
+              border: `1px solid ${CYAN}55`,
+              opacity: labelDim ? 0.35 : 1,
+            }}
+          >
+            {agent.name}
+          </div>
+        </Html>
+      )}
+    </group>
   );
 }
 
@@ -550,7 +383,6 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
       speed: number,
       yTilt: number,
       tiltAxis: number,
-      slotBase: number,
     ) =>
       list.map((agent, i) => ({
         agent,
@@ -560,11 +392,10 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
         tiltAxis,
         angle0: (i / Math.max(list.length, 1)) * Math.PI * 2,
         phase: (i / Math.max(list.length, 1)) * Math.PI * 2,
-        dockSlot: slotBase + i, // MOD #37: stable per-agent dock slot
       }));
     return [
-      ...place(inner, 2.6, 0.12, 0.2, 0.35, 0),
-      ...place(outer, 3.7, -0.08, -0.2, -0.5, inner.length),
+      ...place(inner, 2.6, 0.12, 0.2, 0.35),
+      ...place(outer, 3.7, -0.08, -0.2, -0.5),
     ];
   }, [agents]);
 
@@ -580,7 +411,6 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
           yTilt={item.yTilt}
           tiltAxis={item.tiltAxis}
           phase={item.phase}
-          dockSlot={item.dockSlot}
           selected={selectedName === item.agent.name}
           lowPerf={lowPerf}
           onSelect={onSelect}
@@ -654,7 +484,6 @@ function AgentPanel({
           </div>
           <span className="text-xs" style={{ color: CYAN }}>
             {healthLabel}
-            {agent.working ? ' · Working' : ''}
           </span>
         </div>
         <button
@@ -710,7 +539,7 @@ function AgentPanel({
 // panel renders outside it. A thin hook shares agent state + selection.
 // ---------------------------------------------------------------------------
 export function useAgentOrbits() {
-  const agents = useAgentPoll(3_000); // MOD #37: was 10s — live choreography
+  const agents = useAgentPoll(10_000);
   const [selectedName, setSelectedName] = useState<string | null>(null);
 
   const selected = useMemo(
@@ -742,4 +571,4 @@ export function AgentOrbitsOverlay({
   if (!selected) return null;
   return <AgentPanel agent={selected} onClose={onClose} />;
 }
-// === END JARVIS MOD #22 / #29 / #37 ===
+// === END JARVIS MOD #22 / #29 ===

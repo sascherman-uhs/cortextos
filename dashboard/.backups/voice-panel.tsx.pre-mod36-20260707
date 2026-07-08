@@ -19,9 +19,6 @@ import { useTts } from './use-tts';
 // === JARVIS MOD #25 — iOS audio unlock on the primary (mic) gesture ===
 import { unlockSharedAudio } from './audio-unlock';
 // === END JARVIS MOD #25 ===
-// === JARVIS MOD #38 — single decision point for SSE/backfill reply surfacing ===
-import { shouldSurfaceReply } from './reply-dedupe';
-// === END JARVIS MOD #38 ===
 
 interface VoicePanelProps {
   /** Lets the parent Scene mirror voice state → orb color, amplitude → breathing. */
@@ -33,15 +30,10 @@ interface VoicePanelProps {
 }
 
 const STATE_LABEL: Record<VoiceState, string> = {
-  // === JARVIS MOD #36: open-mic states ===
-  dormant: 'Mic off',
-  wakeListening: 'Say "Jarvis"…',
   idle: 'Tap to speak',
   listening: 'Listening…',
   processing: 'Sending…',
   responding: 'JARVIS is thinking…',
-  speaking: 'JARVIS is speaking…',
-  // === END MOD #36 ===
 };
 
 export function VoicePanel({
@@ -63,39 +55,11 @@ export function VoicePanel({
     // === JARVIS MOD #33: the hook's counter — incremented by EVERY send path ===
     sentTurnsRef,
     // === END JARVIS MOD #33 ===
-    // === JARVIS MOD #36: open-mic surface ===
-    openMic,
-    toggleOpenMic,
-    bindTts,
-    notifyTtsSpeaking,
-    // === END MOD #36 ===
-    // === JARVIS MOD #38: ids already delivered via the synchronous fast lane ===
-    fastReplyIdsRef,
-    // === END MOD #38 ===
   } = voice;
 
   // === JARVIS MOD #21: TTS — speak new agent replies through the three-tier route ===
   // === JARVIS MOD #24: also pull interrupt() for barge-in (mic press / new turn) ===
-  const { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError } = useTts();
-
-  // === JARVIS MOD #36: wire the TTS bridge into the open-mic engine —
-  // wake-word barge-in needs interrupt()+isSpeaking(); wake-ack/sign-off lines
-  // are LOCAL speech (no agent round-trip). speakingRef avoids re-binding. ===
-  const speakingRef = useRef(false);
-  useEffect(() => {
-    speakingRef.current = speaking;
-    notifyTtsSpeaking(speaking);
-  }, [speaking, notifyTtsSpeaking]);
-  useEffect(() => {
-    bindTts({
-      interrupt,
-      isSpeaking: () => speakingRef.current,
-      speakLocal: (text: string) => void speak(text),
-    });
-  }, [bindTts, interrupt, speak]);
-  // Effective state for the orb + label: TTS playback overrides the machine.
-  const displayState: VoiceState = speaking ? 'speaking' : state;
-  // === END MOD #36 ===
+  const { muted, toggleMute, speak, interrupt, ttsAmplitude, lastError } = useTts();
 
   // === JARVIS MOD #31: one-tap audio pipeline check. Runs INSIDE the tap
   // gesture (unlock + unmute + speak), so it isolates faults on the phone:
@@ -138,11 +102,9 @@ export function VoicePanel({
   const closedRef = useRef(false);
 
   // Bubble state + amplitude up to the Scene for the orb.
-  // === JARVIS MOD #36: the scene sees displayState ('speaking' while TTS plays). ===
   useEffect(() => {
-    onStateChange?.(displayState);
-  }, [displayState, onStateChange]);
-  // === END MOD #36 ===
+    onStateChange?.(state);
+  }, [state, onStateChange]);
   useEffect(() => {
     onAmplitudeChange?.(amplitude);
   }, [amplitude, onAmplitudeChange]);
@@ -170,21 +132,13 @@ export function VoicePanel({
       }[];
       for (const it of items) {
         if (it.direction !== 'outbound') continue;
-        // === JARVIS MOD #38: shared decision point (marks seen, skips
-        // fast-lane-delivered ids, keeps the MOD #33 sent-turn gate). ===
-        if (
-          shouldSurfaceReply({
-            id: it.id,
-            text: it.text,
-            seen: seenIdsRef.current,
-            fastReplyIds: fastReplyIdsRef.current,
-            sentTurns: sentTurnsRef.current,
-          })
-        ) {
-          pushAgentReply(it.text as string, it.id as string);
+        const id = it.id ?? '';
+        if (!id || seenIdsRef.current.has(id)) continue;
+        seenIdsRef.current.add(id);
+        if (sentTurnsRef.current > 0 && it.text) {
+          pushAgentReply(it.text, id);
           surfaced += 1;
         }
-        // === END MOD #38 ===
       }
     } catch {
       /* transient — next reconnect/backfill will retry */
@@ -224,20 +178,12 @@ export function VoicePanel({
           return;
         }
         const id = parsed.id ?? `out-${Date.now()}`;
-        // === JARVIS MOD #38: shared decision point — also skips replies the
-        // synchronous fast lane already spoke (same outbound line echoes here). ===
-        if (
-          shouldSurfaceReply({
-            id,
-            text: parsed.text,
-            seen: seenIdsRef.current,
-            fastReplyIds: fastReplyIdsRef.current,
-            sentTurns: sentTurnsRef.current,
-          })
-        ) {
-          pushAgentReply(parsed.text as string, id);
+        if (seenIdsRef.current.has(id)) return;
+        seenIdsRef.current.add(id);
+        // Only surface outbound lines that arrive AFTER we've sent a turn.
+        if (sentTurnsRef.current > 0 && parsed.text) {
+          pushAgentReply(parsed.text, id);
         }
-        // === END MOD #38 ===
       };
 
       es.onerror = () => {
@@ -406,28 +352,8 @@ export function VoicePanel({
           </button>
 
           <span className="flex-1 text-sm text-[#EDE8DF]/80" data-testid="cosmos-status">
-            {/* === JARVIS MOD #36: label follows displayState (incl. 'speaking') === */}
-            {supported ? STATE_LABEL[displayState] : 'Voice not supported — use the box below'}
+            {supported ? STATE_LABEL[state] : 'Voice not supported — use the box below'}
           </span>
-
-          {/* === JARVIS MOD #36: open-mic toggle — the privacy control. ON = hot
-              mic waiting for "Jarvis"; OFF = tap-to-talk only (pre-mod flow). === */}
-          <button
-            onClick={toggleOpenMic}
-            aria-label={openMic ? 'Disable open mic' : 'Enable open mic'}
-            aria-pressed={openMic}
-            data-testid="cosmos-open-mic"
-            title={openMic ? 'Open mic ON — say "Jarvis"' : 'Open mic OFF — tap to talk'}
-            className={[
-              'flex h-9 shrink-0 items-center justify-center rounded-full border px-3 text-xs transition-colors',
-              openMic
-                ? 'border-[#2DD4A8]/60 bg-[#2DD4A8]/10 text-[#2DD4A8] hover:bg-[#2DD4A8]/20'
-                : 'border-white/20 bg-white/5 text-[#EDE8DF]/40 hover:bg-white/10',
-            ].join(' ')}
-          >
-            {openMic ? 'Open mic' : 'Mic off'}
-          </button>
-          {/* === END MOD #36 === */}
 
           {/* === JARVIS MOD #31: one-tap audio pipeline check === */}
           <button

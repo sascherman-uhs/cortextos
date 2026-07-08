@@ -68,39 +68,6 @@ function useCosmosStats(intervalMs: number): CosmosStats | null {
   return stats;
 }
 
-// === JARVIS MOD #38 — client-side voice metrics (2026-07-07) ===
-// Fast-lane hit rate + response-latency p50 live in window.__cosmosStats (written
-// by use-voice's fastReplies/escalations counters and use-tts's recordLatencySample).
-// They are runtime-only, per-session, and never hit the server — so this panel reads
-// them directly rather than through /api/uhs/cosmos-stats. Poll at 1s (cheap, local).
-interface VoiceMetrics {
-  p50Ms: number;
-  hitPct: number | null; // null until at least one [Cosmos] turn resolves
-  samples: number;
-}
-
-function useVoiceMetrics(intervalMs: number): VoiceMetrics {
-  const [m, setM] = useState<VoiceMetrics>({ p50Ms: 0, hitPct: null, samples: 0 });
-  useEffect(() => {
-    const read = () => {
-      const s = typeof window !== 'undefined' ? window.__cosmosStats : undefined;
-      const fast = s?.fastReplies ?? 0;
-      const esc = s?.escalations ?? 0;
-      const total = fast + esc;
-      setM({
-        p50Ms: s?.voiceLatency?.p50 ?? 0,
-        hitPct: total > 0 ? Math.round((fast / total) * 100) : null,
-        samples: s?.voiceLatency?.n ?? 0,
-      });
-    };
-    read();
-    const t = setInterval(read, intervalMs);
-    return () => clearInterval(t);
-  }, [intervalMs]);
-  return m;
-}
-// === END JARVIS MOD #38 ===
-
 interface StatCardProps {
   label: string;
   value: string;
@@ -132,26 +99,9 @@ function StatCard({ label, value, position, testId, hint }: StatCardProps) {
 
 export function DataPanels() {
   const stats = useCosmosStats(60_000);
-  const voice = useVoiceMetrics(1_000);
 
   return (
     <>
-      {/* MOD #38: fast-lane latency + hit-rate — the "is JARVIS answering fast?" readout */}
-      <StatCard
-        testId="panel-voice-latency"
-        label={
-          voice.hitPct === null
-            ? 'Voice Reply'
-            : `Voice · ${voice.hitPct}% fast`
-        }
-        value={voice.samples > 0 ? `${(voice.p50Ms / 1000).toFixed(1)}s` : '—'}
-        position="left-6 top-72"
-        hint={
-          voice.samples > 0
-            ? `p50 of ${voice.samples} spoken turns (user-stopped → first audible). ${voice.hitPct ?? 0}% answered by the fast lane.`
-            : 'No spoken turns yet this session.'
-        }
-      />
       <StatCard
         testId="panel-active-stagings"
         label="Active Stagings"

@@ -31,34 +31,22 @@ const LOW_PARTICLES = 1000;
 // responding bright teal. NOTE: the voice hook currently emits only these four
 // states; an 'error' red-shift would slot in here if use-voice ever emits it. ===
 const STATE_CORE: Record<VoiceState, string> = {
-  // === JARVIS MOD #36: open-mic states — dormant near-dark, wakeListening a
-  // quiet ember (hot mic, waiting for its name), speaking brightest. ===
-  dormant: TEAL,
-  wakeListening: TEAL,
   idle: TEAL,
   listening: CYAN,
   processing: AQUA,
   responding: TEAL,
-  speaking: TEAL,
 };
 const STATE_RIM: Record<VoiceState, string> = {
-  dormant: MINT,
-  wakeListening: MINT,
   idle: MINT,
   listening: MINT,
   processing: PURPLE,
   responding: MINT,
-  speaking: MINT,
 };
 const STATE_BRIGHT: Record<VoiceState, number> = {
-  dormant: 0.45,
-  wakeListening: 0.6,
   idle: 0.72,
   listening: 1.05,
   processing: 0.95,
   responding: 1.18,
-  speaking: 1.25,
-  // === END MOD #36 ===
 };
 // Idle breathing amplitude; live mic amplitude scales above this while speaking.
 const IDLE_AMPLITUDE = 0.035;
@@ -75,9 +63,6 @@ declare global {
       // === JARVIS MOD #22: agent count + live screen positions (debug seam) ===
       orbitAgents?: number;
       orbitPositions?: Record<string, { x: number; y: number; z: number }>;
-      // === JARVIS MOD #37: live per-agent working flags (dispatch choreography seam) ===
-      orbitWorking?: Record<string, boolean>;
-      // === END JARVIS MOD #37 ===
       // === JARVIS MOD #24: per-sentence TTS queue seams (2026-07-05) ===
       // lastUserStopMs: performance.now() when the user's turn ended (set by
       //   use-voice.sendText). timeSinceUserStoppedTalkingMs: that → first audible.
@@ -95,34 +80,8 @@ declare global {
       // === JARVIS MOD #31: last playback-path failure (null = healthy) ===
       ttsLastError?: string | null;
       // === END JARVIS MOD #31 ===
-      // === JARVIS MOD #36: open-mic / wake-gate / VAD seams (2026-07-07) ===
-      openMic?: boolean;
-      openMicError?: string | null;
-      vadSpeechActive?: boolean;
-      followUpUntilMs?: number;
-      wakeGate?: {
-        accepted: number;
-        discarded: number;
-        lastDecision?: string;
-        lastUtterance?: string;
-      };
-      // === END JARVIS MOD #36 ===
-      // === JARVIS MOD #38: sync fast-lane + latency-percentile seams (2026-07-07) ===
-      // fastReplies: count of replies delivered synchronously in the POST response.
-      // voiceLatency: session p50/p95 of user-stopped-talking → first audible (ms).
-      fastReplies?: number;
-      escalations?: number;
-      voiceLatency?: { p50: number; p95: number; n: number };
-      // === END JARVIS MOD #38 ===
     };
     // === END JARVIS MOD #21 ===
-    // === JARVIS MOD #36: micless wake-gate test seam (Playwright drives the
-    // spoken-utterance path without a mic; assigned/removed by use-voice). ===
-    __cosmosVoiceTest?: {
-      utterance: (text: string) => void;
-      agentReply: (text: string) => void;
-    };
-    // === END JARVIS MOD #36 ===
   }
 }
 
