@@ -362,7 +362,10 @@ export function useVoice(): UseVoiceResult {
 
   const pushAgentReply = useCallback((text: string, id: string) => {
     if (!text.trim()) return;
-    setLog((prev) => [...prev, { id, role: 'agent', text, ts: Date.now() }]);
+    setLog((prev) => {
+      if (prev.some((e) => e.id === id)) return prev;
+      return [...prev, { id, role: 'agent', text, ts: Date.now() }];
+    });
     // === JARVIS MOD #36: a reply arrived — the conversation is two-sided now
     // (arms the sign-off detector) and the machine returns to its rest state. ===
     hadAgentTurnRef.current = true;
@@ -596,9 +599,14 @@ export function useVoice(): UseVoiceResult {
 
     recognition.onerror = (e?: { error?: string }) => {
       if (e?.error === 'not-allowed' || e?.error === 'service-not-allowed') {
-        // Permission revoked — drop out of open mic entirely.
+        // MOD #39d: capability failure must NOT overwrite the PREFERENCE — the
+        // old setOpenMic(false) persisted '0', so one transient permission
+        // hiccup silently disabled wake mode forever (Scott's "mic off keeps
+        // coming back", 2026-07-08). Stop the engine for this session, surface
+        // the error on the debug line, and retry next launch.
         mergeStats({ openMicError: e.error });
-        setOpenMic(false);
+        engineRunningRef.current = false;
+        setState('dormant');
         return;
       }
       // Transient (no-speech / network / aborted): onend fires next and restarts.
