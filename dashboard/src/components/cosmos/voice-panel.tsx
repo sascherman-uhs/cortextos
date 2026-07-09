@@ -433,7 +433,7 @@ export function VoicePanel({
                 : 'border-white/20 bg-white/5 text-[#EDE8DF]/40 hover:bg-white/10',
             ].join(' ')}
           >
-            {openMic ? 'Open mic' : 'Mic off'}
+            {openMic ? '"Hey Jarvis" ON' : 'Enable "Hey Jarvis"'}
           </button>
           {/* === END MOD #36 === */}
 

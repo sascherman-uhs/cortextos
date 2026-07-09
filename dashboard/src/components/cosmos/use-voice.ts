@@ -104,9 +104,24 @@ const AGENT = 'jarvis-telegram';
 // MOD #39c: key bumped (was 'cosmos-open-mic') to re-default open mic ON once —
 // an accidental toggle-tap during 2026-07-08 debugging persisted OFF and read
 // as "voice is broken". A deliberate off still sticks under the new key.
-const OPEN_MIC_KEY = 'cosmos-open-mic-v2';
+// (v3, 2026-07-08 evening: the v2 re-default worked, then an instructed toggle
+// tap flipped it off again and persisted. One more re-default; the pill is now
+// labeled unambiguously so an ON→OFF tap is a visibly deliberate act.)
+const OPEN_MIC_KEY = 'cosmos-open-mic-v3';
 /** Tap mode: ms of post-speech silence before the turn auto-sends. */
 const TAP_AUTOSTOP_SILENCE_MS = 1100;
+
+// MOD #39e: whisper emits literal non-speech tokens for silent/ambient audio —
+// "[BLANK_AUDIO]", "[MUSIC]", "(silence)", "♪♪" — which are NOT the user
+// speaking. One reached the agent as a real turn on 2026-07-08 (screenshot:
+// "[BLANK_AUDIO]" bubble, agent politely replied). Treat as empty.
+function meaningfulTranscript(t: string | undefined): string {
+  const trimmed = (t ?? '').trim();
+  if (!trimmed) return '';
+  if (/^[\[\(].*[\]\)]$/.test(trimmed)) return ''; // whole-string bracketed token
+  if (/^[♪♫\s]+$/.test(trimmed)) return '';
+  return trimmed;
+}
 // iOS: bound the always-running recorder's blob during long silence.
 const IOS_IDLE_RESTART_MS = 20_000;
 // Auto-restart delay after a recognition session ends/errors.
@@ -662,12 +677,13 @@ export function useVoice(): UseVoiceResult {
         const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
         const data = (await res.json()) as { transcript?: string };
         setInterim('');
-        if (data.transcript?.trim()) {
+        const engineText = meaningfulTranscript(data.transcript); // MOD #39e
+        if (engineText) {
           // Whisper path has no interim — barge-in check happens here instead.
-          if (ttsBridgeRef.current?.isSpeaking() && containsWakeWord(data.transcript)) {
+          if (ttsBridgeRef.current?.isSpeaking() && containsWakeWord(engineText)) {
             ttsBridgeRef.current.interrupt();
           }
-          handleUtterance(data.transcript);
+          handleUtterance(engineText);
         } else {
           setState(restState());
         }
@@ -920,8 +936,9 @@ export function useVoice(): UseVoiceResult {
           const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
           const data = (await res.json()) as { transcript?: string; error?: string };
           setInterim('');
-          if (data.transcript?.trim()) {
-            sendText(data.transcript);
+          const tapText = meaningfulTranscript(data.transcript); // MOD #39e
+          if (tapText) {
+            sendText(tapText);
           } else {
             setState(restState());
           }
