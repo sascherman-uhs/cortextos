@@ -40,6 +40,15 @@ describe('wakeMatch', () => {
     expect(wakeMatch('Javis, run the report').woke).toBe(true);
     expect(wakeMatch('hey jarvus').woke).toBe(true);
   });
+  it('tolerates Whisper mis-hearings of the greeting (2026-07-12 live miss)', () => {
+    expect(wakeMatch('A Jarvis')).toEqual({ woke: true, remainder: '' });
+    expect(wakeMatch('A Jarvis, what time is it').remainder).toBe('what time is it');
+    expect(wakeMatch('Hay Jarvis, status').woke).toBe(true);
+    expect(wakeMatch('Eh Jarvis').woke).toBe(true);
+    expect(wakeMatch('Hi Jarvis, any messages?').woke).toBe(true);
+    // Still no mid-sentence fire: "a jarvis" only counts as a PREFIX.
+    expect(wakeMatch('I saw a jarvis demo yesterday').woke).toBe(false);
+  });
   it('containsWakeWord finds the name anywhere (barge-in path)', () => {
     expect(containsWakeWord('um Jarvis stop')).toBe(true);
     expect(containsWakeWord('nothing to see')).toBe(false);

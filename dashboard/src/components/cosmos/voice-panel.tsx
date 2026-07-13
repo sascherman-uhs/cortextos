@@ -549,10 +549,10 @@ function MicDebugLine({ openMic }: { openMic: boolean }) {
       const gate = s?.wakeGate?.lastDecision
         ? ` · ${s.wakeGate.lastDecision}: “${(s.wakeGate.lastUtterance ?? '').slice(0, 32)}”`
         : '';
-      // MOD #39d: build stamp — "does the gray line say v39d?" instantly
+      // MOD #39d: build stamp — "does the gray line say v39f?" instantly
       // answers whether the installed PWA pulled fresh JS (iOS staleness lore).
       setLine(
-        `v39d · mic ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
+        `v39f · mic ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
       );
     };
     read();

@@ -49,10 +49,11 @@ function norm(text: string): string {
 // after the greeting must not defeat the gate (found live 2026-07-08: Scott's
 // first real-mic test produced zero sends). Also tolerate common Whisper
 // mis-hearings of the name (same fix class as "Cleo"=Claude): Jervis, Javis,
-// Jarvus, Jarves, Jarvas.
+// Jarvus, Jarves, Jarvas — AND of the greeting: "Hey" comes back as "A",
+// "Hay", "Eh", or "Hi" (found live 2026-07-12: "A Jarvis" discarded on-phone).
 const WAKE_NAME = '(?:jarvis|jervis|javis|jarvus|jarves|jarvas)';
 const WAKE_RE = new RegExp(
-  `^(?:hey|ok|okay)?[,.!]?\\s*${WAKE_NAME}\\b[,.!?]?\\s*`,
+  `^(?:hey|ok|okay|a|hay|eh|hi)?[,.!]?\\s*${WAKE_NAME}\\b[,.!?]?\\s*`,
   'i'
 );
 
