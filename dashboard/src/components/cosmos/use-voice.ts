@@ -110,6 +110,11 @@ const AGENT = 'jarvis-telegram';
 const OPEN_MIC_KEY = 'cosmos-open-mic-v3';
 /** Tap mode: ms of post-speech silence before the turn auto-sends. */
 const TAP_AUTOSTOP_SILENCE_MS = 1100;
+/** MOD #39h: ms of post-transcript quiet before an accepted turn ships to the
+ *  agent. VAD chunks arriving inside this window MERGE into one turn, so a
+ *  natural mid-sentence pause no longer splits (or truncates) the thought.
+ *  Effective pause tolerance ≈ VAD hangover (950ms) + STT (~700ms) + this. */
+const MERGE_WINDOW_MS = 1200;
 
 // MOD #39e: whisper emits literal non-speech tokens for silent/ambient audio —
 // "[BLANK_AUDIO]", "[MUSIC]", "(silence)", "♪♪" — which are NOT the user
@@ -457,6 +462,40 @@ export function useVoice(): UseVoiceResult {
       .catch(() => setState(restState()));
   }, [restState, pushAgentReply]);
 
+  // === JARVIS MOD #39h: turn aggregation ======================================
+  // VAD chunk boundaries are STT boundaries, NOT message boundaries. The engine
+  // cuts audio after ~950ms of silence (good: fast transcription, fast wake
+  // detection), but shipping each chunk to the agent made every natural pause
+  // split the thought — "definitely not a normal dialogue" (Scott, 2026-07-12).
+  // Accepted content buffers here and only ships after MERGE_WINDOW_MS of
+  // post-transcript quiet; anything said in the meantime merges into one turn.
+  const pendingTurnRef = useRef('');
+  const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const shipPendingTurn = useCallback(() => {
+    pendingTimerRef.current = null;
+    if (utterSpeechSeenRef.current) {
+      // Mid-speech again — hold the buffer until the next quiet window.
+      pendingTimerRef.current = setTimeout(shipPendingTurn, MERGE_WINDOW_MS);
+      return;
+    }
+    const text = pendingTurnRef.current.trim();
+    pendingTurnRef.current = '';
+    if (text) sendText(text);
+  }, [sendText]);
+
+  const queueTurn = useCallback(
+    (content: string) => {
+      pendingTurnRef.current = pendingTurnRef.current
+        ? `${pendingTurnRef.current} ${content}`
+        : content;
+      if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = setTimeout(shipPendingTurn, MERGE_WINDOW_MS);
+    },
+    [shipPendingTurn],
+  );
+  // ===========================================================================
+
   // === JARVIS MOD #36: the wake gate — every SPOKEN utterance lands here ======
   const handleUtterance = useCallback(
     (raw: string) => {
@@ -498,7 +537,10 @@ export function useVoice(): UseVoiceResult {
           // removing some of the transcript"). Now it rides through as a
           // follow-up, same as speech within 8s after a TTS reply.
           followUpUntilMsRef.current = now + FOLLOW_UP_MS;
-          sendText(content);
+          // MOD #39h: buffer + merge instead of send-per-chunk — the agent
+          // gets ONE coherent turn after you actually stop talking.
+          queueTurn(content);
+          setState('listening');
         }
       } else {
         // Not for us — ambient speech without the wake word. No send, but show
@@ -522,7 +564,7 @@ export function useVoice(): UseVoiceResult {
         followUpUntilMs: followUpUntilMsRef.current,
       });
     },
-    [restState, sendText],
+    [restState, queueTurn],
   );
   // ===========================================================================
 
