@@ -270,6 +270,10 @@ export function useVoice(): UseVoiceResult {
   const utterInterruptedRef = useRef(false);
   const lastVoiceActivityMsRef = useRef(0);
   const sttBusyRef = useRef(false);
+  // MOD #39g: engine STT is SERIALIZED through this chain, never dropped — a
+  // chunk that landed while the previous Whisper call was in flight used to be
+  // discarded wholesale (heard live 2026-07-12 as "missing transcript").
+  const sttChainRef = useRef<Promise<void>>(Promise.resolve());
   // Turn-taking
   const followUpUntilMsRef = useRef(0);
   const hadAgentTurnRef = useRef(false);
@@ -487,6 +491,13 @@ export function useVoice(): UseVoiceResult {
         } else {
           decision = 'accepted';
           wakeStatsRef.current.accepted += 1;
+          // MOD #39g: an accepted turn OPENS the follow-up window — the VAD
+          // splits long sentences at natural pauses (~950ms), and the tail
+          // chunk arrives with no wake word. Before this, that tail was
+          // discarded as ambient speech (heard live 2026-07-12 as "it's
+          // removing some of the transcript"). Now it rides through as a
+          // follow-up, same as speech within 8s after a TTS reply.
+          followUpUntilMsRef.current = now + FOLLOW_UP_MS;
           sendText(content);
         }
       } else {
@@ -662,37 +673,41 @@ export function useVoice(): UseVoiceResult {
         startEngineRecorder(engineStreamRef.current);
       }
       // …then transcribe what we captured (unless it was an idle-bound restart).
-      if (discarded || sttBusyRef.current) return;
+      if (discarded) return;
       const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
       if (blob.size < 1000) return;
-      sttBusyRef.current = true;
-      setInterim('Transcribing…');
-      try {
-        const form = new FormData();
-        form.append(
-          'audio',
-          blob,
-          'audio.' + ((recorder.mimeType || '').includes('mp4') ? 'm4a' : 'webm'),
-        );
-        const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
-        const data = (await res.json()) as { transcript?: string };
-        setInterim('');
-        const engineText = meaningfulTranscript(data.transcript); // MOD #39e
-        if (engineText) {
-          // Whisper path has no interim — barge-in check happens here instead.
-          if (ttsBridgeRef.current?.isSpeaking() && containsWakeWord(engineText)) {
-            ttsBridgeRef.current.interrupt();
+      // MOD #39g: queue behind any in-flight Whisper call instead of dropping —
+      // the old `if (sttBusyRef.current) return` silently threw the audio away.
+      sttChainRef.current = sttChainRef.current.then(async () => {
+        sttBusyRef.current = true;
+        setInterim('Transcribing…');
+        try {
+          const form = new FormData();
+          form.append(
+            'audio',
+            blob,
+            'audio.' + ((recorder.mimeType || '').includes('mp4') ? 'm4a' : 'webm'),
+          );
+          const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
+          const data = (await res.json()) as { transcript?: string };
+          setInterim('');
+          const engineText = meaningfulTranscript(data.transcript); // MOD #39e
+          if (engineText) {
+            // Whisper path has no interim — barge-in check happens here instead.
+            if (ttsBridgeRef.current?.isSpeaking() && containsWakeWord(engineText)) {
+              ttsBridgeRef.current.interrupt();
+            }
+            handleUtterance(engineText);
+          } else {
+            setState(restState());
           }
-          handleUtterance(engineText);
-        } else {
+        } catch {
+          setInterim('');
           setState(restState());
+        } finally {
+          sttBusyRef.current = false;
         }
-      } catch {
-        setInterim('');
-        setState(restState());
-      } finally {
-        sttBusyRef.current = false;
-      }
+      });
     };
     engineRecorderRef.current = recorder;
     engineRecorderStartedMsRef.current = performance.now();
@@ -773,8 +788,11 @@ export function useVoice(): UseVoiceResult {
             utterSpeechSeenRef.current = false;
             if (ios) {
               // Utterance boundary: stop → transcribe → auto-restart (onstop).
+              // MOD #39g: no sttBusy guard — the boundary must ALWAYS cut. The
+              // old skip-while-busy left the utterance in the standing blob,
+              // where the 20s idle restart could silently discard it.
               const rec = engineRecorderRef.current;
-              if (rec?.state === 'recording' && !sttBusyRef.current) {
+              if (rec?.state === 'recording') {
                 setState('processing');
                 rec.stop();
               }

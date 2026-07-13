@@ -70,6 +70,10 @@ export async function POST(req: Request) {
       parsed.segments?.map((s) => s.text).join(' ').trim() ||
       '';
 
+    // MOD #39g: log every transcript — "is the loss Whisper or a client filter?"
+    // must be answerable from `pm2 logs dash-cortexos` without a repro session.
+    console.log(`[stt] ${buf.length}b → "${transcript}"`);
+
     return Response.json({ transcript });
   } catch (err) {
     console.error('[stt] Whisper error:', err);
