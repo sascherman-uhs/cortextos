@@ -65,7 +65,10 @@ export interface WakeMatch {
 
 /** Case/punctuation-insensitive "jarvis" / "hey jarvis" prefix gate. */
 export function wakeMatch(text: string): WakeMatch {
-  const trimmed = text.trim();
+  // Whisper decorates transcripts with junk lead-ins — ">> Hey Jarvis…", "- Hey
+  // Jarvis…" — which defeated the ^-anchored gate (two live misses 2026-07-12,
+  // "dead silence"). Strip any leading non-letter noise before matching.
+  const trimmed = text.trim().replace(/^[^a-zA-Z]+/, '');
   const m = trimmed.match(WAKE_RE);
   if (!m) return { woke: false, remainder: trimmed };
   return { woke: true, remainder: trimmed.slice(m[0].length).trim() };

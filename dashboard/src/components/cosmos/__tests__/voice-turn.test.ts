@@ -49,6 +49,16 @@ describe('wakeMatch', () => {
     // Still no mid-sentence fire: "a jarvis" only counts as a PREFIX.
     expect(wakeMatch('I saw a jarvis demo yesterday').woke).toBe(false);
   });
+  it('strips Whisper junk lead-ins before the gate (2026-07-12 dead-silence miss)', () => {
+    expect(wakeMatch('>> Hey Jarvis, how many people are registered?').woke).toBe(true);
+    expect(wakeMatch('>> Hey Jarvis, share something witty').remainder).toBe(
+      'share something witty',
+    );
+    expect(wakeMatch('- Jarvis, status').woke).toBe(true);
+    expect(wakeMatch('… Okay Jarvis').woke).toBe(true);
+    // Junk stripping must not create false wakes.
+    expect(wakeMatch('>> the install crew is here').woke).toBe(false);
+  });
   it('containsWakeWord finds the name anywhere (barge-in path)', () => {
     expect(containsWakeWord('um Jarvis stop')).toBe(true);
     expect(containsWakeWord('nothing to see')).toBe(false);

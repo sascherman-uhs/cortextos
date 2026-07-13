@@ -552,7 +552,7 @@ function MicDebugLine({ openMic }: { openMic: boolean }) {
       // MOD #39d: build stamp — "does the gray line say v39g?" instantly
       // answers whether the installed PWA pulled fresh JS (iOS staleness lore).
       setLine(
-        `v39h · mic ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
+        `v39i · mic ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
       );
     };
     read();
