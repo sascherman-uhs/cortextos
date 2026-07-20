@@ -15,12 +15,73 @@
  * effect there. Use a multilingual model (no `.en` suffix) for non-English
  * audio.
  */
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+
+// [UHS MOD #13] Deepgram Nova-3 as primary transcriber with whisper.cpp fallback.
+// Key resolves from DEEPGRAM_API_KEY env, else macOS Keychain (service 'deepgram',
+// account 'jarvis' — installed via scripts/install-deepgram-key-from-clipboard.sh in
+// the uhsJARVIS repo). Disable with CTX_DEEPGRAM_DISABLE=1. If no key or any failure,
+// transcribeVoice() falls through to the original local whisper path below.
+let cachedDeepgramKey: string | null | undefined;
+
+function resolveDeepgramKey(): string | null {
+  if (cachedDeepgramKey !== undefined) return cachedDeepgramKey;
+  let key = (process.env.DEEPGRAM_API_KEY || '').trim();
+  if (!key) {
+    try {
+      key = execFileSync(
+        'security',
+        ['find-generic-password', '-s', 'deepgram', '-a', 'jarvis', '-w'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      ).trim();
+    } catch {
+      key = '';
+    }
+  }
+  cachedDeepgramKey = key || null;
+  return cachedDeepgramKey;
+}
+
+async function transcribeViaDeepgram(
+  oggPath: string,
+  log: (line: string) => void,
+  timeoutMs: number,
+): Promise<string | null> {
+  const key = resolveDeepgramKey();
+  if (!key) return null;
+
+  const audio = fs.readFileSync(oggPath);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // Telegram voice notes are OGG/Opus, which Deepgram accepts directly (no ffmpeg).
+    const resp = await fetch(
+      'https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true',
+      {
+        method: 'POST',
+        headers: { Authorization: `Token ${key}`, 'Content-Type': 'audio/ogg' },
+        body: audio,
+        signal: controller.signal,
+      },
+    );
+    if (!resp.ok) {
+      log(`[transcribe] deepgram HTTP ${resp.status} — falling back to whisper`);
+      return null;
+    }
+    const data = (await resp.json()) as {
+      results?: { channels?: Array<{ alternatives?: Array<{ transcript?: string }> }> };
+    };
+    const text = data?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+    return typeof text === 'string' && text.trim() ? text.trim() : null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function resolveModelPath(): string {
   if (process.env.CTX_WHISPER_MODEL) return process.env.CTX_WHISPER_MODEL;
@@ -53,6 +114,21 @@ export async function transcribeVoice(
   if (!oggPath || !fs.existsSync(oggPath)) return null;
 
   const log = opts.log || (() => {});
+
+  // [UHS MOD #13] Try Deepgram Nova-3 first; on absent key / any failure, fall
+  // through to the local whisper.cpp path below (unchanged original behavior).
+  if (process.env.CTX_DEEPGRAM_DISABLE !== '1') {
+    try {
+      const dg = await transcribeViaDeepgram(oggPath, log, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      if (dg) {
+        log('[transcribe] via Deepgram nova-3');
+        return dg;
+      }
+    } catch (err) {
+      log(`[transcribe] deepgram error (${(err as Error).message}) — falling back to whisper`);
+    }
+  }
+
   const modelPath = opts.modelPath || resolveModelPath();
   const ffmpegBin = resolveBin('CTX_FFMPEG_BIN', 'ffmpeg');
   const whisperBin = resolveBin('CTX_WHISPER_BIN', 'whisper-cli');

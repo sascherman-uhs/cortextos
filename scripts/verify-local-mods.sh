@@ -336,6 +336,17 @@ check "quota exhaustion message says quota not rate limit (MOD #12)" \
 
 echo ""
 
+# ─── MOD #13: Deepgram Nova-3 primary transcriber, whisper.cpp fallback ───────
+echo "── MOD #13: Deepgram speech-in with whisper fallback"
+check "transcribe.ts has Deepgram helper (MOD #13)" \
+  "$CORTEXTOS_ROOT/src/telegram/transcribe.ts" \
+  "transcribeViaDeepgram"
+check "transcribe.ts calls Deepgram before whisper (MOD #13)" \
+  "$CORTEXTOS_ROOT/src/telegram/transcribe.ts" \
+  "UHS MOD #13"
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then
