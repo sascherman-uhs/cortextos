@@ -347,6 +347,17 @@ check "transcribe.ts calls Deepgram before whisper (MOD #13)" \
 
 echo ""
 
+# ─── MOD #42: Deepgram Nova-3 primary for /jarvis web STT, whisper.cpp fallback ─
+echo "── MOD #42: Deepgram speech-in for Cosmos web voice (/api/uhs/stt)"
+check "stt route has Deepgram helper (MOD #42)" \
+  "$DASHBOARD_ROOT/src/app/api/uhs/stt/route.ts" \
+  "transcribeViaDeepgram"
+check "stt route tries Deepgram before whisper (MOD #42)" \
+  "$DASHBOARD_ROOT/src/app/api/uhs/stt/route.ts" \
+  "JARVIS MOD #42"
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then

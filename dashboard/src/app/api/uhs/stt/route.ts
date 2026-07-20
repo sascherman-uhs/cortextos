@@ -3,7 +3,7 @@
 // Used by use-voice.ts when webkitSpeechRecognition is unavailable (iOS PWA standalone).
 // Runs Whisper `base` model locally — model already cached at ~/.cache/whisper/base.pt.
 import { auth } from '@/lib/auth';
-import { exec } from 'child_process';
+import { exec, execFileSync } from 'child_process';
 import { writeFile, readFile, unlink, mkdir } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -13,6 +13,63 @@ const execAsync = promisify(exec);
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+
+// === JARVIS MOD #42 — Deepgram Nova-3 primary for Cosmos STT, whisper.cpp fallback (2026-07-20) ===
+// Parity with the Telegram voice path (cortextos MOD #13). Deepgram is markedly
+// more accurate on proper nouns (street/agent/subdivision names) than the local
+// tiny.en model. Key from DEEPGRAM_API_KEY env, else macOS Keychain
+// (service 'deepgram', account 'jarvis'). Disable with CTX_DEEPGRAM_DISABLE=1.
+// Any failure / absent key falls through to the whisper.cpp path unchanged.
+let cachedDeepgramKey: string | null | undefined;
+
+function resolveDeepgramKey(): string | null {
+  if (cachedDeepgramKey !== undefined) return cachedDeepgramKey;
+  let key = (process.env.DEEPGRAM_API_KEY || '').trim();
+  if (!key) {
+    try {
+      key = execFileSync(
+        'security',
+        ['find-generic-password', '-s', 'deepgram', '-a', 'jarvis', '-w'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      ).trim();
+    } catch {
+      key = '';
+    }
+  }
+  cachedDeepgramKey = key || null;
+  return cachedDeepgramKey;
+}
+
+async function transcribeViaDeepgram(buf: Buffer, mimeType: string): Promise<string | null> {
+  const key = resolveDeepgramKey();
+  if (!key) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    // Deepgram accepts m4a/mp4, webm/opus, and ogg directly — no ffmpeg needed.
+    const resp = await fetch(
+      'https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&punctuate=true',
+      {
+        method: 'POST',
+        headers: { Authorization: `Token ${key}`, 'Content-Type': mimeType || 'audio/mp4' },
+        body: new Uint8Array(buf),
+        signal: controller.signal,
+      },
+    );
+    if (!resp.ok) {
+      console.warn(`[stt] deepgram HTTP ${resp.status} — falling back to whisper`);
+      return null;
+    }
+    const data = (await resp.json()) as {
+      results?: { channels?: Array<{ alternatives?: Array<{ transcript?: string }> }> };
+    };
+    const text = data?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+    return typeof text === 'string' && text.trim() ? text.trim() : null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+// === END JARVIS MOD #42 helpers ===
 
 export async function POST(req: Request) {
   const session = await auth();
@@ -27,6 +84,21 @@ export async function POST(req: Request) {
     if (!audio) return Response.json({ error: 'No audio' }, { status: 400 });
 
     const buf = Buffer.from(await audio.arrayBuffer());
+
+    // === JARVIS MOD #42: Deepgram Nova-3 first; on absent key / any failure,
+    // fall through to the local whisper.cpp path below (unchanged). ===
+    if (process.env.CTX_DEEPGRAM_DISABLE !== '1') {
+      try {
+        const dg = await transcribeViaDeepgram(buf, audio.type);
+        if (dg) {
+          console.log(`[stt] ${buf.length}b → "${dg}" (deepgram nova-3)`);
+          return Response.json({ transcript: dg });
+        }
+      } catch (err) {
+        console.warn('[stt] deepgram error — falling back to whisper:', err);
+      }
+    }
+
     // Use a session-unique temp dir so parallel requests don't clobber each other.
     tmpDir = join(tmpdir(), `stt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
     await mkdir(tmpDir, { recursive: true });
