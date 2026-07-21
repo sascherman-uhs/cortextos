@@ -358,6 +358,17 @@ check "stt route tries Deepgram before whisper (MOD #42)" \
 
 echo ""
 
+# ─── MOD #43: KB read paths must not create phantom empty collections ────────
+echo "── MOD #43: mmrag read paths no longer auto-create collections"
+check "cortextos mmrag.py has create= param (MOD #43)" \
+  "$CORTEXTOS_ROOT/knowledge-base/scripts/mmrag.py" \
+  "def get_chroma_collection(collection_name=\"default\", create=True)"
+check "skill mmrag.py has create= param (MOD #43)" \
+  "$HOME/.claude/skills/multimodal-rag/scripts/mmrag.py" \
+  "def get_chroma_collection(collection_name=\"default\", create=True)"
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then
