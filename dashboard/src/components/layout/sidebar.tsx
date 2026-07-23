@@ -25,6 +25,7 @@ import {
   // === END JARVIS MOD #19 ===
 } from '@tabler/icons-react';
 import { cn } from '@/lib/utils';
+import { AboutFooter } from '@/components/layout/about-footer';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 
@@ -208,6 +209,7 @@ export function Sidebar({
           <IconSettings size={16} className="shrink-0" />
           <span>Settings</span>
         </Link>
+        <AboutFooter />
       </div>
     </aside>
   );

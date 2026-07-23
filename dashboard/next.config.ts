@@ -1,4 +1,10 @@
 import type { NextConfig } from "next";
+import { execSync } from "node:child_process";
+
+function buildSha() {
+  try { return execSync("git rev-parse --short HEAD", { encoding: "utf8" }).trim(); }
+  catch { return process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) ?? "unknown"; }
+}
 
 // Next.js 15.2+ blocks non-localhost origins from /_next/* dev-internal
 // resources by default. When the dashboard is accessed over Tailscale, a LAN
@@ -22,6 +28,10 @@ const nextConfig: NextConfig = {
   // (~/cortextos/package-lock.json) instead of the dashboard, emitting a
   // "multiple lockfiles" warning on every dev start.
   turbopack: { root: __dirname },
+  env: {
+    NEXT_PUBLIC_BUILD_SHA: buildSha(),
+    NEXT_PUBLIC_BUILD_TIME: new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC",
+  },
   serverExternalPackages: ['better-sqlite3'],
   ...(allowedDevOrigins.length > 0 && { allowedDevOrigins }),
   async headers() {
