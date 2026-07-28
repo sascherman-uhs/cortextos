@@ -12,6 +12,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+// === JARVIS MOD #50 — OpenAI Realtime voice hook (feature-flagged) ===
+import { useRealtimeVoice } from './use-realtime-voice';
 import { useVoice, type VoiceState } from './use-voice';
 // === JARVIS MOD #21 — Cosmos TTS playback ===
 import { useTts } from './use-tts';
@@ -22,6 +24,10 @@ import { unlockSharedAudio } from './audio-unlock';
 // === JARVIS MOD #38 — single decision point for SSE/backfill reply surfacing ===
 import { shouldSurfaceReply } from './reply-dedupe';
 // === END JARVIS MOD #38 ===
+
+// === JARVIS MOD #50: feature flag — off by default; flip NEXT_PUBLIC_CTX_REALTIME_VOICE=1 to enable ===
+const USE_REALTIME = process.env.NEXT_PUBLIC_CTX_REALTIME_VOICE === '1';
+// === END MOD #50 ===
 
 interface VoicePanelProps {
   /** Lets the parent Scene mirror voice state → orb color, amplitude → breathing. */
@@ -49,7 +55,11 @@ export function VoicePanel({
   onAmplitudeChange,
   onTtsAmplitudeChange,
 }: VoicePanelProps) {
-  const voice = useVoice();
+  // === JARVIS MOD #50: both hooks called unconditionally (React rules of hooks) ===
+  const voiceLegacy = useVoice();
+  const voiceRealtime = useRealtimeVoice();
+  const voice = USE_REALTIME ? voiceRealtime : voiceLegacy;
+  // === END MOD #50 ===
   const {
     state,
     supported,
@@ -76,7 +86,7 @@ export function VoicePanel({
 
   // === JARVIS MOD #21: TTS — speak new agent replies through the three-tier route ===
   // === JARVIS MOD #24: also pull interrupt() for barge-in (mic press / new turn) ===
-  const { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError } = useTts();
+  const { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError, beginStreamReply } = useTts();
 
   // === JARVIS MOD #36: wire the TTS bridge into the open-mic engine —
   // wake-word barge-in needs interrupt()+isSpeaking(); wake-ack/sign-off lines
@@ -91,8 +101,12 @@ export function VoicePanel({
       interrupt,
       isSpeaking: () => speakingRef.current,
       speakLocal: (text: string) => void speak(text),
+      // === JARVIS MOD #45 (Phase 3): streaming reply surface ===
+      beginStreamReply,
+      markSpoken: (id: string) => spokenIdsRef.current.add(id),
+      // === END MOD #45 ===
     });
-  }, [bindTts, interrupt, speak]);
+  }, [bindTts, interrupt, speak, beginStreamReply]);
   // Effective state for the orb + label: TTS playback overrides the machine.
   const displayState: VoiceState = speaking ? 'speaking' : state;
   // === END MOD #36 ===
@@ -128,6 +142,10 @@ export function VoicePanel({
 
   const [synthValue, setSynthValue] = useState('');
   const esRef = useRef<EventSource | null>(null);
+  // === JARVIS MOD #47: file upload state ===
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle');
+  // === END MOD #47 ===
   // Baseline: outbound lines seen at connect time are pre-existing history,
   // not replies to this session. Once we've sent at least one turn, new
   // outbound lines are treated as replies.
@@ -332,6 +350,28 @@ export function VoicePanel({
     setSynthValue('');
   }, [synthValue, doSend]);
 
+  // === JARVIS MOD #47: file upload handler ===
+  const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    // Reset input so the same file can be re-selected if needed
+    e.target.value = '';
+    setUploadState('uploading');
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch('/api/uhs/upload', { method: 'POST', body: form, credentials: 'same-origin' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setUploadState('done');
+      // Flash "sent" briefly, then back to idle
+      setTimeout(() => setUploadState('idle'), 2500);
+    } catch {
+      setUploadState('error');
+      setTimeout(() => setUploadState('idle'), 3000);
+    }
+  }, []);
+  // === END MOD #47 ===
+
   const micActive = state === 'listening';
 
   return (
@@ -448,6 +488,52 @@ export function VoicePanel({
             Test voice
           </button>
           {/* === END JARVIS MOD #31 === */}
+
+          {/* === JARVIS MOD #47: file/photo upload — sends to JARVIS inbox + Telegram === */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,video/*,.pdf,.doc,.docx,.csv,.txt,.html"
+            className="hidden"
+            aria-hidden="true"
+            onChange={handleUpload}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            aria-label={uploadState === 'uploading' ? 'Uploading…' : uploadState === 'done' ? 'Sent to JARVIS' : 'Attach file or photo'}
+            title="Share a photo, video, or file with JARVIS"
+            disabled={uploadState === 'uploading'}
+            data-testid="cosmos-upload"
+            className={[
+              'flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-colors',
+              uploadState === 'done'
+                ? 'border-[#2DD4A8]/60 bg-[#2DD4A8]/10 text-[#2DD4A8]'
+                : uploadState === 'error'
+                  ? 'border-red-400/50 bg-red-400/10 text-red-400'
+                  : uploadState === 'uploading'
+                    ? 'animate-pulse border-[#CFB383]/50 bg-[#CFB383]/10 text-[#CFB383]'
+                    : 'border-white/20 bg-white/5 text-[#EDE8DF]/50 hover:bg-white/10 hover:text-[#EDE8DF]/80',
+            ].join(' ')}
+          >
+            {uploadState === 'uploading' ? (
+              // Spinner-ish — simple animated dot
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <circle cx="12" cy="12" r="9" strokeOpacity="0.3" />
+                <path d="M12 3a9 9 0 0 1 9 9" />
+              </svg>
+            ) : uploadState === 'done' ? (
+              // Checkmark
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            ) : (
+              // Paperclip
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+              </svg>
+            )}
+          </button>
+          {/* === END MOD #47 === */}
 
           {/* === JARVIS MOD #21: TTS mute toggle (persisted in localStorage) === */}
           <button
