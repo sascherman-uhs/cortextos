@@ -8,7 +8,9 @@ import type {
   UseVoiceResult,
 } from './use-voice';
 
-const REALTIME_MODEL = 'gpt-4o-realtime-preview-2024-12-17';
+// GA WebRTC calls endpoint (2026): no model query param — the model is
+// already baked into the ephemeral client secret minted server-side.
+const REALTIME_CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
 const OPEN_MIC_KEY = 'cosmos-realtime-open-mic';
 
 function mergeStats(patch: Record<string, unknown>): void {
@@ -179,7 +181,7 @@ export function useRealtimeVoice(): UseVoiceResult {
 
       // Step 6: Data channel message handler
       dc.onmessage = (e: MessageEvent<string>) => {
-        let msg: { type?: string; delta?: string; transcript?: string; item?: { content?: Array<{ transcript?: string }> } };
+        let msg: { type?: string; delta?: string; transcript?: string };
         try {
           msg = JSON.parse(e.data) as typeof msg;
         } catch {
@@ -187,13 +189,16 @@ export function useRealtimeVoice(): UseVoiceResult {
         }
 
         switch (msg.type) {
-          case 'response.audio_transcript.delta': {
+          // GA renamed these from response.audio_transcript.* (beta) to
+          // response.output_audio_transcript.* — see developers.openai.com
+          // /api/docs/guides/realtime-conversations.
+          case 'response.output_audio_transcript.delta': {
             if (typeof msg.delta === 'string') {
               setInterim((prev) => prev + msg.delta);
             }
             break;
           }
-          case 'response.audio_transcript.done': {
+          case 'response.output_audio_transcript.done': {
             const finalText = (msg as { transcript?: string }).transcript?.trim();
             if (finalText) {
               const id = `realtime-agent-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -213,10 +218,9 @@ export function useRealtimeVoice(): UseVoiceResult {
             break;
           }
           case 'conversation.item.input_audio_transcription.completed': {
-            const content = (msg as { item?: { content?: Array<{ transcript?: string }> } }).item?.content;
-            const userText = Array.isArray(content)
-              ? content.map((c) => c.transcript ?? '').join(' ').trim()
-              : '';
+            // GA shape is flat: { type, item_id, content_index, transcript } —
+            // not nested under item.content[] like the beta event.
+            const userText = (msg as { transcript?: string }).transcript?.trim() ?? '';
             if (userText) {
               const uid = `realtime-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
               setLog((prev) => {
@@ -261,7 +265,7 @@ export function useRealtimeVoice(): UseVoiceResult {
       await pc.setLocalDescription(offer);
 
       // Step 10: POST SDP to OpenAI
-      const sdpRes = await fetch(`https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
+      const sdpRes = await fetch(REALTIME_CALLS_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,

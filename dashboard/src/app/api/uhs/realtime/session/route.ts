@@ -9,8 +9,11 @@ import { JARVIS_SYSTEM_PROMPT } from '@/lib/realtime/jarvis-prompt';
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-const OPENAI_REALTIME_SESSIONS_URL =
-  'https://api.openai.com/v1/realtime/sessions';
+// GA endpoint (2026): the beta '/v1/realtime/sessions' endpoint 404s now —
+// ephemeral tokens are minted via '/v1/realtime/client_secrets' with a
+// nested `session` body and a flat `value` field in the response.
+const OPENAI_REALTIME_CLIENT_SECRETS_URL =
+  'https://api.openai.com/v1/realtime/client_secrets';
 
 export async function POST() {
   // --- Auth gate: same session check as /api/uhs/tts -------------------------
@@ -28,27 +31,34 @@ export async function POST() {
     );
   }
 
-  // --- Mint ephemeral session token via OpenAI Realtime sessions API ---------
+  // --- Mint ephemeral client secret via OpenAI Realtime GA API ---------------
   try {
-    const res = await fetch(OPENAI_REALTIME_SESSIONS_URL, {
+    const res = await fetch(OPENAI_REALTIME_CLIENT_SECRETS_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model:
-          process.env.OPENAI_REALTIME_MODEL ??
-          'gpt-4o-realtime-preview-2024-12-17',
-        voice: process.env.OPENAI_REALTIME_VOICE ?? 'shimmer',
-        instructions: JARVIS_SYSTEM_PROMPT,
-        turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          silence_duration_ms: 800,
-          prefix_padding_ms: 300,
+        session: {
+          type: 'realtime',
+          model: process.env.OPENAI_REALTIME_MODEL ?? 'gpt-realtime-2.1',
+          instructions: JARVIS_SYSTEM_PROMPT,
+          audio: {
+            input: {
+              turn_detection: {
+                type: 'server_vad',
+                threshold: 0.5,
+                silence_duration_ms: 800,
+                prefix_padding_ms: 300,
+              },
+              transcription: { model: 'whisper-1' },
+            },
+            output: {
+              voice: process.env.OPENAI_REALTIME_VOICE ?? 'shimmer',
+            },
+          },
         },
-        input_audio_transcription: { model: 'whisper-1' },
       }),
     });
 
@@ -64,15 +74,16 @@ export async function POST() {
     }
 
     const data = (await res.json()) as {
-      id: string;
-      client_secret: { value: string; expires_at: number };
+      value: string;
+      expires_at: number;
+      session: { id: string };
     };
 
     return Response.json(
       {
-        token: data.client_secret.value,
-        expires_at: data.client_secret.expires_at,
-        session_id: data.id,
+        token: data.value,
+        expires_at: data.expires_at,
+        session_id: data.session?.id,
       },
       {
         status: 200,

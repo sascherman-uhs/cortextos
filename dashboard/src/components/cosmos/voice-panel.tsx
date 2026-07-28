@@ -126,6 +126,12 @@ export function VoicePanel({
     onTtsAmplitudeChange?.(ttsAmplitude);
   }, [ttsAmplitude, onTtsAmplitudeChange]);
   useEffect(() => {
+    // === JARVIS MOD #50 fix: Realtime already speaks its own replies natively
+    // over the WebRTC audio track. Also firing the shared ElevenLabs/say engine
+    // on the same log entry (its finalized transcript) caused every Realtime
+    // reply to be spoken twice — OpenAI's voice, then ElevenLabs a beat later.
+    if (USE_REALTIME) return;
+    // === END MOD #50 fix ===
     // Speak only the most recent, not-yet-spoken agent line. Speaking is a no-op
     // while muted (and no /api/uhs/tts call fires) — enforced inside useTts.
     for (let i = log.length - 1; i >= 0; i--) {
