@@ -32,6 +32,28 @@ export function useRealtimeVoice(): UseVoiceResult {
   const ttsBridgeRef = useRef<TtsBridge | null>(null);
   const sessionStartingRef = useRef(false);
 
+  // === JARVIS MOD #51 fix — response.create race guard. OpenAI rejects a
+  // response.create sent while a prior response is still in flight
+  // ("conversation_already_has_active_response"). This happened when a tool
+  // call's continuation raced another response (e.g. a second tool call in
+  // the same turn, or a user turn arriving mid tool-call). requestResponse()
+  // is now the ONLY way response.create gets sent: it sends immediately if
+  // idle, otherwise defers one pending request until response.done clears
+  // the active flag. ===
+  const activeResponseRef = useRef(false);
+  const pendingResponseCreateRef = useRef(false);
+  const requestResponse = useCallback(() => {
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== 'open') return;
+    if (activeResponseRef.current) {
+      pendingResponseCreateRef.current = true;
+      return;
+    }
+    activeResponseRef.current = true;
+    dc.send(JSON.stringify({ type: 'response.create' }));
+  }, []);
+  // === END MOD #51 fix ===
+
   // WebRTC refs
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
@@ -134,6 +156,8 @@ export function useRealtimeVoice(): UseVoiceResult {
     stopAmplitude();
     setInterim('');
     setAmplitude(0);
+    activeResponseRef.current = false;
+    pendingResponseCreateRef.current = false;
   }, [stopAmplitude]);
 
   const startSession = useCallback(async () => {
@@ -208,6 +232,13 @@ export function useRealtimeVoice(): UseVoiceResult {
             setState('wakeListening');
             break;
           }
+          case 'response.created': {
+            // Server VAD auto-creates responses too (not just our own
+            // requestResponse() calls) — track every response, not just
+            // client-initiated ones, so the guard actually holds.
+            activeResponseRef.current = true;
+            break;
+          }
           case 'input_audio_buffer.speech_started': {
             setState('listening');
             setInterim('');
@@ -231,6 +262,11 @@ export function useRealtimeVoice(): UseVoiceResult {
             break;
           }
           case 'response.done': {
+            // response.create is only ever safe to send once this response
+            // is fully closed out — clear the active flag before anything
+            // else in this branch (including the tool-call path below).
+            activeResponseRef.current = false;
+
             // === JARVIS MOD #51 — tool bridge: the model called a function.
             // GA surfaces completed function calls on response.done as
             // output items of type "function_call" (call_id/name/arguments).
@@ -242,43 +278,57 @@ export function useRealtimeVoice(): UseVoiceResult {
             const calls = (output ?? []).filter((o) => o.type === 'function_call' && o.call_id && o.name);
             if (calls.length > 0) {
               setState('responding');
-              for (const call of calls) {
-                void (async () => {
-                  let result = 'The tool call could not be completed.';
-                  try {
-                    const res = await fetch('/api/uhs/realtime/tool', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ name: call.name, arguments: call.arguments ?? '{}' }),
-                    });
-                    if (res.ok) {
-                      const payload = (await res.json()) as { output?: string };
-                      if (payload.output) result = payload.output;
-                    } else {
-                      result = `The tool call failed with status ${res.status}.`;
+              // MOD #51 fix: run all calls concurrently, but send exactly ONE
+              // response.create after every function_call_output has landed —
+              // one per call raced a second response.create against the first.
+              void (async () => {
+                await Promise.all(
+                  calls.map(async (call) => {
+                    let result = 'The tool call could not be completed.';
+                    try {
+                      const res = await fetch('/api/uhs/realtime/tool', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: call.name, arguments: call.arguments ?? '{}' }),
+                      });
+                      if (res.ok) {
+                        const payload = (await res.json()) as { output?: string };
+                        if (payload.output) result = payload.output;
+                      } else {
+                        result = `The tool call failed with status ${res.status}.`;
+                      }
+                    } catch {
+                      // keep the default failure message
                     }
-                  } catch {
-                    // keep the default failure message
-                  }
-                  const channel = dcRef.current;
-                  if (channel?.readyState === 'open') {
-                    channel.send(
-                      JSON.stringify({
-                        type: 'conversation.item.create',
-                        item: {
-                          type: 'function_call_output',
-                          call_id: call.call_id,
-                          output: JSON.stringify({ result }),
-                        },
-                      }),
-                    );
-                    channel.send(JSON.stringify({ type: 'response.create' }));
-                  }
-                })();
-              }
+                    const channel = dcRef.current;
+                    if (channel?.readyState === 'open') {
+                      channel.send(
+                        JSON.stringify({
+                          type: 'conversation.item.create',
+                          item: {
+                            type: 'function_call_output',
+                            call_id: call.call_id,
+                            output: JSON.stringify({ result }),
+                          },
+                        }),
+                      );
+                    }
+                  }),
+                );
+                requestResponse();
+              })();
               break;
             }
             // === END JARVIS MOD #51 ===
+
+            // A response finished with no pending tool calls — if a turn
+            // arrived while we were busy (barge-in, or sendText during a
+            // tool round-trip), fire the deferred response.create now.
+            if (pendingResponseCreateRef.current) {
+              pendingResponseCreateRef.current = false;
+              requestResponse();
+              break;
+            }
             setState((s) => (s === 'processing' || s === 'responding' ? 'wakeListening' : s));
             break;
           }
@@ -368,7 +418,7 @@ export function useRealtimeVoice(): UseVoiceResult {
           },
         }),
       );
-      dc.send(JSON.stringify({ type: 'response.create' }));
+      requestResponse();
       setState('processing');
     } else {
       // Data channel not ready — fall back to HTTP send path
@@ -391,7 +441,7 @@ export function useRealtimeVoice(): UseVoiceResult {
         })
         .catch(() => setState('wakeListening'));
     }
-  }, [pushAgentReply]);
+  }, [pushAgentReply, requestResponse]);
 
   // startListening: for Realtime VAD is server-side; this opens a follow-up window
   const startListening = useCallback(() => {
