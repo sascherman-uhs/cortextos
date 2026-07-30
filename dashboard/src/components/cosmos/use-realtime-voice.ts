@@ -231,6 +231,54 @@ export function useRealtimeVoice(): UseVoiceResult {
             break;
           }
           case 'response.done': {
+            // === JARVIS MOD #51 — tool bridge: the model called a function.
+            // GA surfaces completed function calls on response.done as
+            // output items of type "function_call" (call_id/name/arguments).
+            // Execute server-side, return function_call_output, then
+            // response.create so the model speaks the result. ===
+            const output = (msg as unknown as {
+              response?: { output?: Array<{ type?: string; call_id?: string; name?: string; arguments?: string }> };
+            }).response?.output;
+            const calls = (output ?? []).filter((o) => o.type === 'function_call' && o.call_id && o.name);
+            if (calls.length > 0) {
+              setState('responding');
+              for (const call of calls) {
+                void (async () => {
+                  let result = 'The tool call could not be completed.';
+                  try {
+                    const res = await fetch('/api/uhs/realtime/tool', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ name: call.name, arguments: call.arguments ?? '{}' }),
+                    });
+                    if (res.ok) {
+                      const payload = (await res.json()) as { output?: string };
+                      if (payload.output) result = payload.output;
+                    } else {
+                      result = `The tool call failed with status ${res.status}.`;
+                    }
+                  } catch {
+                    // keep the default failure message
+                  }
+                  const channel = dcRef.current;
+                  if (channel?.readyState === 'open') {
+                    channel.send(
+                      JSON.stringify({
+                        type: 'conversation.item.create',
+                        item: {
+                          type: 'function_call_output',
+                          call_id: call.call_id,
+                          output: JSON.stringify({ result }),
+                        },
+                      }),
+                    );
+                    channel.send(JSON.stringify({ type: 'response.create' }));
+                  }
+                })();
+              }
+              break;
+            }
+            // === END JARVIS MOD #51 ===
             setState((s) => (s === 'processing' || s === 'responding' ? 'wakeListening' : s));
             break;
           }

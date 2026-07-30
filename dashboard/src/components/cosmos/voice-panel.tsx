@@ -483,7 +483,12 @@ export function VoicePanel({
           </button>
           {/* === END MOD #36 === */}
 
-          {/* === JARVIS MOD #31: one-tap audio pipeline check === */}
+          {/* === JARVIS MOD #31: one-tap audio pipeline check ===
+              === JARVIS MOD #51: legacy-mode only — in Realtime mode the
+              OpenAI session owns ALL speech on this surface (Scott's one-voice
+              rule, 2026-07-26); firing the ElevenLabs/say engine here would be
+              a second voice. === */}
+          {!USE_REALTIME && (
           <button
             onClick={handleVoiceTest}
             aria-label="Test JARVIS voice"
@@ -493,7 +498,8 @@ export function VoicePanel({
           >
             Test voice
           </button>
-          {/* === END JARVIS MOD #31 === */}
+          )}
+          {/* === END JARVIS MOD #31 / MOD #51 === */}
 
           {/* === JARVIS MOD #47: file/photo upload — sends to JARVIS inbox + Telegram === */}
           <input

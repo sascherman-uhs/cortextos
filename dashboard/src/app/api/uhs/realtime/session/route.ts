@@ -4,7 +4,7 @@
 // and returns { token, expires_at, session_id } to the caller.
 // If OPENAI_API_KEY is absent → 503. Auth failure → 401. OpenAI error → 500.
 import { auth } from '@/lib/auth';
-import { JARVIS_SYSTEM_PROMPT } from '@/lib/realtime/jarvis-prompt';
+import { JARVIS_SYSTEM_PROMPT, JARVIS_REALTIME_TOOLS } from '@/lib/realtime/jarvis-prompt';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -44,6 +44,11 @@ export async function POST() {
           type: 'realtime',
           model: process.env.OPENAI_REALTIME_MODEL ?? 'gpt-realtime-2.1',
           instructions: JARVIS_SYSTEM_PROMPT,
+          // === JARVIS MOD #51 — register tools so the voice model can reach
+          // the real JARVIS brain (calendar/CRM/MLS) instead of guessing. ===
+          tools: JARVIS_REALTIME_TOOLS,
+          tool_choice: 'auto',
+          // === END JARVIS MOD #51 ===
           audio: {
             input: {
               turn_detection: {
