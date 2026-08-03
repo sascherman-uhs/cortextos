@@ -354,6 +354,32 @@ export default function Scene() {
         {/* === END JARVIS MOD #22 === */}
       </Canvas>
 
+      {/* === JARVIS MOD #79 — vignette + floor grade (2026-08-03) ===
+          The single cheapest thing separating "cinematic" from "HUD": a frame
+          that falls off at the edges instead of holding one flat value corner
+          to corner. Pure CSS over the canvas — no draw call, no GPU cost, and
+          it cannot affect FPS or the perf toggle. Sits at z-[5]: above the
+          canvas, below every panel (z-10/z-20), so no readable chrome is dimmed.
+          Centred at 48% to match the orb, not the viewport. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 z-[5]"
+        style={{
+          background:
+            'radial-gradient(ellipse 78% 68% at 50% 48%, rgba(5,11,20,0) 40%, rgba(4,8,16,0.42) 78%, rgba(2,5,10,0.72) 100%)',
+        }}
+      />
+      {/* A faint cool floor so the orb sits IN something rather than floating
+          on a flat field — the same trick as a studio sweep. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 bottom-0 z-[5] h-1/3"
+        style={{
+          background: 'linear-gradient(to top, rgba(6,20,28,0.5), rgba(6,20,28,0))',
+        }}
+      />
+      {/* === END JARVIS MOD #79 === */}
+
       {/* JARVIS label under the orb.
           === JARVIS MOD #59: on a phone the orb is centred higher and the glass
           panel owns the lower third, so the wordmark tucks under the orb

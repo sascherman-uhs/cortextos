@@ -57,9 +57,11 @@ void main(){
   // Layer 3 — fine, fastest, low amplitude: the detail that sells the parallax.
   float c3 = band(dir, 6.1, 0.11, vec3(0.4, -0.9, 1.0));
 
-  col += uHigh * c1 * 0.085;
-  col += uAlt  * c2 * 0.055;
-  col += uHigh * c3 * 0.022;
+  // MOD #79: cloud weight raised — the layers existed but read thin against
+  // the gradient. Amplitude only; no new layer, no new draw call.
+  col += uHigh * c1 * 0.115;
+  col += uAlt  * c2 * 0.095;
+  col += uHigh * c3 * 0.055;
   // Clouds thin out toward the bottom of the sphere so the orb reads clean.
   gl_FragColor = vec4(mix(col, col * 0.86, smoothstep(0.45, 0.0, t)), 1.0);
 }

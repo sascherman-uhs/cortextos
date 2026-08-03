@@ -15,6 +15,8 @@ import { NodeWeb } from './node-web';
 import { TEAL, MINT } from './palette';
 // === JARVIS MOD #57: shared smoothing helpers (nothing snaps) ===
 import { approach, approachAsym } from './motion';
+// === JARVIS MOD #79: soft atmospheric bloom sprite (shells make edges) ===
+import { getSoftGlowTexture } from './dot-texture';
 // === JARVIS MOD #70: frozen scene clock for prefers-reduced-motion ===
 import { sceneTime, sceneDelta, sceneHalfLife } from './reduced-motion';
 // === END JARVIS MOD #57/#70 ===
@@ -71,10 +73,13 @@ export function Orb({
   // total brightness: a TIGHT bright core (small solid angle, so it costs
   // almost no total light), a medium halo at a clearly different radius, and a
   // wide bloom faint enough that it never tints the nebula. ===
-  const bloomMat = useMemo(() => createGlowMaterial(rim, { power: 1.4, strength: 0.04 }), []); // eslint-disable-line react-hooks/exhaustive-deps
-  const haloMat = useMemo(() => createGlowMaterial(rim, { power: 2.4, strength: 0.2 }), []); // eslint-disable-line react-hooks/exhaustive-deps
+  // MOD #79: the wide layer is a camera-facing sprite, NOT a fresnel shell —
+  // a shell is brightest at its silhouette and drew a visible disc edge.
+  const bloomTex = useMemo(() => getSoftGlowTexture(), []);
+  const bloomMatRef = useRef<THREE.SpriteMaterial>(null);
+  const haloMat = useMemo(() => createGlowMaterial(rim, { power: 2.4, strength: 0.19 }), []); // eslint-disable-line react-hooks/exhaustive-deps
   const coreMat = useMemo(
-    () => createGlowMaterial(color, { power: 5.0, strength: 0.62, core: 1, side: THREE.FrontSide }),
+    () => createGlowMaterial(color, { power: 6.5, strength: 0.7, core: 1, side: THREE.FrontSide }),
     [], // eslint-disable-line react-hooks/exhaustive-deps
   );
   // Layer tints (module-level constants would re-allocate per frame otherwise).
@@ -108,18 +113,23 @@ export function Orb({
     (orbMat.uniforms.uColor.value as THREE.Color).set(color);
     (orbMat.uniforms.uRimColor.value as THREE.Color).set(rim);
     // === JARVIS MOD #57: all three layers track live color + the eased envelope ===
+    // MOD #72/#79: the bloom sprite is tinted above; halo/core below.
     // MOD #72: bloom is tinted hard toward the nebula indigo and the core
     // toward white — three layers that differ in radius, falloff AND hue read
     // as three; three that differ only in radius blend into one gradient.
     // The heavy indigo lerp also keeps the widest layer COOL at every state:
     // a wide surface that follows the gold rim is exactly what produced the
     // wave-2 beige wash, so the warm accent stays on the core + halo only.
-    (bloomMat.uniforms.uColor.value as THREE.Color).set(rim).lerp(BLOOM_TINT, 0.72);
     (haloMat.uniforms.uColor.value as THREE.Color).set(rim);
-    (coreMat.uniforms.uColor.value as THREE.Color).set(color).lerp(CORE_TINT, 0.3);
-    bloomMat.uniforms.uStrength.value = 0.04 * vb;
-    haloMat.uniforms.uStrength.value = 0.22 * vb;
-    coreMat.uniforms.uStrength.value = 0.62 * vb;
+    // MOD #79: 0.3 → 0.16. At 0.3 the listening core blew out to white and the
+    // orb lost its gold identity — hot has to stay HUED, not clipped.
+    (coreMat.uniforms.uColor.value as THREE.Color).set(color).lerp(CORE_TINT, 0.16);
+    if (bloomMatRef.current) {
+      bloomMatRef.current.color.set(rim).lerp(BLOOM_TINT, 0.72);
+      bloomMatRef.current.opacity = 0.5 * vb;
+    }
+    haloMat.uniforms.uStrength.value = 0.19 * vb;
+    coreMat.uniforms.uStrength.value = 0.7 * vb;
     // === END JARVIS MOD #57 ===
 
     // Slow two-axis tumble.
@@ -169,11 +179,21 @@ export function Orb({
       </mesh>
       {showGlow && (
         <>
-          {/* Wide atmospheric bloom. detail 5, not 3 — at this radius a coarse
-              icosahedron showed its own facet silhouette through the gradient. */}
-          <mesh material={bloomMat}>
-            <icosahedronGeometry args={[3.6, 5]} />
-          </mesh>
+          {/* Wide atmospheric bloom — a camera-facing sprite with a long
+              gradient tail. Brightest AT the body, fading outward with no
+              silhouette, which is what atmosphere does and a shell cannot. */}
+          {bloomTex && (
+            <sprite scale={[9, 9, 1]}>
+              <spriteMaterial
+                ref={bloomMatRef}
+                map={bloomTex}
+                transparent
+                depthWrite={false}
+                blending={THREE.AdditiveBlending}
+                opacity={0.5}
+              />
+            </sprite>
+          )}
           {/* Bright inner core (front-side, center-bright). Tight radius +
               high falloff power = a small hot centre, not a filled ball. */}
           <mesh material={coreMat}>

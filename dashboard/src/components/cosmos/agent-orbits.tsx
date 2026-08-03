@@ -341,6 +341,8 @@ interface AgentNodeProps {
 
 // MOD #37: dispatch beam timing (seconds).
 const BEAM_DURATION = 2.4;
+// MOD #79: dock slots per column.
+const DOCK_ROWS = 4;
 
 function AgentNode({
   agent,
@@ -374,7 +376,8 @@ function AgentNode({
   const [hovered, setHovered] = useState(false);
   const [labelDim, setLabelDim] = useState(false);
   // MOD #58: true when this label is stepping aside for a neighbour's.
-  const [labelYield, setLabelYield] = useState(false);
+  // MOD #79: 0 = clear; N = this label steps aside past N neighbours.
+  const [labelYield, setLabelYield] = useState(0);
   const { camera, size } = useThree();
   const projected = useRef(new THREE.Vector3());
 
@@ -416,10 +419,13 @@ function AgentNode({
   const dockPos = useMemo(
     () =>
       new THREE.Vector3(
-        dockX,
-        // MOD #71: slots spread across the available band, then offset onto it.
-        yOffset + dockYSpan * (1 - ((dockSlot % 4) * 2) / 3),
-        1.4 + Math.floor(dockSlot / 4) * 0.35,
+        // MOD #79: a real 2D dock grid. Rows spread down the available band,
+        // COLUMNS step inward in x. The old layout put every column at the same
+        // x and separated them only in z, so eight simultaneous workers — which
+        // is a normal fleet moment, not an edge case — piled into one blob.
+        dockX - Math.floor(dockSlot / DOCK_ROWS) * 0.62,
+        yOffset + dockYSpan * (1 - ((dockSlot % DOCK_ROWS) * 2) / (DOCK_ROWS - 1)),
+        1.4,
       ),
     [dockSlot, dockX, yOffset, dockYSpan],
   );
@@ -549,7 +555,8 @@ function AgentNode({
             agentPos.clone().normalize(),
           );
           beamMatRef.current.color.copy(accentColor);
-          beamMatRef.current.opacity = 0.75 * Math.sin(Math.min(1, dt / BEAM_DURATION) * Math.PI);
+          // MOD #79: 0.75 → 0.34 — additive over the orb's glow saturated to white.
+          beamMatRef.current.opacity = 0.34 * Math.sin(Math.min(1, dt / BEAM_DURATION) * Math.PI);
         }
       } else {
         beamRef.current.visible = false;
@@ -570,7 +577,10 @@ function AgentNode({
     const reg = labels.current;
     if (reg) {
       reg.set(agent.name, { x: sx, y: sy, shown, order });
-      let collide = false;
+      // MOD #79: COUNT the lower-ordered labels this one overlaps, don't just
+      // flag the first. Every yielder used the same 22px offset, so six
+      // simultaneous workers produced six labels stacked in one place.
+      let collide = 0;
       if (shown) {
         for (const [name, other] of reg) {
           if (name === agent.name || !other.shown || other.order >= order) continue;
@@ -578,8 +588,7 @@ function AgentNode({
             Math.abs(other.x - sx) < LABEL_COLLIDE_X &&
             Math.abs(other.y - sy) < LABEL_COLLIDE_Y
           ) {
-            collide = true;
-            break;
+            collide += 1;
           }
         }
       }
@@ -602,7 +611,11 @@ function AgentNode({
       {/* MOD #37: dispatch beam (origin-space sibling — NOT inside the moving group) */}
       {!lowPerf && (
         <mesh ref={beamRef} visible={false}>
-          <cylinderGeometry args={[0.035, 0.035, 1, 8, 1, true]} />
+          {/* MOD #79: tapered + thinner. A constant-radius 0.035 tube at
+              0.75 additive opacity blew out to a hard white bar across the
+              frame — the least cinematic thing in the scene. A filament that
+              tapers toward the agent reads as energy, not as a UI stroke. */}
+          <cylinderGeometry args={[0.008, 0.028, 1, 8, 1, true]} />
           <meshBasicMaterial
             ref={beamMatRef}
             transparent
@@ -672,8 +685,8 @@ function AgentNode({
                 color: '#e7fbff',
                 border: `1px solid ${agent.working ? agent.accent : CYAN}55`,
                 // MOD #58: behind-the-orb fade (kept) × collision yield (new).
-                opacity: (labelDim ? 0.35 : 1) * (labelYield ? 0.28 : 1),
-                transform: labelYield ? 'translateY(22px)' : 'translateY(0)',
+                opacity: (labelDim ? 0.35 : 1) * (labelYield ? 0.3 : 1),
+                transform: `translateY(${labelYield * 20}px)`,
                 // MOD #55: the one shared easing curve.
                 transition: `opacity ${DUR_BASE}ms ${EASE}, transform ${DUR_BASE}ms ${EASE}`,
               }}
@@ -775,7 +788,7 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
   // MOD #71: and inside the same vertical band, so docking can't park an agent
   // on top of the wordmark either.
   const yOffset = fit.yCenter;
-  const dockYSpan = Math.min(1.4, fit.ryBand);
+  const dockYSpan = Math.min(1.9, fit.ryBand);
   // === END JARVIS MOD #58 ===
 
   return (

@@ -13,6 +13,8 @@ import * as THREE from 'three';
 import { NODE_COLORS } from './palette';
 // === JARVIS MOD #70: frozen scene clock ===
 import { sceneTime } from './reduced-motion';
+// === JARVIS MOD #78: shared soft-dot alpha map ===
+import { getSoftDotTexture } from './dot-texture';
 // === END JARVIS MOD #70 ===
 
 interface WebGeometry {
@@ -144,6 +146,7 @@ export function NodeWeb({
 }: NodeWebProps) {
   const groupRef = useRef<THREE.Group>(null);
   const nodeMatRef = useRef<THREE.PointsMaterial>(null);
+  const dot = useMemo(() => getSoftDotTexture(), []); // MOD #78
 
   const geo = useMemo(
     () => buildWeb(nodeCount, clusters, radiusMin, radiusMax, linkDist, seed),
@@ -183,6 +186,8 @@ export function NodeWeb({
           opacity={nodeOpacity}
           depthWrite={false}
           blending={THREE.AdditiveBlending}
+          // MOD #78: soft round nodes, not squares.
+          map={dot ?? undefined}
         />
       </points>
       {geo.linePositions.length > 0 && (

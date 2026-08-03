@@ -10,6 +10,8 @@ import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 // === JARVIS MOD #70: frozen scene clock ===
 import { sceneTime } from './reduced-motion';
+// === JARVIS MOD #78: shared soft-dot alpha map — points were square ===
+import { getSoftDotTexture } from './dot-texture';
 // === END JARVIS MOD #70 ===
 
 interface StarLayerProps {
@@ -46,6 +48,7 @@ function StarLayer({
 }: StarLayerProps) {
   const ref = useRef<THREE.Points>(null);
   const matRef = useRef<THREE.PointsMaterial>(null);
+  const dot = useMemo(() => getSoftDotTexture(), []); // MOD #78
 
   const positions = useMemo(() => {
     let s = seed * 1013 + 1;
@@ -89,6 +92,8 @@ function StarLayer({
         opacity={opacity}
         depthWrite={false}
         blending={THREE.AdditiveBlending}
+        // MOD #78: without this every star is a hard-edged square.
+        map={dot ?? undefined}
       />
     </points>
   );
