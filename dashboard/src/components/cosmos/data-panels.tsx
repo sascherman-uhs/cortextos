@@ -77,24 +77,21 @@ function useCosmosStats(intervalMs: number): CosmosStats | null {
 // They are runtime-only, per-session, and never hit the server — so this panel reads
 // them directly rather than through /api/uhs/cosmos-stats. Poll at 1s (cheap, local).
 interface VoiceMetrics {
-  p50Ms: number;
+  // MOD #75: p50/samples removed — the session p50 tile they fed is gone (the
+  // telemetry panel owns reply latency now). Only the fast-lane hit rate, which
+  // telemetry does not surface, is still read here.
   hitPct: number | null; // null until at least one [Cosmos] turn resolves
-  samples: number;
 }
 
 function useVoiceMetrics(intervalMs: number): VoiceMetrics {
-  const [m, setM] = useState<VoiceMetrics>({ p50Ms: 0, hitPct: null, samples: 0 });
+  const [m, setM] = useState<VoiceMetrics>({ hitPct: null });
   useEffect(() => {
     const read = () => {
       const s = typeof window !== 'undefined' ? window.__cosmosStats : undefined;
       const fast = s?.fastReplies ?? 0;
       const esc = s?.escalations ?? 0;
       const total = fast + esc;
-      setM({
-        p50Ms: s?.voiceLatency?.p50 ?? 0,
-        hitPct: total > 0 ? Math.round((fast / total) * 100) : null,
-        samples: s?.voiceLatency?.n ?? 0,
-      });
+      setM({ hitPct: total > 0 ? Math.round((fast / total) * 100) : null });
     };
     read();
     const t = setInterval(read, intervalMs);
@@ -213,14 +210,25 @@ export function DataPanels() {
       value: metricText(stats?.mlsNewToday, (v) => String(v)),
       hint: stats?.mlsNewToday && !stats.mlsNewToday.ok ? stats.mlsNewToday.unavailable : undefined,
     },
+    // === JARVIS MOD #75 (2026-08-03): was "Voice Reply" — a SESSION-local p50.
+    // The telemetry panel now shows a historical median a few tiles away, so the
+    // screen carried two latency numbers with different scopes and no way to
+    // tell which was which ("surfaced lists must agree"). Resolved by removing
+    // the duplicate rather than relabelling both: the telemetry median is the
+    // one latency number, it is always populated, and this session p50 read "—"
+    // until someone spoke.
+    // The tile survives carrying the fast-lane HIT RATE instead, which is the
+    // one signal it had that telemetry does not surface — and which is routing,
+    // not latency, so it cannot be confused with the median. Its scope is in
+    // the label, since a session-local number has to say so.
     {
-      testId: 'panel-voice-latency',
-      label: voice.hitPct === null ? 'Voice Reply' : `Voice · ${voice.hitPct}% fast`,
-      value: voice.samples > 0 ? `${(voice.p50Ms / 1000).toFixed(1)}s` : '—',
+      testId: 'panel-fast-lane',
+      label: 'Fast lane · session',
+      value: voice.hitPct === null ? '—' : `${voice.hitPct}%`,
       hint:
-        voice.samples > 0
-          ? `p50 of ${voice.samples} spoken turns (user-stopped → first audible). ${voice.hitPct ?? 0}% answered by the fast lane.`
-          : 'No spoken turns yet this session.',
+        voice.hitPct === null
+          ? 'No answered turns yet this session. Historical reply latency is in the telemetry panel.'
+          : `${voice.hitPct}% of this session's turns were answered by the fast lane; the rest escalated. Reply latency (all turns, historical) is in the telemetry panel.`,
     },
   ];
 
