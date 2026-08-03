@@ -143,7 +143,7 @@ describe('spokenList — reads as speech, not as an array', () => {
   });
 });
 
-// === JARVIS MOD #55/#56 — the prompt must actually route counts to the tool ===
+// === JARVIS MOD #65/#66 — the prompt must actually route counts to the tool ===
 // The prompt is a shared hot file that several agents rewrite; a rewrite from an
 // older base silently dropped active_stagings from the prose once already, which
 // would put the Realtime lane straight back to free-answering counts.
