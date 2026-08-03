@@ -1,0 +1,20 @@
+# JARVIS — Utopia Home Staging operations dashboard
+
+> The CortexOS dashboard for Utopia Home Staging (Las Vegas, NV): the voice
+> interface, the operational tiles, and the HTTP surface the JARVIS agent fleet
+> calls. This file is generated — do not hand-edit.
+
+## What to read
+
+- [Self-knowledge](/jarvis-self-knowledge.md): the generated, always-current
+  description of what JARVIS is and can do — voice tools and their arguments,
+  fast lanes, fast-path behaviour, the agent fleet, every `/api/uhs` route, and
+  the speech-in/speech-out stacks. Regenerated from source; a drift checker
+  fails when it disagrees with the code.
+
+## Notes
+
+- Every fact in the self-knowledge doc is extracted from a named source file.
+  Sections that could not be extracted say **unknown** rather than guessing.
+- This is an internal operations tool, not a public product. Routes under
+  `/api/uhs` are session-authenticated.
