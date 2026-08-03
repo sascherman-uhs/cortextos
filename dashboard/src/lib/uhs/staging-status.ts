@@ -1,4 +1,4 @@
-// === JARVIS MOD #55 — ONE definition of "active staging" / "open contract" ===
+// === JARVIS MOD #65 — ONE definition of "active staging" / "open contract" ===
 // New file, and the single source of truth for both. It exists because three
 // surfaces answered the same question three different ways on 2026-08-03:
 //
@@ -133,4 +133,4 @@ export async function fetchStagingCounts(): Promise<StagingCounts | null> {
     return null;
   }
 }
-// === END JARVIS MOD #55 ===
+// === END JARVIS MOD #65 ===

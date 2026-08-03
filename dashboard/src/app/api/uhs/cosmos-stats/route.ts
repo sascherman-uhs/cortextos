@@ -13,7 +13,7 @@
 //   - telegramToday                 → count today's lines in jarvis-telegram
 //                                     inbound/outbound-messages.jsonl
 import { auth } from '@/lib/auth';
-// === JARVIS MOD #55 — shared staging definitions (see the file header for why) ===
+// === JARVIS MOD #65 — shared staging definitions (see the file header for why) ===
 import { fetchStagingCounts } from '@/lib/uhs/staging-status';
 import { IPCClient } from '@/lib/ipc-client';
 import { getLogDir } from '@/lib/config';
@@ -100,7 +100,7 @@ async function jarvisMetrics(): Promise<{
     'tasks?status=eq.pending&select=id',
   );
 
-  // === JARVIS MOD #55 — the tile now uses the SHARED definition ===
+  // === JARVIS MOD #65 — the tile now uses the SHARED definition ===
   // Was `status=eq.STAGED`, which undercounted: it missed projects already
   // installed but still sitting at CONTRACTED, missed every NOTICE_GIVEN home
   // whose furniture is still in place, and counted signed work not yet
@@ -112,7 +112,7 @@ async function jarvisMetrics(): Promise<{
   const activeStagings: Metric<number> = counts
     ? { ok: true, value: counts.activeStagings }
     : unavailable('estimate supabase unavailable');
-  // === END MOD #55 ===
+  // === END MOD #65 ===
 
   return { pendingTasks, activeStagings };
 }

@@ -111,7 +111,7 @@ export function assembleStableIdentity(agent: string, org: string): string {
     'anything, running anything, or business records — reply with EXACTLY the single ' +
     'token <<ESCALATE>> and nothing else. The full agent will pick it up. ' +
     'Never guess at data you cannot see; escalate instead.\n\n' +
-    // === JARVIS MOD #56 — the specific rule, because the general one failed ===
+    // === JARVIS MOD #66 — the specific rule, because the general one failed ===
     // "Don't guess" did not stop this lane inventing "five staged, two active"
     // against a real 21: a count question reads as conversation, not as a
     // lookup. So the rule is now about numbers specifically, and it is
@@ -150,7 +150,7 @@ export function assembleVolatileBlock(now: Date = new Date(), snapshot = ''): st
   );
   const mode = hourPt >= 20 || hourPt < 4 ? 'overnight' : hourPt < 6 ? 'morning-prep' : 'daytime';
   return (
-    // === JARVIS MOD #56: live counts lead the uncached block. Volatile by
+    // === JARVIS MOD #66: live counts lead the uncached block. Volatile by
     // definition, so they must never migrate into the cached identity block. ===
     (snapshot ? `${snapshot}\n\n` : '') +
     `Current time: ${pt} (Pacific). Operating mode: ${mode}.\n` +
@@ -181,7 +181,7 @@ export function assembleSystem(
   agent: string,
   org: string,
   now?: Date,
-  // MOD #56: rendered live counts. Optional so every existing caller and test
+  // MOD #66: rendered live counts. Optional so every existing caller and test
   // keeps working; empty means the model has no numbers and must escalate.
   snapshot = '',
 ): SystemBlock[] {

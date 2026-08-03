@@ -1,4 +1,4 @@
-// === JARVIS MOD #56 — unit lock for the authoritative-counts snapshot ===
+// === JARVIS MOD #66 — unit lock for the authoritative-counts snapshot ===
 import { describe, expect, it } from 'vitest';
 import { renderSnapshot } from '../live-snapshot';
 import { assembleVolatileBlock } from '../identity-assembler';

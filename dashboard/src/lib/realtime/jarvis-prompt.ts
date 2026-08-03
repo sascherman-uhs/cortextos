@@ -184,7 +184,7 @@ export const JARVIS_REALTIME_TOOLS = [
       required: ['query'],
     },
   },
-  // === JARVIS MOD #55 — the count question gets a tool, so it stops being
+  // === JARVIS MOD #65 — the count question gets a tool, so it stops being
   // free-answered. Same predicate as the Active Stagings tile. ===
   {
     type: 'function' as const,
@@ -198,7 +198,7 @@ export const JARVIS_REALTIME_TOOLS = [
       'correct source, and it matches the number on the dashboard tile.',
     parameters: { type: 'object', properties: {}, required: [] },
   },
-  // === END MOD #55 ===
+  // === END MOD #65 ===
   {
     type: 'function' as const,
     name: 'agent_status',

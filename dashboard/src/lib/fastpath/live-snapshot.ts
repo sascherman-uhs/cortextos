@@ -1,4 +1,4 @@
-// === JARVIS MOD #56 — authoritative live counts for the fast path ===
+// === JARVIS MOD #66 — authoritative live counts for the fast path ===
 // New file. The fast path is a no-tools conversational lane, and its system
 // prompt already said "Never guess at data you cannot see; escalate instead."
 // It free-answered anyway: asked how many active stagings there were, it
@@ -87,4 +87,4 @@ export async function getLiveCounts(): Promise<StagingCounts | null> {
 export async function getSnapshotBlock(): Promise<string> {
   return renderSnapshot(await getLiveCounts());
 }
-// === END JARVIS MOD #56 ===
+// === END JARVIS MOD #66 ===

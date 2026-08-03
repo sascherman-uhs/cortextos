@@ -297,7 +297,7 @@ export async function calendarToday(): Promise<LaneResult> {
 
 // --- active_stagings --------------------------------------------------------
 // The count question, answered from the SAME predicate the Active Stagings tile
-// uses. Before MOD #55 this question had no tool at all, so the fast path
+// uses. Before MOD #65 this question had no tool at all, so the fast path
 // free-answered it and invented "five staged, two active" while the tile said
 // 16 — the defect that motivated this lane.
 
@@ -342,7 +342,7 @@ export interface ContractRow {
   project_contacts?: ContractContact[] | null;
 }
 
-/** === JARVIS MOD #55 — status set now comes from the SHARED definition ===
+/** === JARVIS MOD #65 — status set now comes from the SHARED definition ===
  *  This lane used to carry its own four-status list, which omitted
  *  NOTICE_GIVEN and so hid the four homes whose dates people ask about most,
  *  while the Active Stagings tile used a different list again. Both surfaces

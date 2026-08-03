@@ -20,7 +20,7 @@ import { getAgentDir, getLogDir, getFrameworkRoot } from '@/lib/config';
 import { assembleSystem } from './identity-assembler';
 import { buildWindow, type Turn } from './conversation-window';
 import { extractSentences } from './stream-sentences';
-// === JARVIS MOD #56 — authoritative live counts injected per turn ===
+// === JARVIS MOD #66 — authoritative live counts injected per turn ===
 import { getSnapshotBlock } from './live-snapshot';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
@@ -138,7 +138,7 @@ export async function tryFastReply(
 
   const started = Date.now();
   try {
-    // MOD #56: fetch before building the prompt. 60s-cached, so this is a
+    // MOD #66: fetch before building the prompt. 60s-cached, so this is a
     // no-op on nearly every turn; a failure yields '' and the NUMBERS RULE
     // routes count questions to the full agent instead of to a guess.
     const snapshot = await getSnapshotBlock();
@@ -234,7 +234,7 @@ export async function tryFastReplyStream(
 
   const started = Date.now();
   try {
-    // MOD #56: fetch before building the prompt. 60s-cached, so this is a
+    // MOD #66: fetch before building the prompt. 60s-cached, so this is a
     // no-op on nearly every turn; a failure yields '' and the NUMBERS RULE
     // routes count questions to the full agent instead of to a guess.
     const snapshot = await getSnapshotBlock();
