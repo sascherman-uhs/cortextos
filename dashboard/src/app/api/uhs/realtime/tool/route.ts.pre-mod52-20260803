@@ -17,10 +17,6 @@ import path from 'path';
 import { SignJWT } from 'jose';
 import { auth } from '@/lib/auth';
 import { getCTXRoot } from '@/lib/config';
-// === JARVIS MOD #52 — direct fast-lane tools (the latency optimization this
-// file's header anticipated). Read-only, sub-second, and every one of them
-// degrades honestly rather than guessing. See src/lib/realtime/fast-lanes.ts. ===
-import { agentStatus, calendarToday, contractStat } from '@/lib/realtime/fast-lanes';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -148,23 +144,6 @@ export async function POST(req: NextRequest) {
 
   try {
     switch (name) {
-      // === JARVIS MOD #52 — fast lanes. Each is a direct read that answers in
-      // the hundreds-of-milliseconds range instead of the 45s-worst-case
-      // ask_jarvis round trip. Read-only: nothing here writes or sends. ===
-      case 'calendar_today': {
-        const { output } = await calendarToday();
-        return Response.json({ output });
-      }
-      case 'contract_stat': {
-        const q = typeof args.query === 'string' ? args.query.trim() : '';
-        const { output } = await contractStat(q);
-        return Response.json({ output });
-      }
-      case 'agent_status': {
-        const { output } = await agentStatus();
-        return Response.json({ output });
-      }
-      // === END JARVIS MOD #52 ===
       case 'ask_jarvis': {
         const question = typeof args.question === 'string' ? args.question.trim() : '';
         if (!question) {

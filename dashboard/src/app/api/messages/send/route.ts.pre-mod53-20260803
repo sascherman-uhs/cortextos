@@ -4,8 +4,6 @@ import path from 'path';
 import { getCTXRoot, getAllAgents } from '@/lib/config';
 import { tryFastReply, tryFastReplyStream } from '@/lib/fastpath/fast-reply';
 import { buildWindow } from '@/lib/fastpath/conversation-window';
-// === JARVIS MOD #53 — shared deterministic goodbye detector ===
-import { isSignoff, signoffLine } from '@/lib/voice/signoff';
 
 export const dynamic = 'force-dynamic';
 
@@ -176,32 +174,6 @@ export async function POST(request: NextRequest) {
     } catch { /* logging failure must not block the message */ }
 
     const userText = text.slice(COSMOS_PREFIX.length).trim();
-
-    // === JARVIS MOD #53 — server-side goodbye gate (defense in depth) ========
-    // The open-mic client already runs this detector before sending (MOD #36),
-    // so in the normal path this never fires. It exists for the turns that skip
-    // that check entirely — typed input, the test seams, and any future client —
-    // where a "thanks" would otherwise buy a full Haiku call for nothing.
-    // `hadAgentTurn` is derived from the conversation window rather than trusted
-    // from the client, so the very first thing said is still never swallowed.
-    let hadAgentTurn = false;
-    try {
-      hadAgentTurn = buildWindow(agent, 6).some((t) => t.role === 'assistant');
-    } catch { /* window read is best-effort; false keeps us on the reply path */ }
-    if (isSignoff(userText, hadAgentTurn)) {
-      const line = signoffLine(Date.now());
-      let replyId: string | undefined;
-      try {
-        replyId = appendOutbound(ctxRoot, agent, line);
-      } catch (err) {
-        console.error('[api/messages/send] signoff outbound append failed:', err);
-      }
-      return Response.json(
-        { success: true, messageId, fastpath: true, signoff: true, latencyMs: 0, replyText: line, replyId },
-        { status: 200 },
-      );
-    }
-    // === END MOD #53 =========================================================
 
     // === JARVIS MOD #45 (Phase 3): sentence-streaming fast path ==============
     // Gated by CTX_COSMOS_STREAM=1 (server env, no code deploy to toggle) AND

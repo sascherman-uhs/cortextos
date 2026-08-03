@@ -43,9 +43,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 // === JARVIS MOD #25 — reuse the ONE shared, gesture-unlocked AudioContext so TTS
 // is audible on iOS (see audio-unlock.ts for the full rationale). ===
 import { getSharedAudioContext, resumeSharedAudio } from './audio-unlock';
-// === JARVIS MOD #54 — persist the number MOD #38 already measured. The
-// p50/p95 ring buffer below dies with the page; the JSONL line survives it. ===
-import { reportTurnLatency } from '@/lib/voice/latency';
 // === END JARVIS MOD #25 ===
 
 const MUTE_KEY = 'cosmos-tts-muted';
@@ -424,11 +421,6 @@ export function useTts(): UseTtsResult {
       // === JARVIS MOD #38 (B5): feed the session percentile buffer ===
       recordLatencySample(ms);
       // === END MOD #38 ===
-      // === JARVIS MOD #54: same sample, durable — one JSONL line per turn in
-      // the fast path's own metrics file so latency is answerable across
-      // sessions, not just for the tab that happens to be open. ===
-      reportTurnLatency({ path: 'fastpath', firstAudioMs: ms });
-      // === END MOD #54 ===
     }
   }, []);
 
