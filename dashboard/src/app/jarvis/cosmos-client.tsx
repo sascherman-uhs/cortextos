@@ -5,6 +5,12 @@ import Link from 'next/link';
 // === JARVIS MOD #25 — PWA boot (SW registration + iOS audio unlock) ===
 import { PwaBoot } from '@/components/cosmos/pwa-boot';
 // === END JARVIS MOD #25 ===
+// === JARVIS MOD #84 — mount the latency + cost telemetry panel (2026-08-03) ===
+// Mounted here rather than in scene.tsx (where DataPanels lives) to keep this
+// wave's edits off a file another agent is actively changing. The panel is a
+// plain DOM overlay — it does not need to be inside the R3F tree.
+import { TelemetryPanel } from '@/components/cosmos/telemetry-panel';
+// === END JARVIS MOD #84 ===
 
 // R3F Canvas must run client-only; ssr:false is allowed here (client component).
 const Scene = dynamic(() => import('@/components/cosmos/scene'), {
@@ -39,6 +45,9 @@ export function CosmosClient() {
       </Link>
       {/* === END JARVIS MOD #40 === */}
       <Scene />
+      {/* === JARVIS MOD #84 === */}
+      <TelemetryPanel />
+      {/* === END JARVIS MOD #84 === */}
     </>
   );
 }
