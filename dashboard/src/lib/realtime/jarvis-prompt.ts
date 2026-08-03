@@ -235,6 +235,12 @@ export const JARVIS_REALTIME_TOOLS = [
 ];
 // === END JARVIS MOD #51 ===
 
-export const JARVIS_REALTIME_VOICE = 'shimmer';
-
-export const JARVIS_REALTIME_MODEL = 'gpt-4o-realtime-preview-2024-12-17';
+// === JARVIS MOD #93 — removed JARVIS_REALTIME_MODEL / JARVIS_REALTIME_VOICE ===
+// Both were exported here, imported by nothing, and the model value
+// ('gpt-4o-realtime-preview-2024-12-17') had gone stale against what the session
+// actually requests. The model and voice are chosen in ONE place — the endpoint
+// that mints the session, api/uhs/realtime/session/route.ts, from
+// OPENAI_REALTIME_MODEL / OPENAI_REALTIME_VOICE. Do not re-add a second copy
+// here: an unused constant cannot be caught by a test, so it drifts silently and
+// then misinforms whoever reads it next.
+// === END JARVIS MOD #93 ===
