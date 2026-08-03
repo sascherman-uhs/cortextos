@@ -20,7 +20,7 @@ import { getCTXRoot } from '@/lib/config';
 // === JARVIS MOD #52 — direct fast-lane tools (the latency optimization this
 // file's header anticipated). Read-only, sub-second, and every one of them
 // degrades honestly rather than guessing. See src/lib/realtime/fast-lanes.ts. ===
-import { agentStatus, calendarToday, contractStat } from '@/lib/realtime/fast-lanes';
+import { activeStagings, agentStatus, calendarToday, contractStat } from '@/lib/realtime/fast-lanes';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -158,6 +158,10 @@ export async function POST(req: NextRequest) {
       case 'contract_stat': {
         const q = typeof args.query === 'string' ? args.query.trim() : '';
         const { output } = await contractStat(q);
+        return Response.json({ output });
+      }
+      case 'active_stagings': {
+        const { output } = await activeStagings();
         return Response.json({ output });
       }
       case 'agent_status': {

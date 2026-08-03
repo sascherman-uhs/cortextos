@@ -22,6 +22,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getAllHeartbeats, getHealthStatus } from '@/lib/data/heartbeats';
+import { OPEN_CONTRACT_STATUSES, fetchStagingCounts } from '@/lib/uhs/staging-status';
 
 /** Every fast lane returns this: the spoken text plus whether it had real data. */
 export interface LaneResult {
@@ -294,6 +295,29 @@ export async function calendarToday(): Promise<LaneResult> {
   };
 }
 
+// --- active_stagings --------------------------------------------------------
+// The count question, answered from the SAME predicate the Active Stagings tile
+// uses. Before MOD #55 this question had no tool at all, so the fast path
+// free-answered it and invented "five staged, two active" while the tile said
+// 16 — the defect that motivated this lane.
+
+export async function activeStagings(): Promise<LaneResult> {
+  const counts = await fetchStagingCounts();
+  if (!counts) {
+    return unavailable('The staging count', 'the uhsEstimate database could not be reached');
+  }
+  let out = `${counts.activeStagings} active stagings — furniture in the home right now.`;
+  // Say the gap rather than let two surfaces disagree by two and look broken.
+  if (counts.awaitingInstall > 0) {
+    out +=
+      ` ${counts.openContracts} open contracts total, including ` +
+      `${counts.awaitingInstall} signed but not yet installed.`;
+  } else {
+    out += ` ${counts.openContracts} open contracts total.`;
+  }
+  return { ok: true, output: out };
+}
+
 // --- contract_stat ----------------------------------------------------------
 // Open staging contracts by fuzzy agent name or property address, answering the
 // three dates the /contract-stat skill answers: staging date, paid-through
@@ -318,9 +342,12 @@ export interface ContractRow {
   project_contacts?: ContractContact[] | null;
 }
 
-/** An "open" contract is one where service is live or about to be — the exact
- *  status set the /contract-stat skill uses. Anything else is history. */
-export const OPEN_STATUSES = ['STAGED', 'PENDING_SALE', 'CONTRACTED', 'PENDING_COLLECTION'];
+/** === JARVIS MOD #55 — status set now comes from the SHARED definition ===
+ *  This lane used to carry its own four-status list, which omitted
+ *  NOTICE_GIVEN and so hid the four homes whose dates people ask about most,
+ *  while the Active Stagings tile used a different list again. Both surfaces
+ *  now import from @/lib/uhs/staging-status so they cannot drift. */
+export const OPEN_STATUSES = OPEN_CONTRACT_STATUSES;
 
 /** §7.2 of the staging contract: notice is a minimum of 10 paid calendar days
  *  before the paid-through date. Derived, never stored — the skill computes it

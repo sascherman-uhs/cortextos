@@ -20,8 +20,6 @@ import { getAgentDir, getLogDir, getFrameworkRoot } from '@/lib/config';
 import { assembleSystem } from './identity-assembler';
 import { buildWindow, type Turn } from './conversation-window';
 import { extractSentences } from './stream-sentences';
-// === JARVIS MOD #56 — authoritative live counts injected per turn ===
-import { getSnapshotBlock } from './live-snapshot';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const DEFAULT_MODEL = process.env.FASTPATH_MODEL || 'claude-haiku-4-5-20251001';
@@ -108,8 +106,8 @@ function logMetrics(agent: string, entry: Record<string, unknown>): void {
 // --- main entry (B4) ---------------------------------------------------------
 
 // === JARVIS MOD #45 (Phase 3): shared request prep for both entrypoints ===
-function prepareMessages(agent: string, org: string, userText: string, started: number, snapshot = '') {
-  const system = assembleSystem(agent, org, undefined, snapshot);
+function prepareMessages(agent: string, org: string, userText: string, started: number) {
+  const system = assembleSystem(agent, org);
   let window = buildWindow(agent);
   // Ensure the current turn is the last user message even if the log append
   // hasn't landed yet (defensive — caller appends before calling us).
@@ -138,11 +136,7 @@ export async function tryFastReply(
 
   const started = Date.now();
   try {
-    // MOD #56: fetch before building the prompt. 60s-cached, so this is a
-    // no-op on nearly every turn; a failure yields '' and the NUMBERS RULE
-    // routes count questions to the full agent instead of to a guess.
-    const snapshot = await getSnapshotBlock();
-    const { system, messages } = prepareMessages(agent, org, userText, started, snapshot);
+    const { system, messages } = prepareMessages(agent, org, userText, started);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -234,11 +228,7 @@ export async function tryFastReplyStream(
 
   const started = Date.now();
   try {
-    // MOD #56: fetch before building the prompt. 60s-cached, so this is a
-    // no-op on nearly every turn; a failure yields '' and the NUMBERS RULE
-    // routes count questions to the full agent instead of to a guess.
-    const snapshot = await getSnapshotBlock();
-    const { system, messages } = prepareMessages(agent, org, userText, started, snapshot);
+    const { system, messages } = prepareMessages(agent, org, userText, started);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);

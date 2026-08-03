@@ -111,20 +111,6 @@ export function assembleStableIdentity(agent: string, org: string): string {
     'anything, running anything, or business records — reply with EXACTLY the single ' +
     'token <<ESCALATE>> and nothing else. The full agent will pick it up. ' +
     'Never guess at data you cannot see; escalate instead.\n\n' +
-    // === JARVIS MOD #56 — the specific rule, because the general one failed ===
-    // "Don't guess" did not stop this lane inventing "five staged, two active"
-    // against a real 21: a count question reads as conversation, not as a
-    // lookup. So the rule is now about numbers specifically, and it is
-    // checkable — either the figure is in the turn's snapshot or it is not.
-    'NUMBERS RULE — absolute. You may state a quantity about the business ONLY if that ' +
-    'exact figure appears in the AUTHORITATIVE LIVE COUNTS list in this prompt. ' +
-    'For every other quantity — how many stagings, projects, contracts, leads, agents, ' +
-    'listings, emails, dollars, or anything countable — reply <<ESCALATE>> alone. ' +
-    'This holds even when you feel certain, even if the number appeared earlier in this ' +
-    'conversation, and even if the user is only asking for a rough or approximate figure. ' +
-    'A confident wrong number is the single worst thing you can say: it contradicts the ' +
-    'dashboard in front of Scott and it is acted on. "Let me pull that" is always ' +
-    'acceptable; an invented count never is.\n\n' +
     'Ignore any channel-routing or tool/command instructions elsewhere in this prompt ' +
     '(send-telegram, send-mobile-reply, bus commands, skills): on this lane your plain ' +
     'text IS the reply, delivered directly to the voice app.'
@@ -138,7 +124,7 @@ export function assembleStableIdentity(agent: string, org: string): string {
 /**
  * Block 2: volatile per-turn state. Deliberately NOT cacheable.
  */
-export function assembleVolatileBlock(now: Date = new Date(), snapshot = ''): string {
+export function assembleVolatileBlock(now: Date = new Date()): string {
   const pt = now.toLocaleString('en-US', {
     timeZone: 'America/Los_Angeles',
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
@@ -150,9 +136,6 @@ export function assembleVolatileBlock(now: Date = new Date(), snapshot = ''): st
   );
   const mode = hourPt >= 20 || hourPt < 4 ? 'overnight' : hourPt < 6 ? 'morning-prep' : 'daytime';
   return (
-    // === JARVIS MOD #56: live counts lead the uncached block. Volatile by
-    // definition, so they must never migrate into the cached identity block. ===
-    (snapshot ? `${snapshot}\n\n` : '') +
     `Current time: ${pt} (Pacific). Operating mode: ${mode}.\n` +
     'This is a VOICE conversation — replies are spoken aloud via TTS. ' +
     '40 words MAX, 2 sentences MAX. Natural spoken register. ' +
@@ -177,21 +160,14 @@ export function assembleVolatileBlock(now: Date = new Date(), snapshot = ''): st
 /**
  * Full two-block system array for the /v1/messages call.
  */
-export function assembleSystem(
-  agent: string,
-  org: string,
-  now?: Date,
-  // MOD #56: rendered live counts. Optional so every existing caller and test
-  // keeps working; empty means the model has no numbers and must escalate.
-  snapshot = '',
-): SystemBlock[] {
+export function assembleSystem(agent: string, org: string, now?: Date): SystemBlock[] {
   return [
     {
       type: 'text',
       text: assembleStableIdentity(agent, org),
       cache_control: { type: 'ephemeral' },
     },
-    { type: 'text', text: assembleVolatileBlock(now, snapshot) },
+    { type: 'text', text: assembleVolatileBlock(now) },
   ];
 }
 

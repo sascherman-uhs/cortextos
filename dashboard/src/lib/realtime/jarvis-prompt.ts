@@ -181,6 +181,21 @@ export const JARVIS_REALTIME_TOOLS = [
       required: ['query'],
     },
   },
+  // === JARVIS MOD #55 — the count question gets a tool, so it stops being
+  // free-answered. Same predicate as the Active Stagings tile. ===
+  {
+    type: 'function' as const,
+    name: 'active_stagings',
+    description:
+      'How many stagings are active right now (furniture physically in a home), ' +
+      'and how many open contracts there are in total. Use for ANY count of ' +
+      'current stagings, projects, or contracts — "how many stagings do we have", ' +
+      '"how many are active", "how many open contracts". Takes no arguments. ' +
+      'Never answer a count of stagings from memory; this tool is the only ' +
+      'correct source, and it matches the number on the dashboard tile.',
+    parameters: { type: 'object', properties: {}, required: [] },
+  },
+  // === END MOD #55 ===
   {
     type: 'function' as const,
     name: 'agent_status',
