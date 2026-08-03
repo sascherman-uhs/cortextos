@@ -21,21 +21,13 @@ import { assembleSystem } from './identity-assembler';
 import { buildWindow, type Turn } from './conversation-window';
 import { extractSentences } from './stream-sentences';
 // === JARVIS MOD #66 — authoritative live counts injected per turn ===
-import { getSnapshotBlock, getLiveCounts } from './live-snapshot';
-// === JARVIS MOD #68 — observe (never gate) unsourced figures in replies ===
-import { auditFigures, numbersIn, summarizeUnsourced } from './figure-audit';
+import { getSnapshotBlock } from './live-snapshot';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const DEFAULT_MODEL = process.env.FASTPATH_MODEL || 'claude-haiku-4-5-20251001';
 const TIMEOUT_MS = parseInt(process.env.FASTPATH_TIMEOUT_MS || '6000', 10);
 const MAX_TOKENS = 500;
 const ESCALATE_TOKEN = '<<ESCALATE>>';
-
-// === JARVIS MOD #69 — ONE escalation predicate, used for BOTH routing and
-// logging. Previously the two drifted apart (see the metrics fix below). ===
-function isEscalation(text: string): boolean {
-  return !text || text.includes(ESCALATE_TOKEN);
-}
 
 export type FastReplyResult =
   | { kind: 'reply'; text: string; latencyMs: number }
@@ -113,27 +105,6 @@ function logMetrics(agent: string, entry: Record<string, unknown>): void {
   } catch { /* metrics must never break the reply path */ }
 }
 
-// === JARVIS MOD #68 — fabrication telemetry ==================================
-// Logs figures a reply asserts that nothing authorized. OBSERVER ONLY: it never
-// edits or suppresses a reply, because a regex cannot reliably tell a grounded
-// number from a guessed one, and silently eating a correct sentence is worse
-// than a noisy log line. Its value is making fabrication visible in
-// fastpath-metrics.jsonl instead of needing a hand-run 25-turn soak to find it.
-async function auditReply(replyText: string, userText: string): Promise<string[] | null> {
-  try {
-    const counts = await getLiveCounts();
-    const allowedNumbers = counts
-      ? [counts.activeStagings, counts.openContracts, counts.awaitingInstall]
-      : [];
-    // Scott's own words ground anything he supplied himself this turn.
-    const result = auditFigures(replyText, allowedNumbers, userText);
-    return result.unsourced.length ? summarizeUnsourced(result) : null;
-  } catch {
-    return null; // telemetry must never break the reply path
-  }
-}
-// === END MOD #68 =============================================================
-
 // --- main entry (B4) ---------------------------------------------------------
 
 // === JARVIS MOD #45 (Phase 3): shared request prep for both entrypoints ===
@@ -146,31 +117,7 @@ function prepareMessages(agent: string, org: string, userText: string, started: 
   if (!last || last.role !== 'user' || !last.content.includes(userText)) {
     window = [...window, { role: 'user', content: userText, ts: started }];
   }
-  // === JARVIS MOD #67c — break the laundering chain ==========================
-  // Re-running the soak showed the lane echoing its OWN earlier inventions
-  // ("unsigned since Friday", "crews start at five") with total confidence: a
-  // figure it guessed three turns ago sits in the window looking exactly like
-  // a figure it retrieved, and prompt text alone loses to that precedent.
-  //
-  // So the payload marks them. Every prior assistant turn is re-audited and any
-  // that asserted figures nothing grounded gets an inline [unverified] tag, so
-  // the model can SEE which of its past numbers were guesses instead of having
-  // to take its own word for them.
-  //
-  // Payload-only, exactly like the voice cue: the stored logs are untouched, so
-  // history stays byte-identical and nothing user-visible is rewritten.
-  const allowed = numbersIn(snapshot);
-  const marked = window.map((turn) => {
-    if (turn.role !== 'assistant') return turn;
-    if (auditFigures(turn.content, allowed).unsourced.length === 0) return turn;
-    return {
-      ...turn,
-      content:
-        `${turn.content}\n[unverified: figures in this earlier reply came from no data ` +
-        `source — do NOT repeat them as fact]`,
-    };
-  });
-  const messages = applyVoiceCue(marked, readVoiceCue(agent, org));
+  const messages = applyVoiceCue(window, readVoiceCue(agent, org));
   return { system, messages };
 }
 // === END MOD #45 ===
@@ -244,18 +191,10 @@ export async function tryFastReply(
     const read = u.cache_read_input_tokens ?? 0;
     const write = u.cache_creation_input_tokens ?? 0;
     const denom = read + write + (u.input_tokens ?? 0);
-    const unsourced = isEscalation(text) ? null : await auditReply(text, userText);
     logMetrics(agent, {
-      // === JARVIS MOD #69 — label from the SAME predicate the router uses.
-      // This logged exact-match while routing on .includes(), so turns that
-      // wrapped the token in prose were routed correctly and logged as
-      // 'reply' — metrics claimed 14 replies where 11 happened, inflating the
-      // fast-path hit rate. A metric that disagrees with the behaviour it
-      // measures is worse than no metric. (Found by the 2026-08-03 soak.)
-      event: isEscalation(text) ? 'escalate' : 'reply',
+      event: text === ESCALATE_TOKEN ? 'escalate' : 'reply',
       model: DEFAULT_MODEL,
       latencyMs,
-      ...(unsourced ? { unsourced_figures: unsourced } : {}),
       input_tokens: u.input_tokens ?? 0,
       output_tokens: u.output_tokens ?? 0,
       cache_creation_input_tokens: write,
@@ -263,7 +202,7 @@ export async function tryFastReply(
       cache_read_ratio: denom ? Math.round((read / denom) * 100) / 100 : 0,
     });
 
-    if (isEscalation(text)) {
+    if (!text || text === ESCALATE_TOKEN || text.includes(ESCALATE_TOKEN)) {
       return { kind: 'escalate' };
     }
     return { kind: 'reply', text, latencyMs };
@@ -386,16 +325,14 @@ export async function tryFastReplyStream(
       flushed += 1;
       onSentence(pending.trim());
     }
-    const unsourcedStream = isEscalation(text) ? null : await auditReply(text, userText);
     const read = usage.cache_read_input_tokens ?? 0;
     const write = usage.cache_creation_input_tokens ?? 0;
     const denom = read + write + (usage.input_tokens ?? 0);
     logMetrics(agent, {
-      event: isEscalation(text) ? 'escalate' : 'reply',
+      event: !text || text.includes(ESCALATE_TOKEN) ? 'escalate' : 'reply',
       model: DEFAULT_MODEL,
       latencyMs,
       stream: true,
-      ...(unsourcedStream ? { unsourced_figures: unsourcedStream } : {}),
       ttfsMs,
       sentences_flushed: flushed,
       input_tokens: usage.input_tokens ?? 0,
@@ -405,7 +342,7 @@ export async function tryFastReplyStream(
       cache_read_ratio: denom ? Math.round((read / denom) * 100) / 100 : 0,
     });
 
-    if (isEscalation(text)) {
+    if (!text || text.includes(ESCALATE_TOKEN)) {
       return { kind: 'escalate' };
     }
     return { kind: 'reply', text, latencyMs };
