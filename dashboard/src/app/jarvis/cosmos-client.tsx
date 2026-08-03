@@ -11,6 +11,12 @@ import { PwaBoot } from '@/components/cosmos/pwa-boot';
 // plain DOM overlay — it does not need to be inside the R3F tree.
 import { TelemetryPanel } from '@/components/cosmos/telemetry-panel';
 // === END JARVIS MOD #84 ===
+// === JARVIS MOD #99 — mount the revenue celebration overlay (2026-08-03) ===
+// Same reasoning as #84: a plain DOM overlay, mounted outside the R3F tree so
+// this wave's edits stay off scene.tsx. Renders nothing at all until a real
+// contract-won event arrives from /api/uhs/celebrations.
+import { Celebration } from '@/components/cosmos/celebration';
+// === END JARVIS MOD #99 ===
 
 // R3F Canvas must run client-only; ssr:false is allowed here (client component).
 const Scene = dynamic(() => import('@/components/cosmos/scene'), {
@@ -48,6 +54,9 @@ export function CosmosClient() {
       {/* === JARVIS MOD #84 === */}
       <TelemetryPanel />
       {/* === END JARVIS MOD #84 === */}
+      {/* === JARVIS MOD #99 === */}
+      <Celebration />
+      {/* === END JARVIS MOD #99 === */}
     </>
   );
 }
