@@ -18,6 +18,10 @@ import {
   buildTonalCueEvents,
   JARVIS_TONAL_CUE_ITEM_PREFIX,
 } from '@/lib/realtime/jarvis-prompt';
+// === JARVIS MOD #100 — same barge-in bookkeeping the legacy lane uses
+// (MOD #85). Only the HTTP fallback below needs it; the WebRTC path has no
+// fetch to abort. ===
+import { TurnGuard } from './turn-guard';
 
 // GA WebRTC calls endpoint (2026): no model query param — the model is
 // already baked into the ephemeral client secret minted server-side.
@@ -42,6 +46,17 @@ export function useRealtimeVoice(): UseVoiceResult {
   const fastReplyIdsRef = useRef<Set<string>>(new Set());
   const ttsBridgeRef = useRef<TtsBridge | null>(null);
   const sessionStartingRef = useRef(false);
+  // === JARVIS MOD #100 — guard for the HTTP fallback reply ====================
+  // sendText has two legs. The WebRTC leg (data channel open) is the normal one
+  // and owns no fetch. The fallback leg — data channel not yet open, which is
+  // every turn during session setup or after an RTC drop — POSTed to
+  // /api/messages/send with no AbortController and no way to cancel, so a slow
+  // or held-open reply pinned the panel in `processing` with no escape. That is
+  // the state build-visual observed live behind the new stop control.
+  const replyGuardRef = useRef<TurnGuard | null>(null);
+  if (!replyGuardRef.current) replyGuardRef.current = new TurnGuard();
+  const replyGuard = replyGuardRef.current;
+  // === END MOD #100 ===
 
   // === JARVIS MOD #51 fix — response.create race guard. OpenAI rejects a
   // response.create sent while a prior response is still in flight
@@ -526,15 +541,26 @@ export function useRealtimeVoice(): UseVoiceResult {
     } else {
       // Data channel not ready — fall back to HTTP send path
       setState('processing');
+      // === JARVIS MOD #100: abortable + generation-gated, matching the legacy
+      // lane's contract (MOD #88). begin() supersedes any prior fallback reply,
+      // and every resume point below re-checks before touching state — an
+      // aborted reply must leave the machine where the interrupt put it, not
+      // stomp it with 'responding'/'wakeListening' seconds later. ===
+      const gen = replyGuard.begin();
+      const ac = new AbortController();
+      replyGuard.track(gen, ac);
       fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent: 'jarvis-telegram', text: `[Cosmos] ${trimmed}`, stream: false }),
+        signal: ac.signal,
       })
         .then(async (r) => {
+          if (!replyGuard.isCurrent(gen)) return;
           if (!r.ok) { setState('wakeListening'); return; }
           let payload: { fastpath?: boolean; replyText?: string; replyId?: string } = {};
           try { payload = (await r.json()) as typeof payload; } catch { /* ok */ }
+          if (!replyGuard.isCurrent(gen)) return;
           if (payload.fastpath && payload.replyText && payload.replyId) {
             fastReplyIdsRef.current.add(payload.replyId);
             pushAgentReply(payload.replyText, payload.replyId);
@@ -542,9 +568,60 @@ export function useRealtimeVoice(): UseVoiceResult {
             setState('responding');
           }
         })
-        .catch(() => setState('wakeListening'));
+        // An AbortError here is the interrupt doing its job, not a failure.
+        .catch(() => {
+          if (!replyGuard.isCurrent(gen)) return;
+          setState('wakeListening');
+        })
+        .finally(() => replyGuard.release(ac));
+      // === END MOD #100 ===
     }
-  }, [pushAgentReply, requestResponse]);
+  }, [pushAgentReply, requestResponse, replyGuard]);
+
+  // === JARVIS MOD #101 — interruptReply for the Realtime lane =================
+  // build-visual's think-time stop control feature-detects this member; without
+  // it the button stayed disabled on the LIVE lane (NEXT_PUBLIC_CTX_REALTIME_VOICE=1
+  // mounts this hook), so the one lane a user actually runs had no way out of a
+  // stalled turn. Additive only — nothing here modifies requestResponse() or the
+  // cue refresh.
+  //
+  // Contract matches use-voice's interruptReply exactly: cancel the reply, leave
+  // clean state, and DO NOT touch TTS — callers pair this with the TTS interrupt
+  // (build-visual's handler calls interruptReply() + interrupt() + stopListening()).
+  //
+  // Both legs of sendText have to be answered, because which one produced the
+  // stall depends on whether the data channel was up when the turn started:
+  //   - HTTP fallback → abort the fetch and advance the generation.
+  //   - WebRTC → response.cancel, then clear BOTH race-guard flags. That
+  //     sequence is not invented here: it is MOD #53's goodbye path
+  //     (the `isSignoff` branch above) applied to a button instead of a spoken
+  //     sign-off. Clearing activeResponseRef AND pendingResponseCreateRef is the
+  //     load-bearing part — cancelling without clearing them would leave the
+  //     MOD #51 guard believing a response is still in flight, and it would
+  //     swallow the NEXT response.create. JARVIS would go permanently mute.
+  const interruptReply = useCallback(() => {
+    replyGuard.begin(); // aborts the HTTP fallback leg, if that is the one in flight
+
+    const channel = dcRef.current;
+    if (channel?.readyState === 'open' && activeResponseRef.current) {
+      channel.send(JSON.stringify({ type: 'response.cancel' }));
+    }
+    activeResponseRef.current = false;
+    pendingResponseCreateRef.current = false;
+
+    // Stale interim belongs to the abandoned turn — no caller clears it, and
+    // leaving it on screen after a stop press is visible cruft.
+    setInterim('');
+
+    // Deliberately NO setState here, matching use-voice's interruptReply. The
+    // transition is the CALLER's half of the contract: handleStopThinking pairs
+    // this with stopListening(), which on this lane sets 'wakeListening'
+    // unconditionally. Normalising state here too would make the two lanes'
+    // interruptReply mean different things — the asymmetry that produced the
+    // disabled-button bug in the first place. Verified live: stop during
+    // think-time returns the panel to the wake gate, no `processing` strand.
+  }, [replyGuard]);
+  // === END MOD #101 ===========================================================
 
   // startListening: for Realtime VAD is server-side; this opens a follow-up window
   const startListening = useCallback(() => {
@@ -594,8 +671,11 @@ export function useRealtimeVoice(): UseVoiceResult {
   useEffect(() => {
     return () => {
       stopSession();
+      // === MOD #100: nothing may outlive the component — abort the fallback
+      // reply and advance the generation so its continuation cannot setState. ===
+      replyGuard.begin();
     };
-  }, [stopSession]);
+  }, [stopSession, replyGuard]);
 
   return {
     state,
@@ -612,6 +692,7 @@ export function useRealtimeVoice(): UseVoiceResult {
     toggleOpenMic,
     bindTts,
     notifyTtsSpeaking,
+    interruptReply, // === MOD #101 ===
     fastReplyIdsRef,
   };
 }
