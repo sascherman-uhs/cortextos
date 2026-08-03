@@ -72,9 +72,12 @@ ${SIMPLEX_GLSL}
 void main(){
   vec3 p = position;
   // Two drifting octaves of noise displace the surface along its normal.
-  float n1 = snoise(normalize(position) * uFreq + uTime * 0.25);
-  float n2 = snoise(normalize(position) * uFreq * 2.1 + uTime * 0.4);
-  float disp = (n1 + 0.5 * n2) * uAmp;
+  // MOD #73: the field drifts ~2x faster and the second octave carries more
+  // weight, so the surface visibly re-forms over a few seconds instead of
+  // presenting one frozen silhouette that merely rotates.
+  float n1 = snoise(normalize(position) * uFreq + uTime * 0.5);
+  float n2 = snoise(normalize(position) * uFreq * 2.1 + uTime * 0.85);
+  float disp = (n1 + 0.65 * n2) * uAmp;
   vDisp = disp;
   p += normal * disp;
   vec4 mv = modelViewMatrix * vec4(p, 1.0);

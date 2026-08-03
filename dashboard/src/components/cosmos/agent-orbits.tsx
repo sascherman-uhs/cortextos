@@ -37,7 +37,15 @@ import * as THREE from 'three';
 import { AGENT_ACCENTS, hashIndex, GREEN, RED, TEAL, CYAN } from './palette';
 // === JARVIS MOD #58/#55: frustum fit + one easing curve ===
 import { approach, EASE, DUR_BASE } from './motion';
-import { cameraZForAspect } from './framing';
+import {
+  cameraZForAspect,
+  worldYAtScreenFrac,
+  PORTRAIT_BAND_TOP,
+  PORTRAIT_BAND_BOTTOM,
+} from './framing';
+// === JARVIS MOD #70: frozen scene clock ===
+import { sceneTime, sceneDelta, sceneHalfLife, isReducedMotion } from './reduced-motion';
+// === END JARVIS MOD #70 ===
 // === END JARVIS MOD #58/#55 ===
 
 // === JARVIS MOD #58 — orbit framing (2026-08-03) ===
@@ -62,6 +70,12 @@ interface OrbitFit {
   ryMax: number;
   /** 1 or 2 rings, depending on how much horizontal room there is. */
   rings: 1 | 2;
+  // === JARVIS MOD #71: portrait vertical band that dodges the DOM chrome ===
+  /** Y the orbit system is centred on (0 on desktop). */
+  yCenter: number;
+  /** Max vertical amplitude that keeps agents inside the band. */
+  ryBand: number;
+  // === END JARVIS MOD #71 ===
 }
 
 function useOrbitFit(): OrbitFit {
@@ -80,7 +94,23 @@ function useOrbitFit(): OrbitFit {
     const solve = (k: number) => (camZ * k - ORBIT_MARGIN) / (1 + ORBIT_DEPTH_K * k);
     const rxMax = Math.max(0.8, solve(tanH * aspect));
     const ryMax = Math.max(0.8, solve(tanH));
-    return { rxMax, ryMax, rings: rxMax < SINGLE_RING_BELOW ? 1 : 2 };
+    const rings: 1 | 2 = rxMax < SINGLE_RING_BELOW ? 1 : 2;
+
+    // === JARVIS MOD #71: on portrait, fit to the band between the stat strip
+    // and the wordmark instead of to the raw frustum — the frustum contains DOM
+    // chrome the scene can't see, which is how agents ended up clipping through
+    // the wordmark's letters. Desktop keeps the symmetric, centred orbit. ===
+    let yCenter = 0;
+    let ryBand = ryMax;
+    if (rings === 1) {
+      const top = worldYAtScreenFrac(fov, camZ, PORTRAIT_BAND_TOP);
+      const bottom = worldYAtScreenFrac(fov, camZ, PORTRAIT_BAND_BOTTOM);
+      yCenter = (top + bottom) / 2;
+      ryBand = Math.max(0.6, (top - bottom) / 2 - ORBIT_MARGIN);
+    }
+    // === END JARVIS MOD #71 ===
+
+    return { rxMax, ryMax, rings, yCenter, ryBand };
   }, [camera, size]);
 }
 
@@ -291,6 +321,10 @@ interface AgentNodeProps {
   ry: number;
   rz: number;
   dockX: number;
+  /** MOD #71: world-Y the whole orbit system is centred on. */
+  yOffset: number;
+  /** MOD #71: half-height available to dock slots. */
+  dockYSpan: number;
   labels: React.RefObject<LabelRegistry>;
   order: number;
   // === END JARVIS MOD #58 ===
@@ -314,6 +348,8 @@ function AgentNode({
   ry,
   rz,
   dockX,
+  yOffset,
+  dockYSpan,
   labels,
   order,
   angle0,
@@ -381,16 +417,19 @@ function AgentNode({
     () =>
       new THREE.Vector3(
         dockX,
-        1.4 - (dockSlot % 4) * 0.85,
+        // MOD #71: slots spread across the available band, then offset onto it.
+        yOffset + dockYSpan * (1 - ((dockSlot % 4) * 2) / 3),
         1.4 + Math.floor(dockSlot / 4) * 0.35,
       ),
-    [dockSlot, dockX],
+    [dockSlot, dockX, yOffset, dockYSpan],
   );
 
   useFrame((state, delta) => {
     if (!groupRef.current) return;
-    const t = state.clock.getElapsedTime();
-    const dt = Math.min(delta, 0.1);
+    // MOD #70: frozen while prefers-reduced-motion is on.
+    const t = sceneTime(state.clock.getElapsedTime());
+    const dt = sceneDelta(delta);
+    const still = isReducedMotion();
     const angle = angle0 + t * speed;
 
     // MOD #58: tilted ellipse with independent per-axis radii, so a portrait
@@ -401,18 +440,23 @@ function AgentNode({
     const sa = Math.sin(tiltAxis);
     const ox = ex * ca - ez * sa;
     const oz = ex * sa + ez * ca;
-    const oy = yTilt + Math.sin(angle) * ry;
+    const oy = yOffset + yTilt + Math.sin(angle) * ry; // MOD #71: band offset
 
     // MOD #37: docking — ease toward the dock anchor while working ("in
     // quickly"), drift back to orbit when done ("out slowly"). Nothing snaps.
     // MOD #55: frame-rate independent (was a raw per-frame lerp that ran ~2x
     // faster on a 120Hz display).
-    dockBlend.current = approach(
-      dockBlend.current,
-      agent.working ? 1 : 0,
-      agent.working ? 0.34 : 1.3,
-      dt,
-    );
+    // MOD #70: docking is decorative. Under reduced motion it would SNAP
+    // (halfLife 0) every time a work flag flipped, which measured as 3.55%
+    // frame-to-frame movement in an otherwise frozen scene. Hold at 0.
+    if (!still) {
+      dockBlend.current = approach(
+        dockBlend.current,
+        agent.working ? 1 : 0,
+        agent.working ? 0.34 : 1.3,
+        dt,
+      );
+    }
     const b = dockBlend.current;
     const x = ox * (1 - b) + dockPos.x * b;
     const y = oy * (1 - b) + dockPos.y * b;
@@ -425,7 +469,7 @@ function AgentNode({
 
     // MOD #37: dispatch flare envelope — peaks mid-beam, eases back.
     let flare = 0;
-    if (dispatchStart.current >= 0) {
+    if (dispatchStart.current >= 0 && !still) {
       const dt = (performance.now() - dispatchStart.current) / 1000;
       if (dt > BEAM_DURATION) {
         dispatchStart.current = -1;
@@ -462,9 +506,12 @@ function AgentNode({
     const behind = zr < -0.2;
     if (behind !== labelDim) setLabelDim(behind);
 
-    // Sonar ping animation.
+    // Sonar ping animation. MOD #70: performance.now()-driven, so `still` has
+    // to silence it explicitly — the frozen scene clock can't.
     if (pingRef.current && pingMatRef.current) {
-      if (pingStart.current >= 0) {
+      if (still) {
+        pingRef.current.visible = false;
+      } else if (pingStart.current >= 0) {
         const dt = (performance.now() - pingStart.current) / 1000;
         if (dt > 1.3) {
           pingStart.current = -1;
@@ -485,7 +532,9 @@ function AgentNode({
     // (system origin) out to the agent, racing out then fading. The beam mesh
     // is a sibling of the agent group, so it lives in origin-space directly.
     if (beamRef.current && beamMatRef.current) {
-      if (dispatchStart.current >= 0) {
+      if (still) {
+        beamRef.current.visible = false; // MOD #70
+      } else if (dispatchStart.current >= 0) {
         const dt = (performance.now() - dispatchStart.current) / 1000;
         const p = Math.min(1, dt / (BEAM_DURATION * 0.4)); // race out in 40%
         const agentPos = groupRef.current.position;
@@ -664,14 +713,25 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
   }, [agents]);
 
   const layout = useMemo(() => {
+    // MOD #70: angle0 is derived from array INDEX, so an /api/agents response in
+    // a different order silently teleported the whole constellation. Sort by
+    // name — a stable key — so a poll can only ever change an agent's state,
+    // never its seat.
+    const ordered = [...agents].sort((a, b) => a.name.localeCompare(b.name));
     const rxOuter = Math.min(DESIGN_RX_OUTER, fit.rxMax);
     // Vertical amplitude: normally a gentle 28% of rx, but on a tall/narrow
     // frame (where rx is squeezed) spend the spare vertical room instead.
-    const ryOuter = Math.min(fit.ryMax, Math.max(rxOuter * 0.28, fit.rings === 1 ? rxOuter * 1.4 : 0));
+    // MOD #71: ryBand is the binding constraint on portrait (it excludes the
+    // wordmark); on desktop ryBand === ryMax so this is a no-op.
+    const ryOuter = Math.min(
+      fit.ryMax,
+      fit.ryBand,
+      Math.max(rxOuter * 0.28, fit.rings === 1 ? rxOuter * 1.4 : 0),
+    );
     const single = fit.rings === 1;
-    const split = single ? agents.length : Math.ceil(agents.length / 2);
-    const inner = agents.slice(0, split);
-    const outer = agents.slice(split);
+    const split = single ? ordered.length : Math.ceil(ordered.length / 2);
+    const inner = ordered.slice(0, split);
+    const outer = ordered.slice(split);
 
     const place = (
       list: OrbitAgent[],
@@ -712,6 +772,10 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
 
   // Docked agents park just inside the right edge of the visible frustum.
   const dockX = Math.min(3.4, fit.rxMax * 0.92);
+  // MOD #71: and inside the same vertical band, so docking can't park an agent
+  // on top of the wordmark either.
+  const yOffset = fit.yCenter;
+  const dockYSpan = Math.min(1.4, fit.ryBand);
   // === END JARVIS MOD #58 ===
 
   return (
@@ -724,6 +788,8 @@ export function OrbitSystem({ agents, selectedName, lowPerf, onSelect }: OrbitSy
           ry={item.ry}
           rz={item.rz}
           dockX={dockX}
+          yOffset={yOffset}
+          dockYSpan={dockYSpan}
           labels={labels}
           order={i}
           angle0={item.angle0}

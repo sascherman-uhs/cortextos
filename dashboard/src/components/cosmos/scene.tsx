@@ -22,6 +22,9 @@ import { TEAL, CYAN, AQUA, MINT, PURPLE, SPACE, GOLD } from './palette';
 // === JARVIS MOD #58/#62: responsive framing + degradation ===
 import { cameraZForAspect } from './framing';
 import { prefersReducedMotion } from './motion';
+// === JARVIS MOD #70: the frozen-clock switch the whole scene reads ===
+import { setReducedMotion } from './reduced-motion';
+// === END JARVIS MOD #70 ===
 // === END JARVIS MOD #58/#62 ===
 
 // === JARVIS MOD #29: deep-space background replaces UHS charcoal in this scene ===
@@ -71,7 +74,9 @@ const STATE_BRIGHT: Record<VoiceState, number> = {
   // === END MOD #36 ===
 };
 // Idle breathing amplitude; live mic amplitude scales above this while speaking.
-const IDLE_AMPLITUDE = 0.035;
+// MOD #73: 0.035 → 0.055. At the old value the displacement was measurable but
+// not perceptible against the wireframe's own line density.
+const IDLE_AMPLITUDE = 0.055;
 // === END JARVIS MOD #29 ===
 
 declare global {
@@ -130,6 +135,9 @@ declare global {
       escalations?: number;
       voiceLatency?: { p50: number; p95: number; n: number };
       // === END JARVIS MOD #38 ===
+      // === JARVIS MOD #70: reduced-motion seam (verification asserts on it) ===
+      reducedMotion?: boolean;
+      // === END JARVIS MOD #70 ===
     };
     // === END JARVIS MOD #21 ===
     // === JARVIS MOD #36: micless wake-gate test seam (Playwright drives the
@@ -234,13 +242,20 @@ export default function Scene() {
   //                 re-renders only when voice state actually changes, so the
   //                 orb still *reads* correctly without any idle animation.
   const [hidden, setHidden] = useState(false);
-  const [reducedMotion, setReducedMotion] = useState(false);
+  const [reducedMotion, setReducedMotionState] = useState(false);
   useEffect(() => {
     const onVis = () => setHidden(document.visibilityState === 'hidden');
     onVis();
     document.addEventListener('visibilitychange', onVis);
     const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)');
-    const onMotion = () => setReducedMotion(prefersReducedMotion());
+    // MOD #70: set the module flag BEFORE the React state, so the very next
+    // frame is already frozen rather than waiting on a re-render.
+    const onMotion = () => {
+      const v = prefersReducedMotion();
+      setReducedMotion(v);
+      setReducedMotionState(v);
+      window.__cosmosStats = { ...(window.__cosmosStats ?? {}), reducedMotion: v };
+    };
     onMotion();
     mq?.addEventListener?.('change', onMotion);
     return () => {
@@ -343,7 +358,9 @@ export default function Scene() {
           === JARVIS MOD #59: on a phone the orb is centred higher and the glass
           panel owns the lower third, so the wordmark tucks under the orb
           instead of colliding with the panel at bottom-18%. === */}
-      <div className="pointer-events-none absolute inset-x-0 top-[66%] flex justify-center md:top-auto md:bottom-[18%]">
+      <div // MOD #71: 65% matches PORTRAIT_BAND_BOTTOM (0.62) + clearance in framing.ts.
+        // If you move this, move that constant with it.
+        className="pointer-events-none absolute inset-x-0 top-[65%] flex justify-center md:top-auto md:bottom-[18%]">
         <span className="text-xl font-light tracking-[0.5em] text-[#5eead4] [text-shadow:0_0_20px_rgba(45,212,191,0.5)] md:text-2xl">
           JARVIS
         </span>
