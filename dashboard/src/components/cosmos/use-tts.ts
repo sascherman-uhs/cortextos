@@ -47,6 +47,13 @@ import { getSharedAudioContext, resumeSharedAudio } from './audio-unlock';
 // p50/p95 ring buffer below dies with the page; the JSONL line survives it. ===
 import { reportTurnLatency } from '@/lib/voice/latency';
 // === END JARVIS MOD #25 ===
+// === JARVIS MOD #85 — barge-in bookkeeping moved into a pure, testable object.
+// MOD #24 already had the right IDEA (baseTurnId + AbortController) but the
+// state lived in three loose refs and the ordering leaked (see MOD #85/#86/#87
+// notes in LOCAL_MODS.md). TurnGuard is the single owner: stale ids cannot
+// start a fetch, cannot enqueue, and cannot dequeue. ===
+import { TurnGuard } from './turn-guard';
+// === END JARVIS MOD #85 ===
 
 const MUTE_KEY = 'cosmos-tts-muted';
 type TtsPath = 'elevenlabs' | 'say' | 'browser' | null;
@@ -227,13 +234,16 @@ export function useTts(): UseTtsResult {
   // === END JARVIS MOD #28 ===
 
   // === JARVIS MOD #24 — queue / turn / abort state ===
-  // baseTurnId: monotonic id per reply. A stale turnId means a newer reply or a
-  // user barge-in superseded us; loops bail and landing bytes are dropped.
-  const baseTurnIdRef = useRef(0);
-  // In-flight TTS fetch controllers — aborted en masse on interrupt/new turn.
-  const abortersRef = useRef<Set<AbortController>>(new Set());
-  // Ready-but-unplayed audio buffers (drives the ttsQueueDepth test seam).
-  const audioQueueRef = useRef<ArrayBuffer[]>([]);
+  // === JARVIS MOD #85 (2026-08-03): the three loose refs this block used to
+  // hold (baseTurnIdRef / abortersRef / audioQueueRef) are now ONE TurnGuard.
+  // Reason they had to merge: they were mutated from four different code paths
+  // (beginTurn, stopAll, the pipeline loop, the stream loop) with no invariant
+  // tying them together, which is how a barge-in could flush the queue while a
+  // superseded pipeline was still holding a `pop()` for it. ===
+  const guardRef = useRef<TurnGuard<ArrayBuffer> | null>(null);
+  if (!guardRef.current) guardRef.current = new TurnGuard<ArrayBuffer>();
+  const guard = guardRef.current;
+  // === END JARVIS MOD #85 ===
   // Cached server path. Once known to be 'elevenlabs' we pipeline per sentence;
   // 'say'/'browser' stay single-shot. Reset when the path changes under us.
   const knownPathRef = useRef<TtsPath>(null);
@@ -257,11 +267,11 @@ export function useTts(): UseTtsResult {
     writeStats({
       ttsMuted: mutedRef.current,
       ttsPath: window.__cosmosStats?.ttsPath ?? null,
-      baseTurnId: baseTurnIdRef.current,
+      baseTurnId: guard.current(),
       ttsQueueDepth: 0,
     });
     // === END JARVIS MOD #25 ===
-  }, []);
+  }, [guard]); // guard is a stable ref instance
 
   const toggleMute = useCallback(() => {
     setMuted((prev) => {
@@ -332,11 +342,20 @@ export function useTts(): UseTtsResult {
     }
     // === END JARVIS MOD #28 ===
     // === JARVIS MOD #24: drop any queued buffers when we stop ===
-    audioQueueRef.current = [];
+    // === JARVIS MOD #85: ALSO abort in-flight synth. stopAll is reached by mute
+    // mid-utterance and by unmount, neither of which went through beginTurn — so
+    // before this, muting JARVIS left an ElevenLabs request running to
+    // completion. Nothing played (mutedRef gates playback) but we paid for the
+    // synthesis, which is exactly the kind of quiet spend the cost-cap rule says
+    // to kill. Turn id deliberately does NOT advance here: nothing new is
+    // starting, and advancing it would strand a turn that legitimately resumes. ===
+    guard.abortInFlight();
+    guard.flush();
+    // === END JARVIS MOD #85 ===
     // === END JARVIS MOD #24 ===
     stopAmplitudeLoop();
     setSpeaking(false);
-  }, [stopAmplitudeLoop]);
+  }, [stopAmplitudeLoop, guard]);
 
   // stopAll referenced from toggleMute (declared earlier) via a ref to dodge
   // the declaration-order / stable-identity dance.
@@ -414,7 +433,7 @@ export function useTts(): UseTtsResult {
 
   /** Record the user-stopped-talking → first-audible latency once per reply. */
   const recordFirstAudible = useCallback((turnId: number) => {
-    if (turnId !== baseTurnIdRef.current) return;
+    if (!guard.isCurrent(turnId)) return;
     if (firstAudibleRecordedRef.current) return;
     firstAudibleRecordedRef.current = true;
     const stop = window.__cosmosStats?.lastUserStopMs;
@@ -430,17 +449,29 @@ export function useTts(): UseTtsResult {
       reportTurnLatency({ path: 'fastpath', firstAudioMs: ms });
       // === END MOD #54 ===
     }
-  }, []);
+  }, [guard]); // guard is a stable ref instance
 
   /**
    * Fetch one TTS segment. Returns { path, buf } — buf is the mp3 bytes on the
    * elevenlabs path, null otherwise (say already spoke server-side; browser is a
    * client-speak signal). Returns null if the fetch was aborted (barge-in).
    */
+  // === JARVIS MOD #85: fetchTts now takes the turn it belongs to and REFUSES to
+  // fire for a stale one. MOD #24 only checked staleness at the call sites, and
+  // one of those checks came too late: runElevenLabsPipeline prefetched segment
+  // i+1 immediately after awaiting segment i, BEFORE re-testing the turn. So a
+  // barge-in that landed while segment i was in flight aborted everything and
+  // then the dying pipeline promptly opened a BRAND NEW request for i+1 — an
+  // ElevenLabs synthesis charged for audio the user had just interrupted, and
+  // one that no longer belonged to any live turn. Guarding inside the fetch
+  // means no call site can make that mistake again. ===
   const fetchTts = useCallback(
-    async (segment: string): Promise<{ path: TtsPath; buf: ArrayBuffer | null } | null> => {
+    async (
+      segment: string,
+      turnId: number,
+    ): Promise<{ path: TtsPath; buf: ArrayBuffer | null } | null> => {
       const ac = new AbortController();
-      abortersRef.current.add(ac);
+      if (!guard.track(turnId, ac)) return null; // stale turn — never hits the network
       try {
         const res = await fetch('/api/uhs/tts', {
           method: 'POST',
@@ -448,10 +479,15 @@ export function useTts(): UseTtsResult {
           body: JSON.stringify({ text: segment }),
           signal: ac.signal,
         });
+        // === JARVIS MOD #85: a barge-in that lands between response headers and
+        // this line leaves an ALREADY-RESOLVED promise that abort cannot recall.
+        // Report it as a miss rather than handing bytes to a dead pipeline. ===
+        if (!guard.isCurrent(turnId)) return null;
         const path = (res.headers.get('x-tts-path') as TtsPath) ?? null;
         const contentType = res.headers.get('Content-Type') ?? '';
         if (res.ok && contentType.includes('audio/mpeg')) {
           const buf = await res.arrayBuffer();
+          if (!guard.isCurrent(turnId)) return null;
           return { path: 'elevenlabs', buf };
         }
         return { path, buf: null };
@@ -459,10 +495,10 @@ export function useTts(): UseTtsResult {
         if (ac.signal.aborted) return null; // barge-in — swallow
         throw err;
       } finally {
-        abortersRef.current.delete(ac);
+        guard.release(ac);
       }
     },
-    [],
+    [guard],
   );
 
   /** Play one mp3 buffer through the shared analyser; resolve on ended. */
@@ -478,7 +514,7 @@ export function useTts(): UseTtsResult {
   const playSegment = useCallback(
     async (buf: ArrayBuffer, turnId: number): Promise<void> => {
       // Drop bytes that landed for a superseded turn.
-      if (turnId !== baseTurnIdRef.current || mutedRef.current) return;
+      if (!guard.isCurrent(turnId) || mutedRef.current) return;
 
       const analyser = ensureAudioGraph(); // also resumes the shared ctx on iOS
       const ctx = audioCtxRef.current;
@@ -507,7 +543,7 @@ export function useTts(): UseTtsResult {
         return; // undecodable segment — skip rather than stall the queue
       }
       // Re-check staleness after the async decode (barge-in may have landed).
-      if (turnId !== baseTurnIdRef.current || mutedRef.current) return;
+      if (!guard.isCurrent(turnId) || mutedRef.current) return;
 
       await new Promise<void>((resolve) => {
         const source = ctx.createBufferSource();
@@ -519,7 +555,26 @@ export function useTts(): UseTtsResult {
           return;
         }
         bufferSourceRef.current = source;
-        source.onended = () => {
+        // === JARVIS MOD #86 (2026-08-03): this promise USED TO STRAND on every
+        // barge-in during playback. stopAll's teardown sets `onended = null`
+        // before calling source.stop() — deliberately, so the stop doesn't fire
+        // a spurious "finished" — which meant the only thing that could ever
+        // resolve this promise was deleted. The awaiting pipeline then hung at
+        // `await playSegment(...)` forever: its `finally` never ran, so
+        // setSpeaking(false) and the ttsQueueDepth reset never happened for that
+        // turn, and its ArrayBuffers stayed reachable. That is the "half-spoken
+        // limbo" the rubric is about — interrupt() papered over the visible
+        // symptom by calling setSpeaking(false) itself.
+        //
+        // Fix: settle through ONE idempotent `finish` registered in
+        // loopStopsRef, the same cancellation channel MOD #35 built for the rAF
+        // loops. stopAmplitudeLoop drains that set, so a barge-in now resolves
+        // this promise deterministically whether or not onended ever fires. ===
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          loopStopsRef.current.delete(finish);
           if (bufferSourceRef.current === source) bufferSourceRef.current = null;
           try {
             source.disconnect();
@@ -528,6 +583,9 @@ export function useTts(): UseTtsResult {
           }
           resolve();
         };
+        loopStopsRef.current.add(finish);
+        source.onended = finish;
+        // === END JARVIS MOD #86 ===
         try {
           source.start(0);
           // First moment sound is actually audible → close the latency metric.
@@ -535,11 +593,11 @@ export function useTts(): UseTtsResult {
           clearTtsError(); // === JARVIS MOD #31: a segment is genuinely playing ===
         } catch {
           reportTtsError('audio start failed');
-          resolve();
+          finish();
         }
       });
     },
-    [ensureAudioGraph, recordFirstAudible, reportTtsError, clearTtsError],
+    [ensureAudioGraph, recordFirstAudible, reportTtsError, clearTtsError, guard],
   );
   // === END JARVIS MOD #28 ===
 
@@ -636,18 +694,16 @@ export function useTts(): UseTtsResult {
    * bump baseTurnId, and reset the per-reply metric latch. Returns the new turnId.
    */
   const beginTurn = useCallback((): number => {
-    for (const ac of abortersRef.current) {
-      try {
-        ac.abort();
-      } catch {
-        /* ignore */
-      }
-    }
-    abortersRef.current.clear();
-    stopAll(); // stops audio + pulse + rAF, closes ctx, clears queue, speaking=false
+    // === JARVIS MOD #85/#87: order matters. stopAll() first — it aborts the
+    // in-flight fetches AND (via stopAmplitudeLoop) resolves any playSegment
+    // promise parked on a source that is about to be silenced (MOD #86). Then
+    // guard.begin() advances the turn id, which is what makes every late
+    // arrival from the old turn a no-op, and wakes any stream loop parked
+    // waiting for its next sentence so it can observe the new id and exit
+    // (MOD #87) instead of suspending for the lifetime of the page. ===
+    stopAll(); // stops audio + pulse + rAF, aborts fetches, clears queue, speaking=false
     firstAudibleRecordedRef.current = false;
-    const next = baseTurnIdRef.current + 1;
-    baseTurnIdRef.current = next;
+    const next = guard.begin();
     // === JARVIS MOD #25: write BOTH the canonical `baseTurnId` (read by the
     // regression suite) and the legacy `cosmosBaseTurnId` (MOD #24 seam). A user
     // turn reaches here via doSend → interrupt() → beginTurn(), so the id visibly
@@ -655,7 +711,7 @@ export function useTts(): UseTtsResult {
     writeStats({ baseTurnId: next, cosmosBaseTurnId: next, ttsQueueDepth: 0 });
     // === END JARVIS MOD #25 ===
     return next;
-  }, [stopAll]);
+  }, [stopAll, guard]);
 
   /**
    * ElevenLabs pipeline: fetch sentence 1 immediately, hold one fetch ahead of
@@ -667,19 +723,27 @@ export function useTts(): UseTtsResult {
     async (segments: string[], turnId: number) => {
       const fetches: Array<Promise<{ path: TtsPath; buf: ArrayBuffer | null } | null> | undefined> = [];
       const startFetch = (i: number) => {
+        // === JARVIS MOD #85: staleness is enforced inside fetchTts (via
+        // guard.track), so a prefetch issued from a superseded pipeline
+        // resolves to null without touching the network. The explicit check
+        // here just avoids allocating the controller at all. ===
+        if (!guard.isCurrent(turnId) || mutedRef.current) return;
         if (i >= 0 && i < segments.length && !fetches[i]) {
-          fetches[i] = fetchTts(segments[i]);
+          fetches[i] = fetchTts(segments[i], turnId);
         }
       };
       startFetch(0);
       startFetch(1); // hold-one-ahead: sentence 2 synthesizes while sentence 1 plays
 
       for (let i = 0; i < segments.length; i++) {
-        if (turnId !== baseTurnIdRef.current || mutedRef.current) return;
+        if (!guard.isCurrent(turnId) || mutedRef.current) return;
         writeStats({ ttsQueueDepth: segments.length - i });
         const res = await fetches[i];
-        startFetch(i + 1); // prefetch next BEFORE playing current
-        if (!res || turnId !== baseTurnIdRef.current || mutedRef.current) return;
+        // === JARVIS MOD #85: re-test the turn BEFORE prefetching. The old order
+        // (prefetch, then test) opened a fresh request for the next sentence on
+        // the way out of an already-interrupted turn. ===
+        if (!res || !guard.isCurrent(turnId) || mutedRef.current) return;
+        startFetch(i + 1); // prefetch next, now that we know we're still live
 
         if (res.path !== 'elevenlabs' || !res.buf) {
           // Path flipped away from elevenlabs (rare: key removed). Reset and finish
@@ -689,9 +753,9 @@ export function useTts(): UseTtsResult {
           if (res.path === 'say') {
             // Server already spoke segment i on the Mac; speak the rest, then pulse.
             const rest = segments.slice(i + 1).join(' ');
-            if (rest && turnId === baseTurnIdRef.current) await fetchTts(rest);
+            if (rest && guard.isCurrent(turnId)) await fetchTts(rest, turnId);
             // === JARVIS MOD #28: on iOS PWA, use browser speech instead of silent pulse ===
-            if (turnId === baseTurnIdRef.current) {
+            if (guard.isCurrent(turnId)) {
               if (isIosPwaStandaloneTts()) {
                 await speakBrowser(segments.slice(i).join(' '), turnId);
               } else {
@@ -702,17 +766,17 @@ export function useTts(): UseTtsResult {
           } else if (res.path === 'browser') {
             // Browser tier spoke nothing server-side; speak from segment i on.
             const rest = segments.slice(i).join(' ');
-            if (turnId === baseTurnIdRef.current) await speakBrowser(rest, turnId);
+            if (guard.isCurrent(turnId)) await speakBrowser(rest, turnId);
           }
           return;
         }
 
-        audioQueueRef.current.push(res.buf);
+        guard.enqueue(turnId, res.buf);
         await playSegment(res.buf, turnId);
-        audioQueueRef.current.pop();
+        guard.dequeue(turnId);
       }
     },
-    [fetchTts, playSegment, holdPulse, speakBrowser],
+    [fetchTts, playSegment, holdPulse, speakBrowser, guard],
   );
   // === END JARVIS MOD #24 ===
 
@@ -742,8 +806,8 @@ export function useTts(): UseTtsResult {
 
         // Path unknown / say / browser → single-shot probe on the WHOLE reply.
         // This is byte-for-byte the pre-mod flow, so say/browser never fragment.
-        const probe = await fetchTts(trimmed);
-        if (!probe || turnId !== baseTurnIdRef.current) return;
+        const probe = await fetchTts(trimmed, turnId);
+        if (!probe || !guard.isCurrent(turnId)) return;
         knownPathRef.current = probe.path;
         writeStats({ ttsPath: probe.path });
 
@@ -753,10 +817,10 @@ export function useTts(): UseTtsResult {
         if (probe.path === 'elevenlabs' && probe.buf) {
           // First elevenlabs reply plays as a single segment; subsequent replies
           // will pipeline per sentence via knownPathRef.
-          audioQueueRef.current.push(probe.buf);
+          guard.enqueue(turnId, probe.buf);
           writeStats({ ttsQueueDepth: 1 });
           await playSegment(probe.buf, turnId);
-          audioQueueRef.current.pop();
+          guard.dequeue(turnId);
         } else if (probe.path === 'say') {
           // === JARVIS MOD #28: on iOS PWA, Mac speakers don't reach Scott's phone.
           // Fall through to browser speechSynthesis so the device actually speaks. ===
@@ -772,19 +836,19 @@ export function useTts(): UseTtsResult {
       } catch {
         // Network/decoding failure — fall back to browser speech client-side.
         writeStats({ ttsPath: 'browser' });
-        if (!mutedRef.current && turnId === baseTurnIdRef.current) {
+        if (!mutedRef.current && guard.isCurrent(turnId)) {
           await speakBrowser(trimmed, turnId);
         }
       } finally {
         // Only tear down if we're still the active turn (a barge-in already reset us).
-        if (turnId === baseTurnIdRef.current) {
+        if (guard.isCurrent(turnId)) {
           stopAmplitudeLoop();
           setSpeaking(false);
           writeStats({ ttsQueueDepth: 0 });
         }
       }
     },
-    [beginTurn, runElevenLabsPipeline, fetchTts, playSegment, holdPulse, speakBrowser, stopAmplitudeLoop],
+    [beginTurn, runElevenLabsPipeline, fetchTts, playSegment, holdPulse, speakBrowser, stopAmplitudeLoop, guard],
   );
 
   // === JARVIS MOD #24: exposed barge-in — mic press / new user turn cuts JARVIS off ===
@@ -817,11 +881,29 @@ export function useTts(): UseTtsResult {
     const turnId = beginTurn();
     setSpeaking(true);
 
+    // === JARVIS MOD #87 (2026-08-03): cancellation for the parked stream loop.
+    // This loop suspends on `st.notify` whenever it has consumed every sentence
+    // pushed so far — normal, since the server is still generating. The ONLY
+    // things that resolved it were push() and end(), both driven by the reply
+    // stream in use-voice. So when a barge-in killed that stream mid-reply (the
+    // reader is aborted, end() never runs), this loop stayed suspended for the
+    // life of the page, holding its fetches, its buffers, and a setSpeaking
+    // continuation. One leaked loop per interrupted streaming reply.
+    //
+    // Parking with the guard makes the next beginTurn() wake it: it observes a
+    // closed stream and a stale turn id, and exits through its own `finally`.
+    // The unpark on the way out keeps normal completions from leaking waiters. ===
+    const unpark = guard.park(turnId, () => {
+      st.closed = true;
+      wake();
+    });
+    // === END JARVIS MOD #87 ===
+
     void (async () => {
       try {
         const fetches = new Map<number, ReturnType<typeof fetchTts>>();
         const startFetch = (i: number) => {
-          if (i < st.queue.length && !fetches.has(i)) fetches.set(i, fetchTts(st.queue[i]));
+          if (i < st.queue.length && !fetches.has(i)) fetches.set(i, fetchTts(st.queue[i], turnId));
         };
         let i = 0;
         for (;;) {
@@ -829,18 +911,18 @@ export function useTts(): UseTtsResult {
             await new Promise<void>((res) => { st.notify = res; });
           }
           if (i >= st.queue.length && st.closed) return;
-          if (turnId !== baseTurnIdRef.current || mutedRef.current) return;
+          if (!guard.isCurrent(turnId) || mutedRef.current) return;
           if (i >= MAX_SEGMENTS) {
             // Pathological sentence count — wait for close, fold the overflow
             // into one final segment (mirrors splitIntoSentences's cap).
             while (!st.closed) await new Promise<void>((res) => { st.notify = res; });
             const rest = st.queue.slice(i).join(' ');
-            if (rest && turnId === baseTurnIdRef.current && !mutedRef.current) {
-              const res = await fetchTts(rest);
-              if (res?.path === 'elevenlabs' && res.buf && turnId === baseTurnIdRef.current) {
-                audioQueueRef.current.push(res.buf);
+            if (rest && guard.isCurrent(turnId) && !mutedRef.current) {
+              const res = await fetchTts(rest, turnId);
+              if (res?.path === 'elevenlabs' && res.buf && guard.isCurrent(turnId)) {
+                guard.enqueue(turnId, res.buf);
                 await playSegment(res.buf, turnId);
-                audioQueueRef.current.pop();
+                guard.dequeue(turnId);
               }
             }
             return;
@@ -850,7 +932,7 @@ export function useTts(): UseTtsResult {
           writeStats({ ttsQueueDepth: st.queue.length - i });
           const res = await fetches.get(i)!;
           startFetch(i + 1);
-          if (!res || turnId !== baseTurnIdRef.current || mutedRef.current) return;
+          if (!res || !guard.isCurrent(turnId) || mutedRef.current) return;
 
           if (res.path !== 'elevenlabs' || !res.buf) {
             // Path flipped away mid-stream (rare: EL key removed). Wait for the
@@ -860,12 +942,12 @@ export function useTts(): UseTtsResult {
             knownPathRef.current = res.path;
             writeStats({ ttsPath: res.path });
             while (!st.closed) await new Promise<void>((r) => { st.notify = r; });
-            if (turnId !== baseTurnIdRef.current || mutedRef.current) return;
+            if (!guard.isCurrent(turnId) || mutedRef.current) return;
             if (res.path === 'say') {
               // Server already spoke segment i on the Mac; speak the rest, then pulse.
               const rest = st.queue.slice(i + 1).join(' ');
-              if (rest && turnId === baseTurnIdRef.current) await fetchTts(rest);
-              if (turnId === baseTurnIdRef.current) {
+              if (rest && guard.isCurrent(turnId)) await fetchTts(rest, turnId);
+              if (guard.isCurrent(turnId)) {
                 if (isIosPwaStandaloneTts()) {
                   await speakBrowser(st.queue.slice(i).join(' '), turnId);
                 } else {
@@ -874,18 +956,19 @@ export function useTts(): UseTtsResult {
               }
             } else if (res.path === 'browser') {
               const rest = st.queue.slice(i).join(' ');
-              if (rest && turnId === baseTurnIdRef.current) await speakBrowser(rest, turnId);
+              if (rest && guard.isCurrent(turnId)) await speakBrowser(rest, turnId);
             }
             return;
           }
 
-          audioQueueRef.current.push(res.buf);
+          guard.enqueue(turnId, res.buf);
           await playSegment(res.buf, turnId);
-          audioQueueRef.current.pop();
+          guard.dequeue(turnId);
           i += 1;
         }
       } finally {
-        if (turnId === baseTurnIdRef.current) {
+        unpark(); // === MOD #87: never leave a waiter behind ===
+        if (guard.isCurrent(turnId)) {
           stopAmplitudeLoop();
           setSpeaking(false);
           writeStats({ ttsQueueDepth: 0 });
@@ -894,13 +977,18 @@ export function useTts(): UseTtsResult {
     })();
 
     return {
+      // === JARVIS MOD #87: both handles are inert once the turn is superseded.
+      // The reply stream in use-voice can keep delivering sentences for a beat
+      // after a barge-in (an aborted reader still drains what was already
+      // buffered), and appending them here would grow a queue nobody consumes. ===
       push: (s: string) => {
+        if (!guard.isCurrent(turnId)) return;
         const t = s.trim();
         if (t && !st.closed) { st.queue.push(t); wake(); }
       },
       end: () => { st.closed = true; wake(); },
     };
-  }, [beginTurn, fetchTts, playSegment, holdPulse, speakBrowser, stopAmplitudeLoop, speak]);
+  }, [beginTurn, fetchTts, playSegment, holdPulse, speakBrowser, stopAmplitudeLoop, speak, guard]);
   // === END MOD #45 ===========================================================
 
   // Cleanup on unmount.
