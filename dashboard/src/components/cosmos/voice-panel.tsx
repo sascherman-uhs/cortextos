@@ -14,7 +14,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 // === JARVIS MOD #56/#55: the one warm accent + the one easing curve ===
 import { GOLD, GOLD_RGB, COOL_TEXT, COOL_DIM, COOL_LINE, CYAN, PURPLE } from './palette';
+// MOD #76: the stop-reply border — cool, brighter than idle chrome so the
+// control reads as actionable without borrowing the reserved gold accent.
+const STOP_LINE = 'rgba(148,214,216,0.6)';
 import { EASE, DUR_BASE } from './motion';
+// === JARVIS MOD #77: think-time stop-control decision (testable, no DOM) ===
+import { micControl } from './stop-control';
+// === END MOD #77 ===
 // === END JARVIS MOD #56/#55 ===
 // === JARVIS MOD #50 — OpenAI Realtime voice hook (feature-flagged) ===
 import { useRealtimeVoice } from './use-realtime-voice';
@@ -83,6 +89,10 @@ export function VoicePanel({
     bindTts,
     notifyTtsSpeaking,
     // === END MOD #36 ===
+    // === JARVIS MOD #76: build-bargein's reply cancel. OPTIONAL on the
+    // interface — use-realtime-voice satisfies the same shape and exposes no
+    // cancel, so absence is a supported state, not an error. ===
+    interruptReply,
     // === JARVIS MOD #38: ids already delivered via the synchronous fast lane ===
     fastReplyIdsRef,
     // === END MOD #38 ===
@@ -406,6 +416,39 @@ export function VoicePanel({
     };
   }, [displayState, openMic, supported]);
   const micActive = micStatus.hot;
+
+  // === JARVIS MOD #76 — think-time stop control (2026-08-03) ===
+  // The mic button was `disabled` for the whole of state === 'processing', so
+  // during agent think-time the user had NO way out of a slow turn: the button
+  // was dead, and wake-word barge-in is gated on isSpeaking, which is false
+  // before the first audible word. build-bargein's own spec documents the gap
+  // (jarvis-bargein.spec.ts G4 interrupts by SPEAKING AGAIN because "the mic
+  // control is disabled ... during think-time the button is not a barge-in
+  // surface at all").
+  const control = micControl({
+    displayState,
+    supported,
+    canCancelReply: typeof interruptReply === 'function',
+  });
+  const stopThinking = control.mode === 'stop-reply';
+
+  const handleStopThinking = useCallback(() => {
+    // Three parts, and all three are required:
+    //   interruptReply — supersedes the in-flight reply via the TurnGuard, so a
+    //     late-landing answer cannot speak or move the machine afterwards.
+    //   interrupt      — drops anything already queued for that reply's audio.
+    //   stopListening  — the STATE transition. interruptReply deliberately does
+    //     NOT touch state, and its abort lands in a .catch() gated on
+    //     replyGuard.isCurrent(gen), which is already false by then. Every other
+    //     caller in use-voice pairs the cancel with a transition ("the barge-in
+    //     already put the machine in 'listening'"); calling it bare would strand
+    //     the panel on "JARVIS is thinking…" — the spinner limbo this control
+    //     exists to prevent.
+    interruptReply?.();
+    interrupt();
+    stopListening();
+  }, [interruptReply, interrupt, stopListening]);
+  // === END JARVIS MOD #76 ===
   // Status dot: gold only while listening; cool everywhere else (MOD #56).
   const dotColor = micStatus.listening
     ? GOLD
@@ -485,11 +528,12 @@ export function VoicePanel({
               gold appears — gold border + fill + stop-square glyph + 24px gold
               glow + the 1.4s expanding pulse ring (cosmos-pulse-ring). === */}
           <button
-            onClick={handleMicPress}
-            disabled={!supported || state === 'processing'}
-            aria-label={micActive ? 'Stop listening' : 'Start voice input'}
+            onClick={stopThinking ? handleStopThinking : handleMicPress}
+            disabled={control.disabled}
+            aria-label={control.ariaLabel}
             data-testid="cosmos-mic"
             data-listening={micActive ? 'true' : 'false'}
+            data-mode={control.mode}
             className={[
               // === JARVIS MOD #25: bigger tap target on phones (h-14/w-14 ≈ 56px),
               // reverting to the desktop 44px at md+ so desktop is unchanged. ===
@@ -497,10 +541,21 @@ export function VoicePanel({
               !supported ? 'opacity-40' : '',
             ].join(' ')}
             style={{
-              borderColor: micActive ? GOLD : COOL_LINE,
-              background: micActive ? `rgba(${GOLD_RGB}, 0.14)` : 'rgba(16,26,34,0.6)',
-              color: micActive ? GOLD : COOL_DIM,
-              boxShadow: micActive ? `0 0 24px rgba(${GOLD_RGB}, 0.5)` : 'none',
+              // MOD #76: the stop-reply state is COOL. Gold stays reserved for
+              // listening — a cancel affordance is not the warm accent, and
+              // spending gold here would undo the point of MOD #56.
+              borderColor: micActive ? GOLD : stopThinking ? STOP_LINE : COOL_LINE,
+              background: micActive
+                ? `rgba(${GOLD_RGB}, 0.14)`
+                : stopThinking
+                  ? 'rgba(148,214,216,0.12)'
+                  : 'rgba(16,26,34,0.6)',
+              color: micActive ? GOLD : stopThinking ? COOL_TEXT : COOL_DIM,
+              boxShadow: micActive
+                ? `0 0 24px rgba(${GOLD_RGB}, 0.5)`
+                : stopThinking
+                  ? '0 0 18px rgba(148,214,216,0.22)'
+                  : 'none',
               transition: `border-color ${DUR_BASE}ms ${EASE}, background-color ${DUR_BASE}ms ${EASE}, color ${DUR_BASE}ms ${EASE}, box-shadow ${DUR_BASE}ms ${EASE}`,
             }}
           >
@@ -512,8 +567,8 @@ export function VoicePanel({
                 style={{ borderColor: `rgba(${GOLD_RGB}, 0.55)` }}
               />
             )}
-            {micActive ? (
-              // Stop square — the listening-state glyph swap
+            {micActive || stopThinking ? (
+              // Stop square — listening, and (MOD #76) cancelling a reply
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <rect x="5" y="5" width="14" height="14" rx="2.5" />
               </svg>
