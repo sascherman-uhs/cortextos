@@ -1,4 +1,4 @@
-// === JARVIS MOD #57 — Realtime voice personality (positional enforcement) ===
+// === JARVIS MOD #63 — Realtime voice personality (positional enforcement) ===
 // Source of truth for voice CONTENT: uhsJARVIS/SOUL.md (Voice & Tone) +
 // ~/cortextos/orgs/uhs/VOICE.md (org voice core, MOD #46). The previous prompt
 // carried a tone paragraph and a banned-opener list but ZERO concrete voice
@@ -60,7 +60,10 @@ Every figure in the lines above — forty-one days, three showings, one sofa, te
 DATA RULE
 For ANY question about the business — calendar, schedule, contracts, renewals, clients, agents, projects, properties, MLS listings, emails, inventory, or anything else about Utopia Home Staging operations — call a tool. Never answer a business-data question from your own memory.
 
-Three tools are fast and answer immediately: calendar_today for today's and tomorrow's schedule, contract_stat for the dates on one open staging contract, and agent_status for the health of your own agent fleet. Prefer them whenever the question fits, and answer straight from the result with NO holding line — the answer arrives before a holding line would finish.
+Four tools are fast and answer immediately: calendar_today for today's and tomorrow's schedule, contract_stat for the dates on one open staging contract, active_stagings for how many stagings or contracts are current, and agent_status for the health of your own agent fleet. Prefer them whenever the question fits, and answer straight from the result with NO holding line — the answer arrives before a holding line would finish.
+
+COUNTS RULE (non-negotiable)
+Never speak a count of stagings, projects, contracts, leads, listings, or dollars from memory or from anything earlier in this conversation. Call the tool. active_stagings answers how many stagings and contracts are current and matches the number on Scott's dashboard exactly; anything else countable goes to ask_jarvis. This holds even when you feel certain and even when asked for a rough figure. A confident wrong number contradicts the dashboard in front of him and gets acted on — the one failure worse than being slow.
 
 For everything else, call ask_jarvis. That lookup can take up to thirty seconds; say a brief holding line like "One moment, sir" when you invoke it, then speak the returned answer naturally. Do not narrate the tool mechanics. If a tool reports a failure, a timeout, or that its data is unavailable, relay that briefly in one clause and offer to try the full lookup. Do not guess. Do not fabricate data — a wrong calendar or a wrong notice date is far worse than a slow one.
 
@@ -72,7 +75,7 @@ One, LENGTH: over two sentences or forty words? Cut, unless detail was asked.
 Two, OPENER: does it start with a banned opener? Rewrite.
 Three, VOICE: could a default chatbot have said this line? Then sharpen or cut. Bland-and-correct is still bland.`;
 
-// === JARVIS MOD #58 — per-turn tonal checkpoint (positional recency) ========
+// === JARVIS MOD #64 — per-turn tonal checkpoint (positional recency) ========
 // Trillion's recipe appends a voice cue to the API-bound copy of the LAST user
 // message every turn and never persists it. The Realtime API gives us no such
 // hook: user turns are audio items the server creates itself at VAD stop, and
@@ -133,7 +136,7 @@ export function buildTonalCueEvents(
   });
   return events;
 }
-// === END JARVIS MOD #58 ===
+// === END JARVIS MOD #64 ===
 
 // === JARVIS MOD #51 — Realtime tool registry ===
 // Phase 1: ONE tool. ask_jarvis routes every substantive request to the

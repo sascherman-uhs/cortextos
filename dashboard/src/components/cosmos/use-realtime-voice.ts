@@ -13,7 +13,7 @@ import type {
 import { isSignoff, signoffLine } from '@/lib/voice/signoff';
 // === JARVIS MOD #54 — per-turn latency instrumentation ===
 import { TurnClock } from '@/lib/voice/latency';
-// === JARVIS MOD #58 — per-turn tonal checkpoint for the Realtime lane ===
+// === JARVIS MOD #64 — per-turn tonal checkpoint for the Realtime lane ===
 import {
   buildTonalCueEvents,
   JARVIS_TONAL_CUE_ITEM_PREFIX,
@@ -74,7 +74,7 @@ export function useRealtimeVoice(): UseVoiceResult {
   }, []);
   // === END MOD #51 fix ===
 
-  // === JARVIS MOD #58 — per-turn tonal checkpoint (positional recency) ======
+  // === JARVIS MOD #64 — per-turn tonal checkpoint (positional recency) ======
   // Session instructions are read once at mint time, so personality decays with
   // depth. After every assistant turn closes we delete the previous cue item
   // and append a fresh one at the tail: exactly one cue is ever live, and it
@@ -92,7 +92,7 @@ export function useRealtimeVoice(): UseVoiceResult {
     }
     cueItemIdRef.current = nextId;
   }, []);
-  // === END MOD #58 ===
+  // === END MOD #64 ===
 
   // WebRTC refs
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -200,7 +200,7 @@ export function useRealtimeVoice(): UseVoiceResult {
     setAmplitude(0);
     activeResponseRef.current = false;
     pendingResponseCreateRef.current = false;
-    // MOD #58: the conversation dies with the session — forget the cue item so
+    // MOD #64: the conversation dies with the session — forget the cue item so
     // the next session never tries to delete an id the server doesn't know.
     cueItemIdRef.current = null;
   }, [stopAmplitude]);
@@ -415,11 +415,11 @@ export function useRealtimeVoice(): UseVoiceResult {
             }
             // === END JARVIS MOD #51 ===
 
-            // === JARVIS MOD #58 — the assistant turn is fully closed and no
+            // === JARVIS MOD #64 — the assistant turn is fully closed and no
             // tool round-trip is outstanding: move the tonal cue to the tail so
             // it sits one item behind whatever the user says next. ===
             refreshTonalCue();
-            // === END MOD #58 ===
+            // === END MOD #64 ===
 
             // A response finished with no pending tool calls — if a turn
             // arrived while we were busy (barge-in, or sendText during a
@@ -442,7 +442,7 @@ export function useRealtimeVoice(): UseVoiceResult {
 
       dc.onopen = () => {
         mergeStats({ voicePath: 'realtime', rtcState: pc.connectionState, dcState: 'open' });
-        // MOD #58: seed the cue so turn 1 is governed by the same checkpoint
+        // MOD #64: seed the cue so turn 1 is governed by the same checkpoint
         // every later turn gets. No response.create — it is context, not a turn.
         refreshTonalCue();
       };

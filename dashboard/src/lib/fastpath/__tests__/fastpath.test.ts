@@ -178,8 +178,8 @@ describe('conversation window (B3)', () => {
   });
 });
 
-// === JARVIS MOD #58 — prompt-cache split: personality cached, checkpoint not ==
-describe('prompt-cache split (MOD #58)', () => {
+// === JARVIS MOD #64 — prompt-cache split: personality cached, checkpoint not ==
+describe('prompt-cache split (MOD #64)', () => {
   it('personality sits in the CACHED block, the tonal checkpoint in the UNCACHED one', () => {
     const orgDir = path.join(tmpRoot, 'framework', 'orgs', 'uhs');
     fs.mkdirSync(orgDir, { recursive: true });

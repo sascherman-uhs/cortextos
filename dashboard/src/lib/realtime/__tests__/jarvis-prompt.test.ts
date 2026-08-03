@@ -1,4 +1,4 @@
-// JARVIS MOD #57/#58 — realtime personality prompt invariants.
+// JARVIS MOD #63/#64 — realtime personality prompt invariants.
 //
 // These lock the things that quietly rot: the spoken word/sentence caps, the
 // banned-opener list, the presence of concrete calibration lines (adjectives
@@ -26,7 +26,7 @@ const BANNED_OPENERS = [
   'I understand',
 ];
 
-describe('realtime system prompt (MOD #57)', () => {
+describe('realtime system prompt (MOD #63)', () => {
   it('names every banned opener', () => {
     for (const opener of BANNED_OPENERS) {
       expect(JARVIS_SYSTEM_PROMPT).toContain(opener);
@@ -83,7 +83,7 @@ describe('realtime system prompt (MOD #57)', () => {
   });
 });
 
-describe('per-turn tonal cue (MOD #58)', () => {
+describe('per-turn tonal cue (MOD #64)', () => {
   it('stays short enough to re-send every turn', () => {
     expect(JARVIS_TONAL_CUE.length).toBeLessThan(1400);
     expect(JARVIS_TONAL_CUE.startsWith('[Voice check')).toBe(true);

@@ -158,7 +158,7 @@ export function assembleVolatileBlock(now: Date = new Date(), snapshot = ''): st
     '40 words MAX, 2 sentences MAX. Natural spoken register. ' +
     'Zero markdown, no emojis, no bullet lists, no URLs. ' +
     'Answer first. If it cannot be spoken in 6 seconds, it is too long — cut it.\n' +
-    // === JARVIS MOD #58 — tonal checkpoint belongs in the UNCACHED block ===
+    // === JARVIS MOD #64 — tonal checkpoint belongs in the UNCACHED block ===
     // Block 1 (cached) carries the personality: VOICE.md + the agent's
     // calibration one-liners. The per-turn CHECK on that personality is
     // volatile by design — it must be re-read at the tail of every request,
@@ -170,7 +170,7 @@ export function assembleVolatileBlock(now: Date = new Date(), snapshot = ''): st
     '"Of course", "Absolutely", "Certainly", "I understand"? Rewrite. ' +
     '(3) VOICE — could a default chatbot have written this line? Then sharpen or cut; ' +
     'bland-and-correct is still bland. Numbers in your calibration lines are STYLE, never data.'
-    // === END MOD #58 ===
+    // === END MOD #64 ===
   );
 }
 
