@@ -13,7 +13,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { getAgentDir } from '@/lib/config';
+import { getAgentDir, getFrameworkRoot } from '@/lib/config';
 
 export interface SystemBlock {
   type: 'text';
@@ -36,6 +36,19 @@ const identityCache = new Map<string, CachedIdentity>();
 // GUARDRAILS alone). Edits to any of these files invalidate the prefix cache
 // on the next call — deliberate and infrequent per the Part A rules.
 const IDENTITY_FILES = ['SOUL.md', 'IDENTITY.md', 'GUARDRAILS.md', 'CLAUDE.md'];
+
+// === JARVIS MOD #46: org-wide voice core =====================================
+// orgs/<org>/VOICE.md carries the shared voice mechanics (banned openers,
+// blade structure, cruelty floor, client brake, tonal checkpoint) for the
+// whole fleet; each agent's IDENTITY.md Vibe supplies the register + one-liner
+// calibration set. Static text only — same cache rules as the agent files.
+// Keyed in the mtime map as 'ORG:VOICE.md' so it participates in invalidation.
+const ORG_VOICE_KEY = 'ORG:VOICE.md';
+
+function orgVoicePath(org: string): string {
+  return path.join(getFrameworkRoot(), 'orgs', org, 'VOICE.md');
+}
+// === END MOD #46 =============================================================
 
 function readIfExists(p: string): { text: string; mtimeMs: number } | null {
   try {
@@ -63,11 +76,26 @@ export function assembleStableIdentity(agent: string, org: string): string {
       try { m = fs.statSync(p).mtimeMs; } catch { /* stays -1 */ }
       if (cached.mtimes[f] !== m) { fresh = false; break; }
     }
+    // === JARVIS MOD #46: org VOICE.md participates in cache invalidation ===
+    if (fresh) {
+      let m = -1;
+      try { m = fs.statSync(orgVoicePath(org)).mtimeMs; } catch { /* stays -1 */ }
+      if (cached.mtimes[ORG_VOICE_KEY] !== m) fresh = false;
+    }
+    // === END MOD #46 ===
     if (fresh) return cached.text;
   }
 
   const parts: string[] = [];
   const mtimes: Record<string, number> = {};
+  // === JARVIS MOD #46: shared org voice core loads FIRST (agent files may
+  // override register specifics; precedence text lives inside VOICE.md) ===
+  {
+    const r = readIfExists(orgVoicePath(org));
+    mtimes[ORG_VOICE_KEY] = r ? r.mtimeMs : -1;
+    if (r) parts.push(`<!-- org VOICE.md -->\n${r.text.trim()}`);
+  }
+  // === END MOD #46 ===
   for (const f of IDENTITY_FILES) {
     const p = path.join(dir, f);
     const r = readIfExists(p);
@@ -110,8 +138,22 @@ export function assembleVolatileBlock(now: Date = new Date()): string {
   return (
     `Current time: ${pt} (Pacific). Operating mode: ${mode}.\n` +
     'This is a VOICE conversation — replies are spoken aloud via TTS. ' +
-    'Keep replies to 1–3 short sentences, natural spoken register, no markdown, ' +
-    'no emojis, no lists, no URLs.'
+    '40 words MAX, 2 sentences MAX. Natural spoken register. ' +
+    'Zero markdown, no emojis, no bullet lists, no URLs. ' +
+    'Answer first. If it cannot be spoken in 6 seconds, it is too long — cut it.\n' +
+    // === JARVIS MOD #58 — tonal checkpoint belongs in the UNCACHED block ===
+    // Block 1 (cached) carries the personality: VOICE.md + the agent's
+    // calibration one-liners. The per-turn CHECK on that personality is
+    // volatile by design — it must be re-read at the tail of every request,
+    // not amortized into a cached prefix the model skims. VOICE_CUE.md still
+    // rides the last user message (fast-reply.applyVoiceCue); this is the
+    // second, positional half of the same enforcement.
+    'TONAL CHECKPOINT before you answer: (1) LENGTH — over 2 sentences or 40 words? Cut. ' +
+    '(2) OPENER — starts with "Great question", "Let me", "Based on", "Happy to help", ' +
+    '"Of course", "Absolutely", "Certainly", "I understand"? Rewrite. ' +
+    '(3) VOICE — could a default chatbot have written this line? Then sharpen or cut; ' +
+    'bland-and-correct is still bland. Numbers in your calibration lines are STYLE, never data.'
+    // === END MOD #58 ===
   );
 }
 

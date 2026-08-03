@@ -7,6 +7,17 @@ import type {
   VoiceState,
   UseVoiceResult,
 } from './use-voice';
+// === JARVIS MOD #53 — shared deterministic goodbye detector (see
+// src/lib/voice/signoff.ts). The fast path has had this since MOD #36; the
+// Realtime path was answering "thanks" with a full model turn. ===
+import { isSignoff, signoffLine } from '@/lib/voice/signoff';
+// === JARVIS MOD #54 — per-turn latency instrumentation ===
+import { TurnClock } from '@/lib/voice/latency';
+// === JARVIS MOD #58 — per-turn tonal checkpoint for the Realtime lane ===
+import {
+  buildTonalCueEvents,
+  JARVIS_TONAL_CUE_ITEM_PREFIX,
+} from '@/lib/realtime/jarvis-prompt';
 
 // GA WebRTC calls endpoint (2026): no model query param — the model is
 // already baked into the ephemeral client secret minted server-side.
@@ -42,6 +53,15 @@ export function useRealtimeVoice(): UseVoiceResult {
   // the active flag. ===
   const activeResponseRef = useRef(false);
   const pendingResponseCreateRef = useRef(false);
+
+  // === JARVIS MOD #53 — goodbye state. `hadAgentTurn` gates the detector so
+  // the very first thing said is never swallowed; `signoffIdx` rotates the
+  // canned lines so a wind-down isn't the same words every time. ===
+  const hadAgentTurnRef = useRef(false);
+  const signoffIdxRef = useRef(0);
+  // === JARVIS MOD #54 — one clock per turn (see src/lib/voice/latency.ts). ===
+  const turnClockRef = useRef(new TurnClock());
+  const turnToolRef = useRef<string | undefined>(undefined);
   const requestResponse = useCallback(() => {
     const dc = dcRef.current;
     if (!dc || dc.readyState !== 'open') return;
@@ -53,6 +73,26 @@ export function useRealtimeVoice(): UseVoiceResult {
     dc.send(JSON.stringify({ type: 'response.create' }));
   }, []);
   // === END MOD #51 fix ===
+
+  // === JARVIS MOD #58 — per-turn tonal checkpoint (positional recency) ======
+  // Session instructions are read once at mint time, so personality decays with
+  // depth. After every assistant turn closes we delete the previous cue item
+  // and append a fresh one at the tail: exactly one cue is ever live, and it
+  // sits one item behind the next user utterance instead of turn-1 deep.
+  // Rationale + API-support notes live in src/lib/realtime/jarvis-prompt.ts.
+  const cueItemIdRef = useRef<string | null>(null);
+  const cueSeqRef = useRef(0);
+  const refreshTonalCue = useCallback(() => {
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== 'open') return;
+    cueSeqRef.current += 1;
+    const nextId = `${JARVIS_TONAL_CUE_ITEM_PREFIX}${cueSeqRef.current}`;
+    for (const evt of buildTonalCueEvents(nextId, cueItemIdRef.current)) {
+      dc.send(JSON.stringify(evt));
+    }
+    cueItemIdRef.current = nextId;
+  }, []);
+  // === END MOD #58 ===
 
   // WebRTC refs
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -125,6 +165,8 @@ export function useRealtimeVoice(): UseVoiceResult {
 
   const pushAgentReply = useCallback((text: string, id: string) => {
     if (!text.trim()) return;
+    // MOD #53: the detector only ends a conversation JARVIS was part of.
+    hadAgentTurnRef.current = true;
     setLog((prev) => {
       if (prev.some((e) => e.id === id)) return prev;
       return [...prev, { id, role: 'agent', text, ts: Date.now() }];
@@ -158,6 +200,9 @@ export function useRealtimeVoice(): UseVoiceResult {
     setAmplitude(0);
     activeResponseRef.current = false;
     pendingResponseCreateRef.current = false;
+    // MOD #58: the conversation dies with the session — forget the cue item so
+    // the next session never tries to delete an id the server doesn't know.
+    cueItemIdRef.current = null;
   }, [stopAmplitude]);
 
   const startSession = useCallback(async () => {
@@ -217,9 +262,20 @@ export function useRealtimeVoice(): UseVoiceResult {
           // response.output_audio_transcript.* — see developers.openai.com
           // /api/docs/guides/realtime-conversations.
           case 'response.output_audio_transcript.delta': {
+            // MOD #54: the first transcript delta is the earliest reliable
+            // "JARVIS is audibly speaking" marker on the data channel. The
+            // clock ignores repeats, so whichever of this and
+            // output_audio_buffer.started lands first wins the measurement.
+            turnClockRef.current.firstAudio({ path: 'realtime', tool: turnToolRef.current });
             if (typeof msg.delta === 'string') {
               setInterim((prev) => prev + msg.delta);
             }
+            break;
+          }
+          case 'output_audio_buffer.started': {
+            // MOD #54: WebRTC-only event; fires when audio actually starts
+            // flowing, usually a beat before the first transcript delta.
+            turnClockRef.current.firstAudio({ path: 'realtime', tool: turnToolRef.current });
             break;
           }
           case 'response.output_audio_transcript.done': {
@@ -245,6 +301,9 @@ export function useRealtimeVoice(): UseVoiceResult {
             break;
           }
           case 'input_audio_buffer.speech_stopped': {
+            // MOD #54: THE measurement origin — everything after this is wait.
+            turnClockRef.current.stop();
+            turnToolRef.current = undefined;
             setState('processing');
             break;
           }
@@ -253,11 +312,42 @@ export function useRealtimeVoice(): UseVoiceResult {
             // not nested under item.content[] like the beta event.
             const userText = (msg as { transcript?: string }).transcript?.trim() ?? '';
             if (userText) {
+              turnClockRef.current.transcript();
               const uid = `realtime-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
               setLog((prev) => {
                 if (prev.some((entry) => entry.text === userText && entry.role === 'user')) return prev;
                 return [...prev, { id: uid, role: 'user', text: userText, ts: Date.now() }];
               });
+
+              // === JARVIS MOD #53 — goodbye detection on the Realtime path ===
+              // Honest limitation: server VAD auto-creates the response as soon
+              // as speech stops, and transcription is what the detector needs,
+              // so we cannot gate the model call the way the fast path does —
+              // we can only cut it short. `response.cancel` stops generation
+              // within a word or two and we speak a canned local line instead,
+              // which is what the user actually hears. Gating it properly would
+              // mean turn_detection.create_response:false, i.e. adding whisper
+              // transcription latency to EVERY turn to save it on a few — the
+              // wrong trade for a latency phase. Revisit if OpenAI exposes a
+              // transcript-before-response hook.
+              if (isSignoff(userText, hadAgentTurnRef.current)) {
+                const channel = dcRef.current;
+                if (channel?.readyState === 'open' && activeResponseRef.current) {
+                  channel.send(JSON.stringify({ type: 'response.cancel' }));
+                }
+                activeResponseRef.current = false;
+                pendingResponseCreateRef.current = false;
+                const line = signoffLine(signoffIdxRef.current);
+                signoffIdxRef.current += 1;
+                ttsBridgeRef.current?.interrupt();
+                ttsBridgeRef.current?.speakLocal(line);
+                turnClockRef.current.firstAudio({ path: 'realtime', signoff: true });
+                setInterim('');
+                // Wind down to the wake gate — no spinner limbo.
+                setState('wakeListening');
+                break;
+              }
+              // === END JARVIS MOD #53 ===
             }
             break;
           }
@@ -277,6 +367,10 @@ export function useRealtimeVoice(): UseVoiceResult {
             }).response?.output;
             const calls = (output ?? []).filter((o) => o.type === 'function_call' && o.call_id && o.name);
             if (calls.length > 0) {
+              // MOD #54: tag the turn so the latency line says WHICH tool the
+              // wait paid for — a slow ask_jarvis and a slow fast lane look
+              // identical in the log otherwise.
+              turnToolRef.current = calls.map((c) => c.name).filter(Boolean).join('+');
               setState('responding');
               // MOD #51 fix: run all calls concurrently, but send exactly ONE
               // response.create after every function_call_output has landed —
@@ -321,6 +415,12 @@ export function useRealtimeVoice(): UseVoiceResult {
             }
             // === END JARVIS MOD #51 ===
 
+            // === JARVIS MOD #58 — the assistant turn is fully closed and no
+            // tool round-trip is outstanding: move the tonal cue to the tail so
+            // it sits one item behind whatever the user says next. ===
+            refreshTonalCue();
+            // === END MOD #58 ===
+
             // A response finished with no pending tool calls — if a turn
             // arrived while we were busy (barge-in, or sendText during a
             // tool round-trip), fire the deferred response.create now.
@@ -342,6 +442,9 @@ export function useRealtimeVoice(): UseVoiceResult {
 
       dc.onopen = () => {
         mergeStats({ voicePath: 'realtime', rtcState: pc.connectionState, dcState: 'open' });
+        // MOD #58: seed the cue so turn 1 is governed by the same checkpoint
+        // every later turn gets. No response.create — it is context, not a turn.
+        refreshTonalCue();
       };
 
       // Step 7: Set up remote audio
@@ -393,7 +496,7 @@ export function useRealtimeVoice(): UseVoiceResult {
       setState('dormant');
       mergeStats({ voicePath: 'realtime', rtcState: 'failed', rtcError: String(err) });
     }
-  }, [pushAgentReply, startAmplitude, stopSession]);
+  }, [pushAgentReply, startAmplitude, stopSession, refreshTonalCue]);
 
   const sendText = useCallback((text: string) => {
     const trimmed = text.trim();
