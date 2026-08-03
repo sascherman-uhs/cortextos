@@ -142,3 +142,22 @@ describe('spokenList — reads as speech, not as an array', () => {
     expect(spokenList([])).toBe('');
   });
 });
+
+// === JARVIS MOD #55/#56 — the prompt must actually route counts to the tool ===
+// The prompt is a shared hot file that several agents rewrite; a rewrite from an
+// older base silently dropped active_stagings from the prose once already, which
+// would put the Realtime lane straight back to free-answering counts.
+describe('the Realtime prompt routes counts through a tool', () => {
+  it('registers active_stagings as a callable tool', async () => {
+    const { JARVIS_REALTIME_TOOLS } = await import('../jarvis-prompt');
+    expect(JARVIS_REALTIME_TOOLS.map((t) => t.name)).toContain('active_stagings');
+  });
+  it('names active_stagings in the prose, not just the registry', async () => {
+    const { JARVIS_SYSTEM_PROMPT } = await import('../jarvis-prompt');
+    expect(JARVIS_SYSTEM_PROMPT).toContain('active_stagings');
+  });
+  it('forbids speaking a count from memory', async () => {
+    const { JARVIS_SYSTEM_PROMPT } = await import('../jarvis-prompt');
+    expect(JARVIS_SYSTEM_PROMPT).toContain('COUNTS RULE');
+  });
+});
