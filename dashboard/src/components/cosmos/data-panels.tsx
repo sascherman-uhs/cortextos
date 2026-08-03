@@ -8,6 +8,9 @@
 // unavailable (derive-from-owned-data rule — never fabricate). UHS palette.
 
 import { useCallback, useEffect, useState } from 'react';
+// === JARVIS MOD #56: cool chrome tokens (no gold outside the listening state) ===
+import { COOL_TEXT, COOL_DIM, COOL_LINE } from './palette';
+// === END JARVIS MOD #56 ===
 
 type Metric<T> = { ok: true; value: T } | { ok: false; unavailable: string };
 
@@ -109,20 +112,57 @@ interface StatCardProps {
   hint?: string;
 }
 
+// === JARVIS MOD #56: stat chrome de-warmed. These tiles carried UHS gold
+// labels and a gold text-shadow at every state, which put permanent warm
+// accents all over an otherwise cool scene and stole the "listening" moment. ===
+// === JARVIS MOD #59: desktop keeps the absolutely-positioned cards; on a phone
+// the five tiles used to stack down the left edge ON TOP of the orb (critic
+// defect #7 — the hero was buried). Below md they render once, in a compact
+// horizontally-scrollable strip pinned under the header instead. ===
 function StatCard({ label, value, position, testId, hint }: StatCardProps) {
   return (
     <div
       data-testid={testId}
-      className={`pointer-events-auto absolute z-10 min-w-[9rem] rounded-2xl border border-white/10 px-4 py-3 backdrop-blur-xl ${position}`}
-      style={{ background: 'rgba(45,41,40,0.5)' }}
+      className={`pointer-events-auto absolute z-10 hidden min-w-[9rem] rounded-2xl border px-4 py-3 backdrop-blur-xl md:block ${position}`}
+      style={{ background: 'rgba(16,26,34,0.55)', borderColor: COOL_LINE }}
       title={hint}
     >
-      <div className="text-[10px] uppercase tracking-[0.18em] text-[#CFB383]">
+      <div
+        className="text-[10px] uppercase tracking-[0.18em]"
+        style={{ color: COOL_DIM }}
+      >
         {label}
       </div>
       <div
-        className="mt-1 text-2xl font-light text-[#EDE8DF] [text-shadow:0_0_16px_rgba(207,179,131,0.25)]"
+        className="mt-1 text-2xl font-light [text-shadow:0_0_16px_rgba(94,234,212,0.22)]"
+        style={{ color: COOL_TEXT }}
         data-testid={`${testId}-value`}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+/** MOD #59: the mobile counterpart — one compact, swipeable chip per metric. */
+function StatChip({ label, value, testId, hint }: Omit<StatCardProps, 'position'>) {
+  return (
+    <div
+      data-testid={`${testId}-chip`}
+      className="pointer-events-auto shrink-0 snap-start rounded-xl border px-3 py-1.5 backdrop-blur-xl"
+      style={{ background: 'rgba(16,26,34,0.55)', borderColor: COOL_LINE }}
+      title={hint}
+    >
+      <div
+        className="text-[9px] uppercase tracking-[0.16em] whitespace-nowrap"
+        style={{ color: COOL_DIM }}
+      >
+        {label}
+      </div>
+      <div
+        className="text-base font-light leading-tight"
+        style={{ color: COOL_TEXT }}
+        data-testid={`${testId}-chip-value`}
       >
         {value}
       </div>
@@ -134,79 +174,79 @@ export function DataPanels() {
   const stats = useCosmosStats(60_000);
   const voice = useVoiceMetrics(1_000);
 
+  // One list, rendered twice: absolute cards on desktop, a strip on mobile.
+  const metrics: Omit<StatCardProps, 'position'>[] = [
+    {
+      testId: 'panel-active-stagings',
+      label: 'Active Stagings',
+      value: metricText(stats?.activeStagings, (v) => String(v)),
+      hint:
+        stats?.activeStagings && !stats.activeStagings.ok
+          ? stats.activeStagings.unavailable
+          : undefined,
+    },
+    {
+      testId: 'panel-pending-tasks',
+      label: 'Pending Tasks',
+      value: metricText(stats?.pendingTasks, (v) => String(v)),
+      hint:
+        stats?.pendingTasks && !stats.pendingTasks.ok ? stats.pendingTasks.unavailable : undefined,
+    },
+    {
+      testId: 'panel-fleet-uptime',
+      label: 'Fleet Uptime',
+      value: metricText(stats?.fleetUptime, (v) => v.label),
+      hint: stats?.fleetUptime && !stats.fleetUptime.ok ? stats.fleetUptime.unavailable : undefined,
+    },
+    {
+      testId: 'panel-telegram-today',
+      label: 'Telegram Today',
+      value: metricText(stats?.telegramToday, (v) => String(v)),
+      hint:
+        stats?.telegramToday && !stats.telegramToday.ok
+          ? stats.telegramToday.unavailable
+          : undefined,
+    },
+    {
+      testId: 'panel-mls-new',
+      label: 'MLS New Today',
+      value: metricText(stats?.mlsNewToday, (v) => String(v)),
+      hint: stats?.mlsNewToday && !stats.mlsNewToday.ok ? stats.mlsNewToday.unavailable : undefined,
+    },
+    {
+      testId: 'panel-voice-latency',
+      label: voice.hitPct === null ? 'Voice Reply' : `Voice · ${voice.hitPct}% fast`,
+      value: voice.samples > 0 ? `${(voice.p50Ms / 1000).toFixed(1)}s` : '—',
+      hint:
+        voice.samples > 0
+          ? `p50 of ${voice.samples} spoken turns (user-stopped → first audible). ${voice.hitPct ?? 0}% answered by the fast lane.`
+          : 'No spoken turns yet this session.',
+    },
+  ];
+
   return (
     <>
-      {/* MOD #38: fast-lane latency + hit-rate — the "is JARVIS answering fast?" readout */}
-      <StatCard
-        testId="panel-voice-latency"
-        label={
-          voice.hitPct === null
-            ? 'Voice Reply'
-            : `Voice · ${voice.hitPct}% fast`
-        }
-        value={voice.samples > 0 ? `${(voice.p50Ms / 1000).toFixed(1)}s` : '—'}
-        position="left-6 top-72"
-        hint={
-          voice.samples > 0
-            ? `p50 of ${voice.samples} spoken turns (user-stopped → first audible). ${voice.hitPct ?? 0}% answered by the fast lane.`
-            : 'No spoken turns yet this session.'
-        }
-      />
-      <StatCard
-        testId="panel-active-stagings"
-        label="Active Stagings"
-        value={metricText(stats?.activeStagings, (v) => String(v))}
-        position="left-6 top-24"
-        hint={
-          stats?.activeStagings && !stats.activeStagings.ok
-            ? stats.activeStagings.unavailable
-            : undefined
-        }
-      />
-      <StatCard
-        testId="panel-pending-tasks"
-        label="Pending Tasks"
-        value={metricText(stats?.pendingTasks, (v) => String(v))}
-        position="left-6 top-48"
-        hint={
-          stats?.pendingTasks && !stats.pendingTasks.ok
-            ? stats.pendingTasks.unavailable
-            : undefined
-        }
-      />
-      <StatCard
-        testId="panel-fleet-uptime"
-        label="Fleet Uptime"
-        value={metricText(stats?.fleetUptime, (v) => v.label)}
-        position="right-6 top-24"
-        hint={
-          stats?.fleetUptime && !stats.fleetUptime.ok
-            ? stats.fleetUptime.unavailable
-            : undefined
-        }
-      />
-      <StatCard
-        testId="panel-telegram-today"
-        label="Telegram Today"
-        value={metricText(stats?.telegramToday, (v) => String(v))}
-        position="right-6 top-48"
-        hint={
-          stats?.telegramToday && !stats.telegramToday.ok
-            ? stats.telegramToday.unavailable
-            : undefined
-        }
-      />
-      <StatCard
-        testId="panel-mls-new"
-        label="MLS New Today"
-        value={metricText(stats?.mlsNewToday, (v) => String(v))}
-        position="bottom-8 left-1/2 -translate-x-1/2"
-        hint={
-          stats?.mlsNewToday && !stats.mlsNewToday.ok
-            ? stats.mlsNewToday.unavailable
-            : undefined
-        }
-      />
+      {/* MOD #59: mobile strip — scrolls horizontally, never covers the orb */}
+      <div
+        data-testid="panel-strip-mobile"
+        className="pointer-events-auto fixed inset-x-0 z-10 flex snap-x gap-2 overflow-x-auto px-3 pb-1 md:hidden"
+        style={{
+          top: 'calc(3.25rem + env(safe-area-inset-top))',
+          scrollbarWidth: 'none',
+        }}
+      >
+        {metrics.map((m) => (
+          <StatChip key={m.testId} {...m} />
+        ))}
+      </div>
+
+      {/* Desktop: the original absolutely-positioned cards, unchanged layout */}
+      <StatCard {...metrics[0]} position="left-6 top-24" />
+      <StatCard {...metrics[1]} position="left-6 top-48" />
+      <StatCard {...metrics[5]} position="left-6 top-72" />
+      <StatCard {...metrics[2]} position="right-6 top-24" />
+      <StatCard {...metrics[3]} position="right-6 top-48" />
+      <StatCard {...metrics[4]} position="bottom-8 left-1/2 -translate-x-1/2" />
     </>
   );
 }

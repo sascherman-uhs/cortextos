@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Sora, JetBrains_Mono } from "next/font/google";
 import { ThemeProvider } from "@/components/theme-provider";
 import { SessionProvider } from "@/components/session-provider";
@@ -19,13 +19,23 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "cortextOS Dashboard",
   description: "cortextOS agent orchestration dashboard",
-  viewport: "width=device-width, initial-scale=1, viewport-fit=cover",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
     title: "cortextOS",
   },
 };
+
+// === JARVIS MOD #61 (2026-08-03): `viewport` inside `metadata` is unsupported
+// in the App Router and logged a deprecation warning on EVERY page render
+// (critic defect #10 — a permanently noisy console). It belongs in its own
+// `viewport` export; /jarvis already had one, the root layout did not. ===
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
+// === END JARVIS MOD #61 ===
 
 export default function RootLayout({
   children,

@@ -13,6 +13,9 @@ import * as THREE from 'three';
 import { createOrbMaterial, createGlowMaterial } from './orb-shader';
 import { NodeWeb } from './node-web';
 import { TEAL, MINT } from './palette';
+// === JARVIS MOD #57: shared smoothing helpers (nothing snaps) ===
+import { approach, approachAsym } from './motion';
+// === END JARVIS MOD #57 ===
 
 interface OrbProps {
   /** Surface displacement amplitude (idle breathing → live mic/TTS amplitude). */
@@ -51,19 +54,46 @@ export function Orb({
   const smoothRing = useRef(0);
 
   const orbMat = useMemo(() => createOrbMaterial(color, rim), []); // eslint-disable-line react-hooks/exhaustive-deps
-  const glowMat = useMemo(() => createGlowMaterial(rim), []); // eslint-disable-line react-hooks/exhaustive-deps
+  // === JARVIS MOD #57 — three glow layers (2026-08-03).
+  // The spec calls for wide atmospheric bloom + medium halo + bright inner core,
+  // all additive, wrapping the fresnel-rimmed wireframe. Previously ONE shell,
+  // which read flat and let the orb's silhouette die into the nebula. ===
+  const bloomMat = useMemo(() => createGlowMaterial(rim, { power: 2.6, strength: 0.032 }), []); // eslint-disable-line react-hooks/exhaustive-deps
+  const haloMat = useMemo(() => createGlowMaterial(rim, { power: 3.2, strength: 0.26 }), []); // eslint-disable-line react-hooks/exhaustive-deps
+  const coreMat = useMemo(
+    () => createGlowMaterial(color, { power: 2.4, strength: 0.16, core: 1, side: THREE.FrontSide }),
+    [], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  // Asymmetric voice-brightness envelope: leaps on syllables, releases slowly.
+  const voiceBright = useRef(brightness);
+  // === END JARVIS MOD #57 ===
 
   useFrame((state, delta) => {
     const t = state.clock.elapsedTime;
+    // Guard against tab-resume delta spikes (a 30s delta would still snap).
+    const dt = Math.min(delta, 0.1);
+
+    // === JARVIS MOD #57: fast attack (~60ms half-life), slow decay (~380ms),
+    // plus the spec's ~4s idle sine so the orb is never static even at rest. ===
+    voiceBright.current = approachAsym(voiceBright.current, brightness, 0.06, 0.38, dt);
+    const idlePulse = 1 + Math.sin((t * Math.PI * 2) / 4) * 0.045;
+    const vb = voiceBright.current * idlePulse;
+    // === END JARVIS MOD #57 ===
 
     // Drive orb shader uniforms from live props.
     orbMat.uniforms.uTime.value = t;
     orbMat.uniforms.uAmp.value = amplitude * 3.7; // scale idle(0.035) → visible roil
-    orbMat.uniforms.uBrightness.value = brightness;
+    orbMat.uniforms.uBrightness.value = vb;
     (orbMat.uniforms.uColor.value as THREE.Color).set(color);
     (orbMat.uniforms.uRimColor.value as THREE.Color).set(rim);
-    (glowMat.uniforms.uColor.value as THREE.Color).set(rim);
-    glowMat.uniforms.uStrength.value = 0.45 * brightness;
+    // === JARVIS MOD #57: all three layers track live color + the eased envelope ===
+    (bloomMat.uniforms.uColor.value as THREE.Color).set(rim);
+    (haloMat.uniforms.uColor.value as THREE.Color).set(rim);
+    (coreMat.uniforms.uColor.value as THREE.Color).set(color);
+    bloomMat.uniforms.uStrength.value = 0.032 * vb;
+    haloMat.uniforms.uStrength.value = 0.26 * vb;
+    coreMat.uniforms.uStrength.value = 0.16 * vb;
+    // === END JARVIS MOD #57 ===
 
     // Slow two-axis tumble.
     if (groupRef.current) {
@@ -72,7 +102,7 @@ export function Orb({
     }
 
     // Ease ring strength so processing enter/exit is smooth.
-    smoothRing.current += (ringStrength - smoothRing.current) * Math.min(delta * 3, 1);
+    smoothRing.current = approach(smoothRing.current, ringStrength, 0.22, dt);
     const rs = smoothRing.current;
     if (ring1Ref.current && ring2Ref.current) {
       ring1Ref.current.rotation.z = t * 0.9;
@@ -96,12 +126,27 @@ export function Orb({
         <icosahedronGeometry args={[1.55, detail]} />
       </mesh>
 
-      {/* Additive glow shell */}
+      {/* === JARVIS MOD #57: three additive glow layers, outer → inner.
+          Low-perf drops the bloom + core but KEEPS the halo — the mobile hero
+          orb reads as a bare wireframe without it (MOD #59). === */}
+      <mesh material={haloMat}>
+        <icosahedronGeometry args={[1.92, showGlow ? 5 : 3]} />
+      </mesh>
       {showGlow && (
-        <mesh material={glowMat}>
-          <icosahedronGeometry args={[1.85, 3]} />
-        </mesh>
+        <>
+          {/* Wide atmospheric bloom. detail 5, not 3 — at this radius a coarse
+              icosahedron showed its own facet silhouette through the gradient. */}
+          <mesh material={bloomMat}>
+            <icosahedronGeometry args={[2.45, 5]} />
+          </mesh>
+          {/* Bright inner core (front-side, center-bright) — deliberately faint:
+              it lifts the orb's centre, it does not fill it. */}
+          <mesh material={coreMat}>
+            <icosahedronGeometry args={[1.15, 4]} />
+          </mesh>
+        </>
       )}
+      {/* === END JARVIS MOD #57 === */}
 
       {/* Sparse internal node-web (tumbles with the orb) */}
       {internalNodes > 0 && (

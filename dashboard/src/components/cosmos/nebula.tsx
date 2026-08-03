@@ -94,7 +94,11 @@ export function GlowPool({ color }: { color: string }) {
       new THREE.ShaderMaterial({
         uniforms: {
           uColor: { value: new THREE.Color(color) },
-          uStrength: { value: 0.42 },
+          // MOD #57: 0.42 → 0.15. With the orb's new three-layer glow stacked on
+          // top, the old pool strength washed the whole frame — and a wide gold
+          // pool over the navy nebula reads BROWN, not gold. The orb's own halo
+          // now carries the warm accent; the pool only seats the orb in space.
+          uStrength: { value: 0.15 },
         },
         vertexShader: POOL_VERT,
         fragmentShader: POOL_FRAG,

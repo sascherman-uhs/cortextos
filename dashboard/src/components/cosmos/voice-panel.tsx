@@ -11,7 +11,11 @@
 //    same send path as the mic.
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+// === JARVIS MOD #56/#55: the one warm accent + the one easing curve ===
+import { GOLD, GOLD_RGB, COOL_TEXT, COOL_DIM, COOL_LINE, CYAN, PURPLE } from './palette';
+import { EASE, DUR_BASE } from './motion';
+// === END JARVIS MOD #56/#55 ===
 // === JARVIS MOD #50 — OpenAI Realtime voice hook (feature-flagged) ===
 import { useRealtimeVoice } from './use-realtime-voice';
 import { useVoice, type VoiceState } from './use-voice';
@@ -378,7 +382,39 @@ export function VoicePanel({
   }, []);
   // === END MOD #47 ===
 
-  const micActive = state === 'listening';
+  // === JARVIS MOD #60 — ONE mic-state source of truth (2026-08-03) ===
+  // The status line read `openMic` (the wake-word toggle) and printed it as
+  // "mic off", while the mic BUTTON read `state === 'listening'` — two
+  // different concepts rendered with the same word, so the two halves of the
+  // same control row routinely disagreed (critic defect #2). Everything that
+  // renders mic state now derives from this one object, and the wake toggle is
+  // labelled as its own thing rather than as "the mic".
+  const micStatus = useMemo(() => {
+    const listening = displayState === 'listening';
+    return {
+      displayState,
+      listening,
+      /** Capturing right now — this is what the button's warm state means. */
+      hot: listening,
+      /** Wake-word armed: hot mic waiting for its name, but not capturing a turn. */
+      armed: openMic && !listening && displayState !== 'dormant',
+      openMic,
+      supported,
+      label: supported
+        ? STATE_LABEL[displayState]
+        : 'Voice not supported — use the box below',
+    };
+  }, [displayState, openMic, supported]);
+  const micActive = micStatus.hot;
+  // Status dot: gold only while listening; cool everywhere else (MOD #56).
+  const dotColor = micStatus.listening
+    ? GOLD
+    : displayState === 'processing' || displayState === 'responding'
+      ? PURPLE
+      : displayState === 'speaking'
+        ? CYAN
+        : COOL_DIM;
+  // === END JARVIS MOD #60 ===
 
   return (
     <div
@@ -391,14 +427,21 @@ export function VoicePanel({
         paddingRight: 'calc(1rem + env(safe-area-inset-right))',
       }}
     >
-      <div className="pointer-events-auto w-full max-w-xl rounded-2xl border border-white/15 bg-[#2D2928]/60 p-4 text-[#EDE8DF] shadow-2xl backdrop-blur-xl">
+      <div
+        className="pointer-events-auto w-full max-w-xl rounded-2xl border p-3 shadow-2xl backdrop-blur-xl md:p-4"
+        style={{
+          background: 'rgba(10,20,28,0.62)',
+          borderColor: COOL_LINE,
+          color: COOL_TEXT,
+        }}
+      >
         {/* Conversation log */}
         <div
-          className="mb-3 max-h-48 space-y-2 overflow-y-auto pr-1"
+          className="mb-3 max-h-28 space-y-2 overflow-y-auto pr-1 md:max-h-48"
           data-testid="cosmos-log"
         >
           {log.length === 0 && (
-            <p className="text-center text-xs text-[#CFB383]/50">
+            <p className="text-center text-xs" style={{ color: `${COOL_DIM}99` }}>
               Ask JARVIS anything.
             </p>
           )}
@@ -410,7 +453,7 @@ export function VoicePanel({
                   ? 'text-right text-sm text-[#EDE8DF]'
                   : entry.role === 'heard'
                     ? 'text-right text-xs italic text-[#EDE8DF]/35'
-                    : 'text-left text-sm text-[#CFB383]'
+                    : 'text-left text-sm text-[#7fe3d8]'
               }
               data-testid={
                 entry.role === 'agent'
@@ -435,33 +478,77 @@ export function VoicePanel({
         )}
 
         {/* Controls row */}
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          {/* === JARVIS MOD #56 — the ONE warm moment (2026-08-03).
+              Was backwards: gold at rest, flat cream while listening. Now the
+              idle button is cool glass, and LISTENING is the only place UHS
+              gold appears — gold border + fill + stop-square glyph + 24px gold
+              glow + the 1.4s expanding pulse ring (cosmos-pulse-ring). === */}
           <button
             onClick={handleMicPress}
             disabled={!supported || state === 'processing'}
             aria-label={micActive ? 'Stop listening' : 'Start voice input'}
             data-testid="cosmos-mic"
+            data-listening={micActive ? 'true' : 'false'}
             className={[
               // === JARVIS MOD #25: bigger tap target on phones (h-14/w-14 ≈ 56px),
               // reverting to the desktop 44px at md+ so desktop is unchanged. ===
-              'flex h-14 w-14 md:h-11 md:w-11 shrink-0 items-center justify-center rounded-full border transition-colors',
-              micActive
-                ? 'animate-pulse border-[#F5F0E6] bg-[#F5F0E6]/20 text-[#F5F0E6]'
-                : 'border-[#CFB383]/50 bg-[#CFB383]/10 text-[#CFB383] hover:bg-[#CFB383]/20',
+              'relative flex h-14 w-14 md:h-11 md:w-11 shrink-0 items-center justify-center rounded-full border',
               !supported ? 'opacity-40' : '',
             ].join(' ')}
+            style={{
+              borderColor: micActive ? GOLD : COOL_LINE,
+              background: micActive ? `rgba(${GOLD_RGB}, 0.14)` : 'rgba(16,26,34,0.6)',
+              color: micActive ? GOLD : COOL_DIM,
+              boxShadow: micActive ? `0 0 24px rgba(${GOLD_RGB}, 0.5)` : 'none',
+              transition: `border-color ${DUR_BASE}ms ${EASE}, background-color ${DUR_BASE}ms ${EASE}, color ${DUR_BASE}ms ${EASE}, box-shadow ${DUR_BASE}ms ${EASE}`,
+            }}
           >
-            {/* Simple mic glyph (no icon dep needed here) */}
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-              <line x1="12" y1="19" x2="12" y2="23" />
-            </svg>
+            {/* 1.4s expanding pulse ring — listening only */}
+            {micActive && (
+              <span
+                aria-hidden="true"
+                className="cosmos-pulse-ring"
+                style={{ borderColor: `rgba(${GOLD_RGB}, 0.55)` }}
+              />
+            )}
+            {micActive ? (
+              // Stop square — the listening-state glyph swap
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <rect x="5" y="5" width="14" height="14" rx="2.5" />
+              </svg>
+            ) : (
+              // Simple mic glyph (no icon dep needed here)
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="23" />
+              </svg>
+            )}
           </button>
 
-          <span className="flex-1 text-sm text-[#EDE8DF]/80" data-testid="cosmos-status">
+          <span
+            className="flex flex-1 items-center gap-2 text-sm"
+            style={{ color: `${COOL_TEXT}cc` }}
+            data-testid="cosmos-status"
+          >
+            {/* === JARVIS MOD #60: 10px status dot — same source as the button === */}
+            <span
+              aria-hidden="true"
+              data-testid="cosmos-status-dot"
+              className={micStatus.listening ? 'cosmos-dot-pulse' : ''}
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: 9999,
+                background: dotColor,
+                boxShadow: micStatus.listening ? `0 0 10px rgba(${GOLD_RGB}, 0.8)` : 'none',
+                transition: `background-color ${DUR_BASE}ms ${EASE}, box-shadow ${DUR_BASE}ms ${EASE}`,
+                flexShrink: 0,
+              }}
+            />
             {/* === JARVIS MOD #36: label follows displayState (incl. 'speaking') === */}
-            {supported ? STATE_LABEL[displayState] : 'Voice not supported — use the box below'}
+            <span className="truncate">{micStatus.label}</span>
           </span>
 
           {/* === JARVIS MOD #36: open-mic toggle — the privacy control. ON = hot
@@ -523,7 +610,7 @@ export function VoicePanel({
                 : uploadState === 'error'
                   ? 'border-red-400/50 bg-red-400/10 text-red-400'
                   : uploadState === 'uploading'
-                    ? 'animate-pulse border-[#CFB383]/50 bg-[#CFB383]/10 text-[#CFB383]'
+                    ? 'animate-pulse border-[#5eead4]/40 bg-[#5eead4]/10 text-[#7fe3d8]'
                     : 'border-white/20 bg-white/5 text-[#EDE8DF]/50 hover:bg-white/10 hover:text-[#EDE8DF]/80',
             ].join(' ')}
           >
@@ -558,7 +645,7 @@ export function VoicePanel({
               'flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-colors',
               muted
                 ? 'border-white/20 bg-white/5 text-[#EDE8DF]/40'
-                : 'border-[#CFB383]/50 bg-[#CFB383]/10 text-[#CFB383] hover:bg-[#CFB383]/20',
+                : 'border-[#5eead4]/40 bg-[#5eead4]/10 text-[#7fe3d8] hover:bg-[#5eead4]/20',
             ].join(' ')}
           >
             {muted ? (
@@ -593,7 +680,7 @@ export function VoicePanel({
         {/* === JARVIS MOD #39: mic-debug line — the mic pipeline's live state,
             always visible (dim). A suspended AudioContext + dead VAD was
             indistinguishable from "working" on 2026-07-08; never again. === */}
-        <MicDebugLine openMic={openMic} />
+        <MicDebugLine status={micStatus} />
         {/* === END JARVIS MOD #39 === */}
 
         {/* Hidden Playwright test hooks — feed the EXACT same send path as voice.
@@ -608,12 +695,12 @@ export function VoicePanel({
             }}
             placeholder="Type a message…"
             data-testid="synth-transcript"
-            className="flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-sm text-[#EDE8DF] placeholder:text-[#EDE8DF]/30 focus:border-[#CFB383]/50 focus:outline-none"
+            className="flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-1.5 text-sm text-[#EDE8DF] placeholder:text-[#EDE8DF]/30 focus:border-[#5eead4]/60 focus:outline-none"
           />
           <button
             onClick={handleSynthSend}
             data-testid="synth-send"
-            className="rounded-lg border border-[#9E7331]/60 bg-[#9E7331]/20 px-3 py-1.5 text-sm text-[#CFB383] hover:bg-[#9E7331]/30"
+            className="rounded-lg border border-[#2dd4bf]/45 bg-[#2dd4bf]/15 px-3 py-1.5 text-sm text-[#9df0e3] hover:bg-[#2dd4bf]/25"
           >
             Send
           </button>
@@ -629,7 +716,19 @@ export function VoicePanel({
 // line: mic on/off · audio-context state · live VAD energy vs threshold ·
 // last wake-gate decision. MOD #31's rule generalized: every silent failure
 // mode of the audio pipeline must be readable off the phone screen.
-function MicDebugLine({ openMic }: { openMic: boolean }) {
+// === JARVIS MOD #60: takes the SAME derived status object the mic button and
+// the status dot render from, so the debug line can no longer contradict the
+// control next to it. "mic" now means capture state (hot/armed/off) and the
+// wake-word toggle is reported separately as `wake`. ===
+interface MicStatus {
+  listening: boolean;
+  hot: boolean;
+  armed: boolean;
+  openMic: boolean;
+}
+
+function MicDebugLine({ status }: { status: MicStatus }) {
+  const { hot, armed, openMic } = status;
   const [line, setLine] = useState('');
   useEffect(() => {
     const read = () => {
@@ -649,14 +748,15 @@ function MicDebugLine({ openMic }: { openMic: boolean }) {
         : '';
       // MOD #39d: build stamp — "does the gray line say v39g?" instantly
       // answers whether the installed PWA pulled fresh JS (iOS staleness lore).
+      const mic = hot ? 'hot' : armed ? 'armed' : 'off';
       setLine(
-        `v39i · mic ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
+        `v60 · mic ${mic} · wake ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
       );
     };
     read();
     const t = setInterval(read, 500);
     return () => clearInterval(t);
-  }, [openMic]);
+  }, [hot, armed, openMic]);
   return (
     <p
       className="mt-1 truncate text-[10px] text-[#EDE8DF]/30"
