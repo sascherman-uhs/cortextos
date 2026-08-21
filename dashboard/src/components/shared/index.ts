@@ -13,6 +13,9 @@ export type { CategoryBadgeProps } from './category-badge';
 export { OrgBadge } from './org-badge';
 export type { OrgBadgeProps } from './org-badge';
 
+export { OriginBadge } from './origin-badge';
+export type { OriginBadgeProps } from './origin-badge';
+
 export { RuntimeBadge } from './runtime-badge';
 export type { RuntimeBadgeProps } from './runtime-badge';
 

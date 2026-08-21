@@ -21,27 +21,43 @@ interface KanbanBoardProps {
   renderCard?: (task: Task) => ReactNode;
 }
 
+const PRIORITY_RANK: Record<string, number> = {
+  critical: 5,
+  urgent: 4,
+  high: 3,
+  normal: 2,
+  low: 1,
+};
+
+function sortTasks(list: Task[]): Task[] {
+  return [...list].sort((a, b) => {
+    const rankDiff = (PRIORITY_RANK[b.priority] ?? 2) - (PRIORITY_RANK[a.priority] ?? 2);
+    if (rankDiff !== 0) return rankDiff;
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  });
+}
+
 export function KanbanBoard({ tasks, completedTodayTasks, onTaskClick, renderCard }: KanbanBoardProps) {
   const columns: KanbanColumn[] = [
     {
       status: 'pending',
       label: 'Pending',
-      tasks: tasks.filter((t) => t.status === 'pending'),
+      tasks: sortTasks(tasks.filter((t) => t.status === 'pending')),
     },
     {
       status: 'in_progress',
       label: 'In Progress',
-      tasks: tasks.filter((t) => t.status === 'in_progress'),
+      tasks: sortTasks(tasks.filter((t) => t.status === 'in_progress')),
     },
     {
       status: 'blocked',
       label: 'Blocked',
-      tasks: tasks.filter((t) => t.status === 'blocked'),
+      tasks: sortTasks(tasks.filter((t) => t.status === 'blocked')),
     },
     {
       status: 'completed',
       label: 'Completed',
-      tasks: completedTodayTasks,
+      tasks: sortTasks(completedTodayTasks),
     },
   ];
 
