@@ -492,6 +492,15 @@ export function collectTelegramCommands(scanDirs: string[]): { command: string; 
       commands.push({ command: cmd, description });
     }
   }
+  // LOCAL MOD #51 (2026-08-30): Telegram's setMyCommands rejects >100 entries (BOT_COMMANDS_TOO_MUCH).
+  // scanDirs is [agentDir, frameworkRoot]; the framework tree carries ~210 SKILL.md files, so any agent
+  // with its own skills overflowed and registered NOTHING (jarvis-telegram/vera/vivienne, 94 failures).
+  // Keep the first 100 — agent-dir skills come first, so an agent's own commands always survive.
+  const TELEGRAM_MAX_COMMANDS = 100;
+  if (commands.length > TELEGRAM_MAX_COMMANDS) {
+    console.warn(`[telegram-commands] ${commands.length} commands collected; registering the first ${TELEGRAM_MAX_COMMANDS} (Telegram cap)`);
+    return commands.slice(0, TELEGRAM_MAX_COMMANDS);
+  }
 
   return commands;
 }
