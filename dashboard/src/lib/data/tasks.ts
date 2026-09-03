@@ -43,6 +43,14 @@ export function getTasks(filters?: TaskFilters): Task[] {
     const term = `%${filters.search}%`;
     params.push(term, term);
   }
+  if (filters?.date === 'today') {
+    // Same UTC-day boundary as getTasksCompletedToday() — only meaningful
+    // paired with status=completed, but scopes on completed_at regardless.
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    conditions.push('completed_at >= ?');
+    params.push(todayStart.toISOString());
+  }
 
   const where =
     conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';

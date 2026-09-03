@@ -25,19 +25,25 @@ const DEFAULT_FILTERS = {
   priority: 'all',
   project: 'all',
   status: 'all',
+  date: undefined as 'today' | undefined,
 };
 
 export default function TasksPage() {
   const { currentOrg } = useOrg();
   const searchParams = useSearchParams();
 
-  const [view, setView] = useState<ViewMode>('kanban');
+  // Deep-link support: /tasks?tab=recurring, /tasks?agent=human, /tasks?status=blocked,
+  // /tasks?status=completed&date=today (used by the Overview ActionRequired card and
+  // the Queue page's lanes). A status=completed deep link defaults to List view since
+  // the Board's Completed column is a separate, unfiltered fetch (pre-existing,
+  // unrelated quirk — see completedToday below) that would otherwise look wrong.
+  const [view, setView] = useState<ViewMode>(
+    searchParams.get('status') === 'completed' ? 'list' : 'kanban'
+  );
   const [tasks, setTasks] = useState<Task[]>([]);
   const [completedToday, setCompletedToday] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Deep-link support: /tasks?tab=recurring, /tasks?agent=human, /tasks?status=blocked
-  // (used by the Overview ActionRequired card and the Queue page's lanes).
   const [activeTab, setActiveTab] = useState<'tasks' | 'recurring'>(
     searchParams.get('tab') === 'recurring' ? 'recurring' : 'tasks'
   );
@@ -45,6 +51,7 @@ export default function TasksPage() {
     ...DEFAULT_FILTERS,
     agent: searchParams.get('agent') ?? DEFAULT_FILTERS.agent,
     status: searchParams.get('status') ?? DEFAULT_FILTERS.status,
+    date: searchParams.get('date') === 'today' ? ('today' as const) : DEFAULT_FILTERS.date,
   }));
   // UHS MOD #7 — search is client-side only; isolated from filters so typing
   // never re-creates fetchTasks or triggers setLoading (no API round-trip).
@@ -66,10 +73,14 @@ export default function TasksPage() {
     if (filters.priority !== 'all') params.set('priority', filters.priority);
     if (filters.status !== 'all') params.set('status', filters.status);
     if (filters.project !== 'all') params.set('project', filters.project);
+    if (filters.date === 'today') params.set('date', 'today');
 
     try {
-      // Build completed params with same filters (except status)
+      // Build completed params with same filters (except status/date — the
+      // Board's Completed column is intentionally an unscoped "all completed"
+      // view today; date scoping only applies to the primary tasks fetch).
       const completedParams = new URLSearchParams(params);
+      completedParams.delete('date');
       completedParams.set('status', 'completed');
       completedParams.delete('status'); // remove any existing non-completed status
       completedParams.set('status', 'completed');

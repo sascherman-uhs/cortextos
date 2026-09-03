@@ -19,7 +19,11 @@ import type { Task, Approval, HealthSummary } from '@/lib/types';
 const STALE_HUMAN_MS = 24 * 60 * 60 * 1000;
 
 export interface ActionItem {
-  kind: 'human_task' | 'approval' | 'blocked_task' | 'stale_agent';
+  // 'skill_run' items are not produced by getActionItems() below — they're
+  // added client-side by NeedsYouLane from the same /api/uhs/skill-runs data
+  // SkillRunsCard already fetches (see needs-you-lane.tsx). The kind lives
+  // here so ActionItem stays the one shared item shape for the lane.
+  kind: 'human_task' | 'approval' | 'blocked_task' | 'stale_agent' | 'skill_run';
   id: string;
   title: string;
   subtitle?: string;

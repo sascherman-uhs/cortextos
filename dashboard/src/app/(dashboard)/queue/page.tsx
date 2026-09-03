@@ -68,13 +68,15 @@ export default async function QueuePage({
         title="Done Today"
         tasks={done}
         totalCount={done.length}
-        href="/tasks?status=completed"
+        href="/tasks?status=completed&date=today"
         dateField="completed_at"
         maxVisible={8}
         emptyLabel="Nothing completed yet today — see Tasks for full history."
       />
 
-      <RecurringLane />
+      <div id="recurring">
+        <RecurringLane />
+      </div>
     </div>
   );
 }

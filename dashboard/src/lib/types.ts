@@ -199,6 +199,8 @@ export interface TaskFilters {
   status?: string;
   project?: string;
   search?: string;
+  /** 'today' scopes completed_at to the current UTC day — same window as getTasksCompletedToday(). */
+  date?: 'today';
 }
 
 // -- Health Summary --
