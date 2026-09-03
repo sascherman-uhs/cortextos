@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { useOrg } from '@/hooks/use-org';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
@@ -28,13 +29,23 @@ const DEFAULT_FILTERS = {
 
 export default function TasksPage() {
   const { currentOrg } = useOrg();
+  const searchParams = useSearchParams();
 
   const [view, setView] = useState<ViewMode>('kanban');
   const [tasks, setTasks] = useState<Task[]>([]);
   const [completedToday, setCompletedToday] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  // Deep-link support: /tasks?tab=recurring, /tasks?agent=human, /tasks?status=blocked
+  // (used by the Overview ActionRequired card and the Queue page's lanes).
+  const [activeTab, setActiveTab] = useState<'tasks' | 'recurring'>(
+    searchParams.get('tab') === 'recurring' ? 'recurring' : 'tasks'
+  );
+  const [filters, setFilters] = useState(() => ({
+    ...DEFAULT_FILTERS,
+    agent: searchParams.get('agent') ?? DEFAULT_FILTERS.agent,
+    status: searchParams.get('status') ?? DEFAULT_FILTERS.status,
+  }));
   // UHS MOD #7 — search is client-side only; isolated from filters so typing
   // never re-creates fetchTasks or triggers setLoading (no API round-trip).
   const [searchQuery, setSearchQuery] = useState('');
@@ -170,7 +181,7 @@ export default function TasksPage() {
   return (
     <div className="space-y-4">
       {/* UHS MOD #7 — top-level tabs: One-time tasks vs Recurring tasks */}
-      <Tabs defaultValue="tasks" className="w-full">
+      <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'tasks' | 'recurring')} className="w-full">
         {/* Header — title + tab switcher + view controls on same row */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">

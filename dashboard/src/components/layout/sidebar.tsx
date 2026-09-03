@@ -7,6 +7,7 @@ import {
   IconLayoutDashboard,
   IconRobot,
   IconListCheck,
+  IconLayoutList,
   IconShieldCheck,
   IconActivity,
   IconChartDots3,
@@ -40,6 +41,7 @@ interface NavItem {
 const navItems: NavItem[] = [
   // Core
   { label: 'Overview', href: '/', icon: IconLayoutDashboard, section: 'core' },
+  { label: 'Queue', href: '/queue', icon: IconLayoutList, section: 'core' },
   // === JARVIS MOD #19 (2026-07-03): Cosmos voice-first JARVIS tab ===
   { label: 'JARVIS', href: '/jarvis', icon: IconPlanet, section: 'core' },
   // === END JARVIS MOD #19 ===

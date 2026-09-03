@@ -1,9 +1,9 @@
 import Link from 'next/link';
 import { getOrgs } from '@/lib/config';
-import { getPendingCount } from '@/lib/data/approvals';
 import { getTasks, getTasksCompletedToday } from '@/lib/data/tasks';
+import { getActionItems } from '@/lib/data/action-items';
 import { getGoals } from '@/lib/data/goals';
-import { getHealthSummary, getAllHeartbeats } from '@/lib/data/heartbeats';
+import { getAllHeartbeats } from '@/lib/data/heartbeats';
 import { getRecentEvents, getMilestones } from '@/lib/data/events';
 import { discoverAgents } from '@/lib/data/agents';
 
@@ -14,6 +14,7 @@ import { LiveActivity } from '@/components/overview/live-activity';
 import { SystemHealth } from '@/components/overview/system-health';
 import { MetricCards } from '@/components/overview/metric-cards';
 import { AgentStatusGrid } from '@/components/overview/agent-status-grid';
+import { SkillRunsCard } from '@/components/uhs/skill-runs-card';
 
 export const dynamic = 'force-dynamic';
 
@@ -30,22 +31,18 @@ export default async function OverviewPage({
 
   // Fetch all data in parallel
   const [
-    pendingCount,
-    blockedTasks,
+    actionItems,
     allTasks,
     goalsData,
-    healthSummary,
     completedToday,
     recentEvents,
     milestones,
     agents,
     heartbeatsList,
   ] = await Promise.all([
-    Promise.resolve(getPendingCount(org || undefined)),
-    Promise.resolve(getTasks({ status: 'blocked', org: org || undefined })),
+    getActionItems(org || undefined),
     Promise.resolve(getTasks({ org: org || undefined })),
     Promise.resolve(getGoals(org || 'default')),
-    getHealthSummary(org || undefined),
     Promise.resolve(getTasksCompletedToday(org || undefined)),
     Promise.resolve(getRecentEvents(20, org || undefined)),
     Promise.resolve(getMilestones(org || undefined)),
@@ -59,10 +56,12 @@ export default async function OverviewPage({
     heartbeats[hb.agent] = hb;
   }
 
-  const staleAgentCount = healthSummary.stale + healthSummary.down;
+  const { humanTasks: humanTaskItems, blockedTasks, approvals, staleAgents, healthSummary } = actionItems;
+  const pendingCount = approvals.length;
+  const staleAgentCount = staleAgents.length;
   const inProgressTasks = allTasks.filter(t => t.status === 'in_progress').length;
   const pendingTasks = allTasks.filter(t => t.status === 'pending').length;
-  const humanTasks = allTasks.filter(t => t.assignee === 'human' && t.status !== 'completed').length;
+  const humanTasks = humanTaskItems.length;
   const totalActions = pendingCount + blockedTasks.length + staleAgentCount + humanTasks;
 
   return (
@@ -133,6 +132,9 @@ export default async function OverviewPage({
           />
         </div>
       </div>
+
+      {/* Blocked & Unfinished Skill Runs */}
+      <SkillRunsCard />
 
       {/* System Health */}
       <SystemHealth summary={healthSummary} />
