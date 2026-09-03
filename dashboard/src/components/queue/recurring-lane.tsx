@@ -12,6 +12,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { IconChevronRight, IconAlertTriangle, IconRefresh } from '@tabler/icons-react';
@@ -91,10 +92,17 @@ function RecurringJobsSummary() {
 }
 
 export function RecurringLane() {
+  // Force a genuine remount (fresh state + effects + event listeners) on every
+  // route re-entry — including browser back/forward — rather than relying on
+  // these fetch-on-mount client components to notice they're being reused.
+  // Without this, back-navigating to /queue can leave a stale instance stuck
+  // on its initial "loading" state with no live listeners, and even its own
+  // manual Refresh button silently does nothing (bug: 2026-09-03 round 2).
+  const pathname = usePathname();
   return (
     <div className="space-y-4">
-      <RecurringJobsSummary />
-      <SkillRunsCard />
+      <RecurringJobsSummary key={`recurring-jobs-${pathname}`} />
+      <SkillRunsCard key={`skill-runs-${pathname}`} />
     </div>
   );
 }

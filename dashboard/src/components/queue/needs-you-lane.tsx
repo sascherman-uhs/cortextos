@@ -1,16 +1,17 @@
-'use client';
-
 /**
  * Needs You lane — the "one glance, one place" card. Its count/list MUST
  * reflect every real blocker, including skill runs with a non-retryable
  * blocker (the ones SkillRunsCard badges "needs you" further down the
  * Recurring lane) — otherwise this card can say "all clear" while real,
- * badged blockers sit unmentioned below it. Reuses the exact same
- * /api/uhs/skill-runs endpoint and retryable-blocker rule SkillRunsCard
- * already uses, rather than forking a second definition of "blocked".
+ * badged blockers sit unmentioned below it.
+ *
+ * All five categories (human tasks, approvals, blocked tasks, stale agents,
+ * blocked skill runs) are server-computed by getActionItems() in
+ * lib/data/action-items.ts and passed in as props — a pure, server-renderable
+ * component with no client-side fetch of its own, so it can't go stale on
+ * back/forward navigation the way a fetch-on-mount client component can.
  */
 
-import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
   IconUser,
@@ -24,7 +25,6 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import type { ActionItem } from '@/lib/data/action-items';
-import type { SkillRun } from '@/components/uhs/skill-runs-card';
 
 const KIND_ICON: Record<ActionItem['kind'], React.ReactNode> = {
   human_task: <IconUser size={16} className="text-primary shrink-0" />,
@@ -42,31 +42,12 @@ const KIND_LABEL: Record<ActionItem['kind'], string> = {
   skill_run: 'Skill run blocked',
 };
 
-// A skill run counts as "needs you" using the same rule SkillRunsCard badges
-// with — at least one blocker that isn't marked auto-retryable.
-function skillRunsToActionItems(runs: SkillRun[]): ActionItem[] {
-  const items: ActionItem[] = [];
-  for (const run of runs) {
-    const needsYou = (run.blockers ?? []).filter((b) => !b.retryable);
-    if (needsYou.length === 0) continue;
-    const first = needsYou[0];
-    items.push({
-      kind: 'skill_run',
-      id: String(run.id),
-      title: `${run.skill} / ${run.subject}`,
-      subtitle: first.item + (first.reason ? ` — ${first.reason}` : ''),
-      href: '/queue#recurring',
-      createdAt: run.updated_at ?? run.started_at ?? undefined,
-    });
-  }
-  return items;
-}
-
 interface NeedsYouLaneProps {
   humanTasks: ActionItem[];
   approvals: ActionItem[];
   blockedTasks: ActionItem[];
   staleAgents: ActionItem[];
+  blockedSkillRuns: ActionItem[];
 }
 
 function Row({ item }: { item: ActionItem }) {
@@ -95,25 +76,14 @@ function Row({ item }: { item: ActionItem }) {
   );
 }
 
-export function NeedsYouLane({ humanTasks, approvals, blockedTasks, staleAgents }: NeedsYouLaneProps) {
-  const [skillRunItems, setSkillRunItems] = useState<ActionItem[]>([]);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/uhs/skill-runs', { cache: 'no-store' })
-      .then((res) => (res.ok ? res.json() : []))
-      .then((data: SkillRun[]) => {
-        if (!cancelled) setSkillRunItems(skillRunsToActionItems(Array.isArray(data) ? data : []));
-      })
-      .catch(() => {
-        // Non-fatal — SkillRunsCard below will surface the same fetch failure.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const items = [...humanTasks, ...approvals, ...blockedTasks, ...staleAgents, ...skillRunItems];
+export function NeedsYouLane({
+  humanTasks,
+  approvals,
+  blockedTasks,
+  staleAgents,
+  blockedSkillRuns,
+}: NeedsYouLaneProps) {
+  const items = [...humanTasks, ...approvals, ...blockedTasks, ...staleAgents, ...blockedSkillRuns];
   // Stale agents and blocked work (tasks + skill runs) surface above fresh human tasks.
   const sorted = [...items].sort((a, b) => {
     const weight = (i: ActionItem) =>

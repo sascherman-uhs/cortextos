@@ -26,7 +26,7 @@ export default async function QueuePage({
     Promise.resolve(getTasksCompletedToday(orgFilter)),
   ]);
 
-  const { humanTasks, blockedTasks, approvals, staleAgents } = actionItems;
+  const { humanTasks, blockedTasks, approvals, staleAgents, blockedSkillRuns } = actionItems;
 
   return (
     <div className="space-y-6">
@@ -43,6 +43,7 @@ export default async function QueuePage({
         approvals={approvals}
         blockedTasks={blockedTasks}
         staleAgents={staleAgents}
+        blockedSkillRuns={blockedSkillRuns}
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

@@ -114,7 +114,13 @@ export function getTasksCompletedToday(org?: string): Task[] {
   todayStart.setUTCHours(0, 0, 0, 0);
   const todayISO = todayStart.toISOString();
 
-  const conditions: string[] = ['completed_at >= ?'];
+  // status='completed' (not just a stamped completed_at) — a recurring job
+  // whose latest run failed can still carry a completed_at timestamp with
+  // status='failed'; without this the count/list disagreed with the
+  // status=completed&date=today filtered Tasks view by exactly those rows
+  // (bug: 2026-09-03 round 2 — "Done Today" badge off by one vs the page it
+  // links to).
+  const conditions: string[] = ["status = 'completed'", 'completed_at >= ?'];
   const params: (string | number)[] = [todayISO];
 
   if (org) {

@@ -56,13 +56,17 @@ export default async function OverviewPage({
     heartbeats[hb.agent] = hb;
   }
 
-  const { humanTasks: humanTaskItems, blockedTasks, approvals, staleAgents, healthSummary } = actionItems;
+  const { humanTasks: humanTaskItems, blockedTasks, approvals, staleAgents, blockedSkillRuns, healthSummary } = actionItems;
   const pendingCount = approvals.length;
   const staleAgentCount = staleAgents.length;
   const inProgressTasks = allTasks.filter(t => t.status === 'in_progress').length;
   const pendingTasks = allTasks.filter(t => t.status === 'pending').length;
   const humanTasks = humanTaskItems.length;
-  const totalActions = pendingCount + blockedTasks.length + staleAgentCount + humanTasks;
+  const skillRunBlockers = blockedSkillRuns.length;
+  // Includes blocked skill runs — without this, Overview could show "Blocked: 0"
+  // / "Approvals: 0" and imply all-clear while real, badged blockers sat in
+  // SkillRunsCard further down the same page (bug: 2026-09-03 round 2).
+  const totalActions = pendingCount + blockedTasks.length + staleAgentCount + humanTasks + skillRunBlockers;
 
   return (
     <div className="space-y-6">
@@ -103,6 +107,7 @@ export default async function OverviewPage({
           blockedTasks={blockedTasks.length}
           staleAgents={staleAgentCount}
           humanTasks={humanTasks}
+          skillRunBlockers={skillRunBlockers}
         />
       )}
 
@@ -134,7 +139,9 @@ export default async function OverviewPage({
       </div>
 
       {/* Blocked & Unfinished Skill Runs */}
-      <SkillRunsCard />
+      <div id="skill-runs">
+        <SkillRunsCard />
+      </div>
 
       {/* System Health */}
       <SystemHealth summary={healthSummary} />

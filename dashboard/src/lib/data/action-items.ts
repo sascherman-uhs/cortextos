@@ -8,7 +8,9 @@
 import { getTasks } from './tasks';
 import { getPendingApprovals } from './approvals';
 import { getHealthSummary } from './heartbeats';
+import { getBlockedSkillRuns } from './skill-runs';
 import type { Task, Approval, HealthSummary } from '@/lib/types';
+import type { SkillRun } from '@/components/uhs/skill-runs-card';
 
 // Matches core's checkHumanTasks()/checkStaleTasks() stale_human threshold
 // (src/bus/task.ts) — 24h since creation. The dashboard's own human-task
@@ -19,10 +21,6 @@ import type { Task, Approval, HealthSummary } from '@/lib/types';
 const STALE_HUMAN_MS = 24 * 60 * 60 * 1000;
 
 export interface ActionItem {
-  // 'skill_run' items are not produced by getActionItems() below — they're
-  // added client-side by NeedsYouLane from the same /api/uhs/skill-runs data
-  // SkillRunsCard already fetches (see needs-you-lane.tsx). The kind lives
-  // here so ActionItem stays the one shared item shape for the lane.
   kind: 'human_task' | 'approval' | 'blocked_task' | 'stale_agent' | 'skill_run';
   id: string;
   title: string;
@@ -37,7 +35,30 @@ export interface ActionItems {
   blockedTasks: ActionItem[];
   approvals: ActionItem[];
   staleAgents: ActionItem[];
+  // Skill runs with at least one non-retryable blocker — same rule
+  // SkillRunsCard badges "needs you" with. Computed here (not just fetched
+  // client-side by one page) so Overview and Queue can't disagree about
+  // whether something needs attention (bug: 2026-09-03 round 2 — Overview
+  // showed "Blocked: 0" / "Queue clear" while Queue correctly showed 7).
+  blockedSkillRuns: ActionItem[];
   healthSummary: HealthSummary;
+}
+
+function isNonRetryable(run: SkillRun): boolean {
+  return (run.blockers ?? []).some((b) => !b.retryable);
+}
+
+function skillRunItem(run: SkillRun): ActionItem {
+  const blockers = (run.blockers ?? []).filter((b) => !b.retryable);
+  const first = blockers[0];
+  return {
+    kind: 'skill_run',
+    id: String(run.id),
+    title: `${run.skill} / ${run.subject}`,
+    subtitle: first ? first.item + (first.reason ? ` — ${first.reason}` : '') : undefined,
+    href: '/queue#recurring',
+    createdAt: run.updated_at ?? run.started_at ?? undefined,
+  };
 }
 
 function isStaleHuman(task: Task): boolean {
@@ -86,11 +107,12 @@ function approvalItem(approval: Approval): ActionItem {
  * SystemHealth/MetricCards) don't have to re-fetch heartbeats separately.
  */
 export async function getActionItems(org?: string): Promise<ActionItems> {
-  const [humanTaskRows, blockedRows, approvalRows, healthSummary] = await Promise.all([
+  const [humanTaskRows, blockedRows, approvalRows, healthSummary, skillRuns] = await Promise.all([
     Promise.resolve(getTasks({ agent: 'human', org })),
     Promise.resolve(getTasks({ status: 'blocked', org })),
     Promise.resolve(getPendingApprovals(org)),
     getHealthSummary(org),
+    getBlockedSkillRuns(),
   ]);
 
   const humanTasks = humanTaskRows
@@ -99,6 +121,10 @@ export async function getActionItems(org?: string): Promise<ActionItems> {
 
   const blockedTasks = blockedRows.map(blockedTaskItem);
   const approvals = approvalRows.map(approvalItem);
+  // Skill runs aren't org-scoped (uhs-jarvis skill_runs is a single shared
+  // table), so they show under every org filter — same as they already do
+  // via SkillRunsCard elsewhere on both pages.
+  const blockedSkillRuns = skillRuns.filter(isNonRetryable).map(skillRunItem);
 
   const staleAgents: ActionItem[] = healthSummary.agents
     .filter((a) => a.health !== 'healthy')
@@ -110,5 +136,5 @@ export async function getActionItems(org?: string): Promise<ActionItems> {
       href: '/agents',
     }));
 
-  return { humanTasks, blockedTasks, approvals, staleAgents, healthSummary };
+  return { humanTasks, blockedTasks, approvals, staleAgents, blockedSkillRuns, healthSummary };
 }
