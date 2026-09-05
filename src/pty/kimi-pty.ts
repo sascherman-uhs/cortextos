@@ -44,6 +44,8 @@ export class KimiPTY {
   private outputBuffer: OutputBuffer;
   private cwd: string;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
+  /** Model routing (OS-02b-core) — see AgentPTY.setModelOverride. */
+  private modelOverride: string | null = null;
 
   constructor(private env: CtxEnv, private config: AgentConfig, logPath?: string) {
     this.cwd = config.working_directory || env.agentDir || process.cwd();
@@ -119,6 +121,16 @@ export class KimiPTY {
 
   isBootstrapped(): boolean {
     return this.alive;
+  }
+
+  /** Set the registry-resolved model for subsequent print invocations. */
+  setModelOverride(modelId: string | null): void {
+    this.modelOverride = modelId;
+  }
+
+  /** Null unless routing is enforced — see the note in buildKimiArgs. */
+  getEffectiveModel(): string | undefined {
+    return this.modelOverride ?? undefined;
   }
 
   private queueTurn(prompt: string, isStartup: boolean): void {
@@ -203,6 +215,18 @@ export class KimiPTY {
       prompt,
       '--afk',
     ];
+
+    // Explicit selection. `kimi --help` on the installed CLI documents
+    // `--model/-m TEXT  LLM model to use`, so the kimi adapter DOES have a
+    // selection mechanism — the pre-routing arg builder simply never used one.
+    //
+    // Deliberately NOT falling back to `config.model` here: this adapter has
+    // always ignored that field, so honouring it now would change what runs
+    // in SHADOW mode, which the routing contract forbids. Only an enforced
+    // registry resolution sets `modelOverride`.
+    if (this.modelOverride) {
+      args.push('--model', this.modelOverride);
+    }
 
     if (mode === 'continue') {
       args.push('--continue');

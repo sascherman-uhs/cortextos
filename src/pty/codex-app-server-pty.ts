@@ -118,6 +118,21 @@ export class CodexAppServerPTY {
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
+  /**
+   * Model routing (OS-02b-core). The installed `codex-cli 0.153.2` app-server
+   * protocol DOES accept an explicit model — verified by running
+   * `codex app-server generate-json-schema --out <dir>` and reading the v2
+   * bundle: `ThreadStartParams.model` (string|null), `ThreadResumeParams.model`
+   * ("Configuration overrides for the resumed thread") and
+   * `TurnStartParams.model` ("Override the model for this turn and subsequent
+   * turns"). All three boundaries are wired below.
+   *
+   * Deliberately NOT falling back to `config.model`: this adapter has never
+   * passed that field to the server (it was only ever a log label), so
+   * honouring it now would change what runs in SHADOW mode. Only an enforced
+   * registry resolution sets this.
+   */
+  private _modelOverride: string | null = null;
   private _telegramApi: TelegramAPI | null = null;
   private _chatId: string | null = null;
   private _typingLastSent = 0;
@@ -215,6 +230,29 @@ export class CodexAppServerPTY {
 
   getOutputBuffer(): OutputBuffer {
     return this._outputBuffer;
+  }
+
+  /** Set the registry-resolved model for the next thread/turn. */
+  setModelOverride(modelId: string | null): void {
+    this._modelOverride = modelId;
+  }
+
+  /** Null unless routing is enforced — see the note on `_modelOverride`. */
+  getEffectiveModel(): string | undefined {
+    return this._modelOverride ?? undefined;
+  }
+
+  /**
+   * Active app-server thread id, or null before `thread/start` resolves. The
+   * model-routing observer needs it to bind a rollout file to this session.
+   */
+  getThreadId(): string | null {
+    return this._threadId;
+  }
+
+  /** `{ model }` when an explicit selection is active, otherwise `{}`. */
+  private modelParam(): Record<string, string> {
+    return this._modelOverride ? { model: this._modelOverride } : {};
   }
 
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
@@ -484,6 +522,7 @@ export class CodexAppServerPTY {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: persisted.threadId,
           cwd: this._cwd,
+          ...this.modelParam(),
           ...THREAD_PERMISSION_OVERRIDES,
           config: { features: { goals: true } },
           excludeTurns: true,
@@ -502,6 +541,7 @@ export class CodexAppServerPTY {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: latest,
           cwd: this._cwd,
+          ...this.modelParam(),
           ...THREAD_PERMISSION_OVERRIDES,
           config: { features: { goals: true } },
           excludeTurns: true,
@@ -514,6 +554,7 @@ export class CodexAppServerPTY {
 
     const started = await this.request<ThreadResponse>('thread/start', {
       cwd: this._cwd,
+      ...this.modelParam(),
       ...THREAD_PERMISSION_OVERRIDES,
       config: { features: { goals: true } },
       sessionStartSource: 'startup',
@@ -558,7 +599,12 @@ export class CodexAppServerPTY {
   private async startTurn(input: unknown[]): Promise<void> {
     if (!this._threadId) throw new Error('No Codex app-server thread is active');
     const completion = this.createTurnCompletion();
-    await this.request('turn/start', { threadId: this._threadId, input, ...TURN_PERMISSION_OVERRIDES });
+    await this.request('turn/start', {
+      threadId: this._threadId,
+      input,
+      ...this.modelParam(),
+      ...TURN_PERMISSION_OVERRIDES,
+    });
     await completion;
   }
 
@@ -845,7 +891,10 @@ export class CodexAppServerPTY {
 
     const entry = {
       timestamp: new Date().toISOString(),
-      model: this._config.model || 'gpt-5-codex',
+      // Config-labelled, NOT an observation. The routing contract forbids
+      // treating this as evidence of the model that actually ran — the
+      // observer reads `turn_context.payload.model` from the rollout instead.
+      model: this._modelOverride || this._config.model || 'gpt-5-codex',
       input_tokens: typeof total.inputTokens === 'number' ? total.inputTokens : 0,
       output_tokens: typeof total.outputTokens === 'number' ? total.outputTokens : 0,
       cache_read_tokens: typeof total.cachedInputTokens === 'number' ? total.cachedInputTokens : 0,
