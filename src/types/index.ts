@@ -1022,6 +1022,14 @@ export interface ModelEventRecord {
 
 export type ModelObservedConfidence = 'verified' | 'unconfirmed' | 'mismatch';
 
+/**
+ * How an observed model id was tied to a specific spawn. `session-id` and
+ * `thread-id` are exact; `prompt-correlated` matches the boot prompt on a
+ * transcript newer than the spawn. Anything else is a guess and must leave the
+ * attempt `unconfirmed`.
+ */
+export type ModelObservationBinding = 'session-id' | 'thread-id' | 'prompt-correlated' | 'unbound';
+
 export interface ModelAttemptRecord {
   attempt_id: string;
   consumer: string;
@@ -1034,12 +1042,21 @@ export interface ModelAttemptRecord {
   registry_revision: number;
   session_ref: string | null;
   activation: ModelActivationMode;
+  /**
+   * The model this spawn actually dispatches, and therefore the only baseline
+   * an observation may be compared against: the legacy config model in shadow
+   * mode, the resolved model in enforced mode. Optional for records written
+   * before the field existed.
+   */
+  expected_model_id?: string | null;
   at: string;
   observed: {
     model_id: string | null;
     source: string | null;
     confidence: ModelObservedConfidence;
     at: string | null;
+    /** How the transcript was attributed to this spawn (absent = legacy record). */
+    binding?: ModelObservationBinding;
   };
   fallback?: { from: string; reason: string };
 }

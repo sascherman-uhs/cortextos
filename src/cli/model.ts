@@ -464,7 +464,16 @@ modelCommand
         dryRun: !!opts.dryRun,
       });
       out(json, result, () => {
-        console.log(`scanned ${result.scanned.length} agent config(s); registry revision ${result.registry_revision}`);
+        console.log(
+          `scanned ${result.scanned.length} agent config(s) in ${result.agents_dir}; ` +
+          `registry revision ${result.registry_revision}`,
+        );
+        if (result.scanned.length === 0) {
+          // Nothing was imported and nothing was written. Almost always a root
+          // problem, so say which root was used and how to point at another.
+          console.log('  no agent config.json found there — nothing imported, registry untouched.');
+          console.log('  pass --root <cortextos repo> (or set CTX_FRAMEWORK_ROOT) if that is the wrong root.');
+        }
         for (const p of result.legacy_pins) console.log(`  legacy-migration pin  ${p.agent.padEnd(22)} → ${p.entry_id} (expires ${p.expires_at})`);
         for (const p of result.proposed_invalid) {
           console.log(`  PROPOSED-INVALID      ${p.agent.padEnd(22)} model=${p.model} runtime=${p.runtime}`);

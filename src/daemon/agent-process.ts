@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
+import type { AgentConfig, AgentStatus, CtxEnv, ModelObservationBinding } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
@@ -223,7 +223,7 @@ export class AgentProcess {
 
       // Provenance: one attempt record per spawn, then a bounded poll for the
       // runtime-observed model id (never a config-derived label).
-      if (routing) this.recordModelAttempt(routing.resolution);
+      if (routing) this.recordModelAttempt(routing.resolution, prompt);
 
       // Issue #392: codex-app-server does not reliably execute the inline
       // "Send a Telegram message saying you are back online" instruction the
@@ -511,15 +511,18 @@ export class AgentProcess {
    * Write the spawn-time attempt record, then poll (bounded) for a
    * runtime-observed model id and update the record in place.
    */
-  private recordModelAttempt(resolution: ReturnType<typeof resolveModelRouting>): void {
+  private recordModelAttempt(resolution: ReturnType<typeof resolveModelRouting>, bootPrompt: string): void {
     const ctx = {
       org: this.env.org,
       frameworkRoot: this.env.frameworkRoot || this.env.projectRoot,
       ctxRoot: this.env.ctxRoot,
       instanceId: this.env.instanceId,
     };
+    const sessionId = this.pty && 'getSessionId' in this.pty
+      ? (this.pty as { getSessionId(): string | null }).getSessionId()
+      : null;
     try {
-      const written = recordAttempt({ consumer: this.name, resolution }, ctx);
+      const written = recordAttempt({ consumer: this.name, resolution, sessionRef: sessionId }, ctx);
       this.modelAttemptPath = written.path;
     } catch (err) {
       this.log(`[model-routing] attempt record failed: ${(err as Error).message}`);
@@ -536,10 +539,14 @@ export class AgentProcess {
     // `unconfirmed`. No busy loop, and the timer is cleared on stop().
     const poll = (): void => {
       tries += 1;
-      let observed: { model_id: string; source: string } | null = null;
+      let observed: { model_id: string; source: string; binding: ModelObservationBinding } | null = null;
       try {
         if (runtime === 'claude-code') {
-          observed = observeClaudeModel({ cwd, since });
+          // Bind to the session this PTY launched. Without a session id (a
+          // `--continue` spawn) fall back to prompt correlation on a
+          // transcript newer than the spawn — several agents share a cwd, so
+          // "newest file in the slug dir" is not evidence of anything.
+          observed = observeClaudeModel({ cwd, sessionId, since, bootPrompt });
         } else if (runtime === 'codex-app-server') {
           const threadId = this.pty && 'getThreadId' in this.pty
             ? (this.pty as { getThreadId(): string | null }).getThreadId()
@@ -555,7 +562,8 @@ export class AgentProcess {
           const rec = updateAttemptObserved(attemptPath, observed, ctx);
           this.log(
             `[model-routing] observed agent=${this.name} model=${observed.model_id} ` +
-            `source=${observed.source} confidence=${rec?.observed.confidence ?? 'unknown'}`,
+            `source=${observed.source} binding=${observed.binding} ` +
+            `expected=${rec?.expected_model_id ?? 'none'} confidence=${rec?.observed.confidence ?? 'unknown'}`,
           );
         } catch { /* best-effort */ }
         this.modelObserveTimer = null;
