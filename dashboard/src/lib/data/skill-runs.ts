@@ -7,12 +7,27 @@
 // "blocked". See action-items.ts.
 
 import type { SkillRun } from '@/components/uhs/skill-runs-card';
+import { envelope, unavailable, type SourceEnvelope } from './source-health';
 
 const SUPA_URL = process.env.SUPABASE_URL;
 const SUPA_KEY = process.env.SUPABASE_KEY;
+const SKILL_RUNS_SOURCE = 'supabase://skill_runs';
 
-export async function getBlockedSkillRuns(): Promise<SkillRun[]> {
-  if (!SUPA_URL || !SUPA_KEY) return [];
+/**
+ * Blocked/unfinished skill runs, with source health attached.
+ *
+ * Every early return here used to be a bare `[]`, so an unset key, a 500 from
+ * PostgREST and a genuinely clear ledger were indistinguishable to the caller —
+ * and all three rendered as "all clear". They are now distinguishable.
+ */
+export async function getBlockedSkillRunsEnvelope(): Promise<SourceEnvelope<SkillRun[]>> {
+  if (!SUPA_URL || !SUPA_KEY) {
+    return unavailable(
+      [] as SkillRun[],
+      SKILL_RUNS_SOURCE,
+      'SUPABASE_URL/SUPABASE_KEY not configured — skill-run blockers cannot be read',
+    );
+  }
 
   try {
     const res = await fetch(
@@ -29,11 +44,29 @@ export async function getBlockedSkillRuns(): Promise<SkillRun[]> {
         cache: 'no-store',
       },
     );
-    if (!res.ok) return [];
+    if (!res.ok) {
+      return unavailable(
+        [] as SkillRun[],
+        SKILL_RUNS_SOURCE,
+        `HTTP ${res.status} from skill_runs`,
+      );
+    }
     const rows = await res.json();
-    return Array.isArray(rows) ? rows : [];
+    if (!Array.isArray(rows)) {
+      return unavailable([] as SkillRun[], SKILL_RUNS_SOURCE, 'skill_runs response was not a list');
+    }
+    const newest = rows.reduce<string | null>((acc: string | null, r: SkillRun) => {
+      const u = r.updated_at ?? r.started_at ?? null;
+      return u && (!acc || u > acc) ? u : acc;
+    }, null);
+    return envelope(rows as SkillRun[], SKILL_RUNS_SOURCE, { source_updated_at: newest });
   } catch (err) {
     console.error('[data/skill-runs] getBlockedSkillRuns error:', err);
-    return [];
+    return unavailable([] as SkillRun[], SKILL_RUNS_SOURCE, err);
   }
+}
+
+/** Back-compat wrapper. Prefer getBlockedSkillRunsEnvelope(). */
+export async function getBlockedSkillRuns(): Promise<SkillRun[]> {
+  return (await getBlockedSkillRunsEnvelope()).data;
 }

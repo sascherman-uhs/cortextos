@@ -813,3 +813,239 @@ export interface AgentStatus {
   crashCount?: number;
   model?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Model routing registry (OS-02b-core)
+// ---------------------------------------------------------------------------
+//
+// Implements `.planning/agentic-os/model-routing-contract.md`. The registry is
+// the single authority for "which model does this consumer run on". Agent
+// config.json keeps `runtime`; its `model` field becomes LEGACY — imported as a
+// pin by `cortextos model migrate --bootstrap`, never edited by this system.
+//
+// All types here are ADDITIVE. The `AgentConfig.runtime` union is unchanged;
+// the adapter map (below) is what actually decides which adapters exist, so a
+// new adapter can be registered without a code change to that union.
+
+/** Activation mode for one consumer (agent name or JARVIS call-site id). */
+export type ModelActivationMode = 'shadow' | 'enforced';
+
+/** How a model entry is billed. Drives the cost preview on a switch. */
+export type ModelBillingMode = 'subscription_quota' | 'api_cash' | 'local';
+
+export type ModelEntryStatus = 'active' | 'deprecated' | 'unavailable';
+
+/** A bounded, non-billing health probe descriptor. */
+export interface ModelHealthProbe {
+  /**
+   * `cli-print`  — a CLI login/credential presence check (never a billed call).
+   * `env-key`    — presence of the named environment variable.
+   * `http-tags`  — a local HTTP GET (ollama `/api/tags`).
+   * `none`       — no probe is possible for this entry.
+   */
+  kind: 'cli-print' | 'env-key' | 'http-tags' | 'none';
+  timeout_ms?: number;
+  url?: string;
+}
+
+export interface ModelEntry {
+  model_id: string;
+  provider: string;
+  runtime_adapter: string;
+  capability_tags: string[];
+  context_window: number;
+  billing_mode: ModelBillingMode;
+  cost_class: number;
+  auth_source: string | null;
+  status: ModelEntryStatus;
+  health_probe?: ModelHealthProbe;
+  /** Optional human note (e.g. why an entry is marked unavailable). */
+  note?: string;
+}
+
+export interface ModelAdapterDescriptor {
+  version: number;
+  /**
+   * How this adapter is told which model to run. `null` means the adapter has
+   * no explicit-selection mechanism — it can be described but never enforced.
+   */
+  selection: string | null;
+  /** Where a runtime-observed model id can be read back, or null if nowhere. */
+  observed_source: string | null;
+  supports: string[];
+  auth_source: string | null;
+  /**
+   * Agent `runtime` values this adapter can host. Absent = the adapter id is
+   * itself the runtime name (the common case).
+   */
+  hosts_runtimes?: string[];
+}
+
+export type ModelPinKind = 'explicit' | 'legacy-migration' | 'proposed-invalid';
+
+export interface ModelPin {
+  entry_id: string;
+  kind: ModelPinKind;
+  reason: string;
+  actor: string;
+  created_at: string;
+  expires_at: string | null;
+  fallback?: string[];
+}
+
+export interface ModelRoleAssignment {
+  tier: string;
+  required_capabilities: string[];
+  min_context: number;
+  data_scope: string;
+}
+
+export interface ModelAgentAssignment {
+  role: string;
+  pin: ModelPin | null;
+}
+
+export interface ModelCallsiteAssignment {
+  role: string;
+  pin?: ModelPin | null;
+}
+
+export interface ModelRegistry {
+  schema_version: number;
+  revision: number;
+  updated_at: string;
+  updated_by: string;
+  activation: {
+    org_default: ModelActivationMode;
+    consumers: Record<string, ModelActivationMode>;
+  };
+  adapters: Record<string, ModelAdapterDescriptor>;
+  entries: Record<string, ModelEntry>;
+  tiers: Record<string, string[]>;
+  org_default_tier: string;
+  roles: Record<string, ModelRoleAssignment>;
+  agents: Record<string, ModelAgentAssignment>;
+  callsites: Record<string, ModelCallsiteAssignment>;
+}
+
+export interface ModelValidationError {
+  code: string;
+  message: string;
+}
+
+export interface ModelResolveOverride {
+  tier?: string;
+  entry_id?: string;
+  actor: string;
+  reason: string;
+}
+
+export interface ModelResolveInput {
+  agent?: string;
+  callsite?: string;
+  role?: string;
+  override?: ModelResolveOverride;
+}
+
+export interface ModelSelection {
+  entry_id: string;
+  model_id: string;
+  provider: string;
+  runtime_adapter: string;
+  billing_mode: string;
+  cost_class: number;
+}
+
+export interface ModelResolution {
+  registry_revision: number;
+  activation: ModelActivationMode;
+  requested: {
+    source: 'override' | 'pin' | 'role' | 'org_default';
+    tier?: string;
+    entry_id?: string;
+  };
+  /** Ordered eligible entry ids remaining after validation filtering. */
+  candidates: string[];
+  selected: ModelSelection | null;
+  validation: { ok: boolean; errors: ModelValidationError[]; warnings: string[] };
+  /** What the agent config literally says today (shadow reporting only). */
+  legacy_effective?: { model_id?: string; runtime?: string };
+  /** Resolved role id, when one could be determined. */
+  role?: string;
+}
+
+export type ModelOperationKind = 'switch' | 'pin' | 'unpin' | 'revert' | 'activation';
+
+export type ModelOperationState =
+  | 'requested'
+  | 'validated'
+  | 'desired_written'
+  | 'draining'
+  | 'applied'
+  | 'blocked'
+  | 'failed';
+
+export interface ModelRestartResult {
+  agent: string;
+  ok: boolean;
+  detail: string;
+  observed_after?: string | null;
+}
+
+export interface ModelOperationReceipt {
+  operation_id: string;
+  kind: ModelOperationKind;
+  actor: string;
+  reason: string;
+  from: unknown;
+  to: unknown;
+  affected_consumers: string[];
+  registry_revision_before: number;
+  registry_revision_after: number;
+  state: ModelOperationState;
+  restart_results: ModelRestartResult[];
+  created_at: string;
+  applied_at: string | null;
+  error: string | null;
+}
+
+export interface ModelEventRecord {
+  operation_id: string;
+  state: ModelOperationState | 'revert';
+  kind: ModelOperationKind;
+  actor: string;
+  reason: string;
+  at: string;
+  registry_revision: number;
+  detail?: Record<string, unknown>;
+}
+
+export type ModelObservedConfidence = 'verified' | 'unconfirmed' | 'mismatch';
+
+export interface ModelAttemptRecord {
+  attempt_id: string;
+  consumer: string;
+  role: string | null;
+  requested: ModelResolution['requested'];
+  selected_entry: string | null;
+  model_id: string | null;
+  runtime_adapter: string | null;
+  billing_mode: string | null;
+  registry_revision: number;
+  session_ref: string | null;
+  activation: ModelActivationMode;
+  at: string;
+  observed: {
+    model_id: string | null;
+    source: string | null;
+    confidence: ModelObservedConfidence;
+    at: string | null;
+  };
+  fallback?: { from: string; reason: string };
+}
+
+/**
+ * Error classes that may trigger an automatic fallback to the next candidate.
+ * Quality / refusal / policy failures MUST NOT — see contract §3.
+ */
+export type ModelFallbackClass = 'spawn' | 'auth' | 'quota' | 'outage';

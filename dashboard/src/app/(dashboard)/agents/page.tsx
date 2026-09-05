@@ -1,5 +1,6 @@
 import { discoverAgents } from '@/lib/data/agents';
 import { AgentsGrid } from '@/components/agents/agents-grid';
+import { FleetModelRouting } from '@/components/fleet/fleet-model-routing';
 import type { AgentCardData } from '@/components/agents/agent-card';
 
 export const dynamic = 'force-dynamic';
@@ -37,6 +38,8 @@ export default async function AgentsPage({
       </div>
 
       <AgentsGrid initialAgents={agents} />
+
+      <FleetModelRouting agents={agents.map((a) => a.systemName)} />
     </div>
   );
 }

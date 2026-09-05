@@ -1,0 +1,158 @@
+{
+  "contract_version": 1,
+  "description": "Shared task identity + status projection contract for OS-01. This file is byte-identical in the CortexOS repo (tests/fixtures/) and the uhsJARVIS repo (tests/fixtures/). Both the Python projector (uhsJARVIS scripts/task_projection.py) and the TypeScript projector (CortexOS dashboard/src/lib/data/task-projection.ts) load it and MUST agree on every case below. Slice 1 rule: the owning store's native status is preserved verbatim; lanes are a projection layer only. Do not rewrite native statuses to the canonical OS-02 vocabulary here.",
+  "people": {
+    "scott": {
+      "display": "Scott Ascherman",
+      "aliases": ["scott", "scott ascherman", "sascherman", "scott@utopiahomestaging.com"],
+      "legacy_aliases": ["human", "user", "owner"]
+    },
+    "angelic": {
+      "display": "Angelic Ferguson",
+      "aliases": ["angelic", "angelic ferguson", "ange", "ange@utopiahomestaging.com"],
+      "legacy_aliases": []
+    },
+    "raquel": {
+      "display": "Raquel Lopez",
+      "aliases": ["raquel", "raquel lopez"],
+      "legacy_aliases": []
+    }
+  },
+  "legacy_title_prefixes": ["[HUMAN]"],
+  "legacy_projects": ["human-tasks"],
+  "legacy_person": "scott",
+  "agent_aliases": [
+    "jarvis", "vera", "vivienne", "trillion-coder", "tron", "client-ops",
+    "estimator", "marketing", "orchestrator", "claude-code", "codex", "hermes"
+  ],
+  "agent_alias_prefixes": ["jarvis-"],
+  "ambiguous_aliases": ["team", "staff", "uhs", "admin", "us", "someone", "anyone", "tbd", "unassigned"],
+  "legacy_status_map": {
+    "duplicate": "cancelled",
+    "archived": "cancelled"
+  },
+  "known_statuses": ["pending", "in_progress", "blocked", "completed", "cancelled", "failed"],
+  "terminal_statuses": ["completed", "cancelled"],
+  "status_lanes": {
+    "pending": { "lane": "todo", "waiting_subtype": null },
+    "in_progress": { "lane": "doing", "waiting_subtype": null },
+    "blocked": { "lane": "waiting", "waiting_subtype": "unclassified" },
+    "failed": { "lane": "waiting", "waiting_subtype": "retry" },
+    "completed": { "lane": "done", "waiting_subtype": null },
+    "cancelled": { "lane": "cancelled", "waiting_subtype": null }
+  },
+  "unknown_status_lane": { "lane": "waiting", "waiting_subtype": "unclassified" },
+  "waiting_subtype_rules": [
+    "needs_approval truthy on a non-terminal row => human",
+    "owner_kind == person on a waiting row => human",
+    "native status failed => retry",
+    "otherwise the status_lanes default, which is unclassified for blocked and unknown statuses"
+  ],
+  "cases": [
+    {
+      "name": "pending row assigned to scott is a Scott-owned todo",
+      "input": { "status": "pending", "assigned_to": "scott", "needs_approval": false, "title": "Review Richman renewal", "project": "contracts" },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "legacy human alias resolves to scott and is flagged legacy",
+      "input": { "status": "pending", "assigned_to": "human", "needs_approval": false, "title": "Call the vendor", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": true, "unassigned_recovery": false }
+    },
+    {
+      "name": "legacy user alias resolves to scott and is flagged legacy",
+      "input": { "status": "pending", "assigned_to": "user", "needs_approval": false, "title": "Decide on pricing", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": true, "unassigned_recovery": false }
+    },
+    {
+      "name": "assignee casing and whitespace are normalised",
+      "input": { "status": "pending", "assigned_to": "  Scott Ascherman ", "needs_approval": false, "title": "x", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "legacy [HUMAN] title prefix with no assignee resolves to scott",
+      "input": { "status": "pending", "assigned_to": null, "needs_approval": false, "title": "[HUMAN] sign the contract", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": true, "unassigned_recovery": false }
+    },
+    {
+      "name": "legacy human-tasks project with no assignee resolves to scott",
+      "input": { "status": "pending", "assigned_to": null, "needs_approval": false, "title": "Approve the invoice", "project": "human-tasks" },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": true, "unassigned_recovery": false }
+    },
+    {
+      "name": "angelic is a distinct person, never folded into scott",
+      "input": { "status": "pending", "assigned_to": "Ange", "needs_approval": false, "title": "Design review", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "angelic", "owner_kind": "person", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "raquel is a distinct person",
+      "input": { "status": "in_progress", "assigned_to": "raquel lopez", "needs_approval": false, "title": "Edit photos", "project": null },
+      "expect": { "status": "in_progress", "lane": "doing", "waiting_subtype": null, "person": "raquel", "owner_kind": "person", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "blocked status is preserved and lands in unclassified recovery for an agent owner",
+      "input": { "status": "blocked", "assigned_to": "jarvis-orchestrator", "needs_approval": false, "title": "Sync MLS export", "project": "mls" },
+      "expect": { "status": "blocked", "lane": "waiting", "waiting_subtype": "unclassified", "person": null, "owner_kind": "agent", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "blocked status owned by a person is a human-decision wait",
+      "input": { "status": "blocked", "assigned_to": "scott", "needs_approval": false, "title": "Pick a vendor", "project": null },
+      "expect": { "status": "blocked", "lane": "waiting", "waiting_subtype": "human", "person": "scott", "owner_kind": "person", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "failed status is preserved and lands in retry recovery",
+      "input": { "status": "failed", "assigned_to": "jarvis", "needs_approval": false, "title": "Nightly Stageforce sync", "project": "stageforce" },
+      "expect": { "status": "failed", "lane": "waiting", "waiting_subtype": "retry", "person": null, "owner_kind": "agent", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "needs_approval outranks the status default and asks for a human",
+      "input": { "status": "blocked", "assigned_to": "jarvis-estimator", "needs_approval": true, "title": "Send the proposal", "project": "estimate" },
+      "expect": { "status": "blocked", "lane": "waiting", "waiting_subtype": "human", "person": null, "owner_kind": "agent", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "unassigned non-terminal row goes to unassigned recovery",
+      "input": { "status": "pending", "assigned_to": null, "needs_approval": false, "title": "Follow up with the agent", "project": "sales" },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": null, "owner_kind": "unassigned", "legacy_alias": false, "unassigned_recovery": true }
+    },
+    {
+      "name": "empty-string assignee counts as unassigned",
+      "input": { "status": "in_progress", "assigned_to": "   ", "needs_approval": false, "title": "y", "project": null },
+      "expect": { "status": "in_progress", "lane": "doing", "waiting_subtype": null, "person": null, "owner_kind": "unassigned", "legacy_alias": false, "unassigned_recovery": true }
+    },
+    {
+      "name": "unassigned completed row is history, not recovery",
+      "input": { "status": "completed", "assigned_to": null, "needs_approval": false, "title": "z", "project": null },
+      "expect": { "status": "completed", "lane": "done", "waiting_subtype": null, "person": null, "owner_kind": "unassigned", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "ambiguous alias is flagged, never guessed onto a person",
+      "input": { "status": "pending", "assigned_to": "team", "needs_approval": false, "title": "Plan the week", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": null, "owner_kind": "ambiguous", "legacy_alias": false, "unassigned_recovery": true }
+    },
+    {
+      "name": "unrecognised assignee is unknown, not silently an agent",
+      "input": { "status": "pending", "assigned_to": "kimberly", "needs_approval": false, "title": "Unknown owner work", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": null, "owner_kind": "unknown", "legacy_alias": false, "unassigned_recovery": true }
+    },
+    {
+      "name": "unknown native status is preserved and shown as unclassified recovery",
+      "input": { "status": "needs_triage", "assigned_to": "jarvis", "needs_approval": false, "title": "Odd row", "project": null },
+      "expect": { "status": "needs_triage", "lane": "waiting", "waiting_subtype": "unclassified", "person": null, "owner_kind": "agent", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "legacy duplicate status maps to cancelled",
+      "input": { "status": "duplicate", "assigned_to": "jarvis", "needs_approval": false, "title": "Dupe", "project": null },
+      "expect": { "status": "cancelled", "lane": "cancelled", "waiting_subtype": null, "person": null, "owner_kind": "agent", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "legacy archived status maps to cancelled",
+      "input": { "status": "archived", "assigned_to": null, "needs_approval": false, "title": "Old", "project": null },
+      "expect": { "status": "cancelled", "lane": "cancelled", "waiting_subtype": null, "person": null, "owner_kind": "unassigned", "legacy_alias": false, "unassigned_recovery": false }
+    },
+    {
+      "name": "missing status defaults to pending",
+      "input": { "status": null, "assigned_to": "scott", "needs_approval": false, "title": "No status", "project": null },
+      "expect": { "status": "pending", "lane": "todo", "waiting_subtype": null, "person": "scott", "owner_kind": "person", "legacy_alias": false, "unassigned_recovery": false }
+    }
+  ]
+}

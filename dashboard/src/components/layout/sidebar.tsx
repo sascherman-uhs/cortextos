@@ -8,6 +8,7 @@ import {
   IconRobot,
   IconListCheck,
   IconLayoutList,
+  IconSunrise,
   IconShieldCheck,
   IconActivity,
   IconChartDots3,
@@ -42,6 +43,9 @@ const navItems: NavItem[] = [
   // Core
   { label: 'Overview', href: '/', icon: IconLayoutDashboard, section: 'core' },
   { label: 'Queue', href: '/queue', icon: IconLayoutList, section: 'core' },
+  // === OS-04 (2026-09-05): the morning briefing snapshot ===
+  { label: 'Briefing', href: '/briefing', icon: IconSunrise, section: 'core' },
+  // === END OS-04 ===
   // === JARVIS MOD #19 (2026-07-03): Cosmos voice-first JARVIS tab ===
   { label: 'JARVIS', href: '/jarvis', icon: IconPlanet, section: 'core' },
   // === END JARVIS MOD #19 ===

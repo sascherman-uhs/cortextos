@@ -65,6 +65,24 @@ function initializeSchema(db: Database.Database): void {
       source_file TEXT
     );
 
+    -- OS-01 additive migration: per-source freshness for the degraded banner.
+    -- Written by BOTH this dashboard's sync and the JARVIS Python projector
+    -- (uhsJARVIS scripts/cortex_dashboard_sync.py). CREATE IF NOT EXISTS on both
+    -- sides, so whichever process starts first wins and the other is a no-op.
+    -- The tasks.status column is plain TEXT with no CHECK constraint, so the
+    -- 'blocked' and 'failed' statuses this release stops discarding need no
+    -- enum change — only the writers had to stop coercing them.
+    CREATE TABLE IF NOT EXISTS source_health (
+      source              TEXT PRIMARY KEY,
+      status              TEXT NOT NULL,
+      fetched_at          TEXT,
+      source_updated_at   TEXT,
+      stale_after_seconds INTEGER,
+      last_good_at        TEXT,
+      row_count           INTEGER,
+      error               TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
