@@ -6,6 +6,12 @@ import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
+import {
+  consumeBinding,
+  isValidRef,
+  readApproval,
+  type BindingRejection,
+} from '../bus/approval-binding.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
@@ -544,53 +550,110 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       }
     }
 
-    const apprMatch = data.match(/^appr_(allow|deny)_(approval_\d+_[a-zA-Z0-9]+)$/);
-    if (!apprMatch) {
-      this.log(`activity-channel callback ignored (unknown prefix): ${data.slice(0, 40)}`);
-      try { await activityApi.answerCallbackQuery(callbackQueryId, 'Unknown button'); } catch { /* ignore */ }
+    // OS-02 bound callback: apprb_<32 hex ref>. The reference is opaque and
+    // single-use; everything it authorizes is checked server-side.
+    const boundMatch = data.match(/^apprb_([a-f0-9]{32})$/);
+    if (boundMatch) {
+      await this.routeBoundApprovalCallback(boundMatch[1], query, activityApi);
       return;
     }
 
-    await this.routeApprovalCallback(apprMatch[1] as 'allow' | 'deny', apprMatch[2], query, activityApi);
+    // Legacy unbound callback: appr_(allow|deny)_<approval_id>. These carry the
+    // approval id in the clear and prove nothing about version, payload, bot,
+    // chat or decider, so they can no longer authorize anything. They are
+    // rejected with an explanation rather than silently ignored, because a
+    // button that does nothing and says nothing is how a decision gets lost.
+    if (/^appr_(allow|deny)_/.test(data)) {
+      this.log(`activity-channel callback REJECTED (legacy unbound button): ${data.slice(0, 60)}`);
+      try {
+        await activityApi.answerCallbackQuery(
+          callbackQueryId,
+          'This button predates approval binding and can no longer authorize. Open the current request.',
+        );
+      } catch { /* ignore */ }
+      return;
+    }
+
+    this.log(`activity-channel callback ignored (unknown prefix): ${data.slice(0, 40)}`);
+    try { await activityApi.answerCallbackQuery(callbackQueryId, 'Unknown button'); } catch { /* ignore */ }
   }
 
   /**
-   * Shared approval-callback resolution path. Called by both handleCallback
-   * (agent's own bot) and handleActivityCallback (activity-channel bot).
+   * Resolve one BOUND approval callback (OS-02).
    *
-   * Resolves the approval via updateApproval (which moves the file from
-   * pending/ to resolved/ and notifies the requesting agent via inbox),
-   * answers the Telegram callback so the spinner stops, and edits the
-   * original message to show who approved/denied for the audit trail.
+   * The button carries only an opaque reference. Everything that decides
+   * whether it may authorize — the approval's current version and payload
+   * hash, which bot posted it, which chat it was posted in, who is allowed to
+   * click it, whether it expired, whether it was already used — is verified
+   * server-side against the approval authority and consumed in the same locked
+   * step. A duplicate click therefore records ONE decision, and a forwarded,
+   * replayed, expired or stale button records none.
    *
-   * `api` is the TelegramAPI that owns the bot the callback came from —
-   * answerCallbackQuery and editMessageText must target the same bot.
+   * A rejection is never silent. The person gets the reason and, where the
+   * request still exists, the CURRENT request re-rendered, so a stale button
+   * turns into an informed decision instead of a dead end.
    */
-  private async routeApprovalCallback(
-    decision: 'allow' | 'deny',
-    approvalId: string,
+  private async routeBoundApprovalCallback(
+    ref: string,
     query: TelegramCallbackQuery,
     api: TelegramAPI | undefined,
   ): Promise<void> {
+    const callbackQueryId = query.id;
     const chatId = query.message?.chat?.id;
     const messageId = query.message?.message_id;
-    const callbackQueryId = query.id;
-    const status = decision === 'allow' ? 'approved' : 'rejected';
 
-    // Build a friendly audit-trail suffix: "by Alice (@alice)" or just
-    // "by Alice" if no username. Falls back to the Telegram user id if
-    // both are missing (shouldn't happen in practice but guards edge).
+    if (!isValidRef(ref)) {
+      if (api) { try { await api.answerCallbackQuery(callbackQueryId, 'Invalid button'); } catch { /* ignore */ } }
+      return;
+    }
+
+    const result = consumeBinding(this.paths, ref, {
+      decider: query.from?.id ?? 'unknown',
+      botIdentity: api?.botId ?? 'unknown-bot',
+      chatId: chatId ?? '',
+    });
+
+    if (!result.ok) {
+      const rejection = result.rejection as BindingRejection;
+      this.log(`Approval callback REJECTED (${rejection}) ref=${ref.slice(0, 8)}… : ${result.detail ?? ''}`);
+      if (api) {
+        try { await api.answerCallbackQuery(callbackQueryId, this.rejectionMessage(rejection)); } catch { /* ignore */ }
+        // Re-render the request as it stands now, so the person can act on the
+        // real thing instead of guessing what changed.
+        const current = result.current ?? (result.binding ? readApproval(this.paths, result.binding.approval_id) : null);
+        if (chatId && messageId && current) {
+          const body = [
+            `⚠️ ${this.rejectionMessage(rejection)}`,
+            '',
+            `Current request: ${current.title}`,
+            `Category: ${current.category} · Status: ${current.status}`,
+            current.description ? '' : undefined,
+            current.description || undefined,
+            '',
+            `id: ${current.id}`,
+          ].filter((l) => l !== undefined).join('\n');
+          try { await api.editMessageText(chatId, messageId, body); } catch { /* ignore */ }
+        }
+      }
+      return;
+    }
+
+    const binding = result.binding!;
+    const status = binding.action === 'allow' ? 'approved' : 'rejected';
     const firstName = query.from?.first_name;
     const username = query.from?.username;
     const auditWho = firstName && username
       ? `${firstName} (@${username})`
       : firstName ?? (username ? `@${username}` : `user ${query.from?.id ?? 'unknown'}`);
-    const auditNote = `via Telegram activity channel by ${auditWho}`;
 
     try {
-      updateApproval(this.paths, approvalId, status, auditNote);
+      updateApproval(this.paths, binding.approval_id, status, `via Telegram by ${auditWho}`, {
+        route: 'telegram',
+        decider: String(query.from?.id ?? 'unknown'),
+        bindingRef: ref,
+      });
     } catch (err) {
-      this.log(`Approval callback: updateApproval failed for ${approvalId}: ${err}`);
+      this.log(`Approval callback: updateApproval failed for ${binding.approval_id}: ${err}`);
       if (api) {
         try { await api.answerCallbackQuery(callbackQueryId, 'Approval not found or already resolved'); } catch { /* ignore */ }
       }
@@ -598,13 +661,31 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     }
 
     if (api) {
-      try { await api.answerCallbackQuery(callbackQueryId, decision === 'allow' ? 'Approved' : 'Denied'); } catch { /* ignore */ }
+      try { await api.answerCallbackQuery(callbackQueryId, binding.action === 'allow' ? 'Approved' : 'Denied'); } catch { /* ignore */ }
       if (chatId && messageId) {
-        const label = decision === 'allow' ? `✅ Approved by ${auditWho}` : `❌ Denied by ${auditWho}`;
+        const label = binding.action === 'allow' ? `✅ Approved by ${auditWho}` : `❌ Denied by ${auditWho}`;
         try { await api.editMessageText(chatId, messageId, label); } catch { /* ignore */ }
       }
     }
-    this.log(`Approval callback: ${decision} for ${approvalId} by ${auditWho}`);
+    // The decision is recorded. Execution is a SEPARATE event with its own
+    // intent and provider receipt — no external effect happens here.
+    this.log(`Approval decision recorded: ${status} for ${binding.approval_id} by ${auditWho} (execution pending its own intent)`);
+  }
+
+  /** Plain-language reason a bound button was refused. */
+  private rejectionMessage(rejection: BindingRejection): string {
+    switch (rejection) {
+      case 'already_consumed': return 'This decision was already recorded.';
+      case 'expired': return 'This approval button has expired. Open the current request.';
+      case 'wrong_decider': return 'This button was issued to a different person.';
+      case 'wrong_bot': return 'This button belongs to a different bot.';
+      case 'wrong_chat': return 'A forwarded approval button cannot authorize anything.';
+      case 'version_changed':
+      case 'payload_changed': return 'The request changed since this button was posted, so it no longer applies.';
+      case 'approval_resolved': return 'This request has already been decided.';
+      case 'approval_missing': return 'The request this button refers to no longer exists.';
+      default: return 'This approval button is not valid.';
+    }
   }
 
   /**
@@ -632,9 +713,21 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // handleActivityCallback) but may also arrive here if an operator
     // ever routes an approval button through the agent's own bot. The
     // prefix check is cheap and routing-agnostic.
-    const apprMatch = data.match(/^appr_(allow|deny)_(approval_\d+_[a-zA-Z0-9]+)$/);
-    if (apprMatch) {
-      await this.routeApprovalCallback(apprMatch[1] as 'allow' | 'deny', apprMatch[2], query, this.telegramApi);
+    const boundMatch = data.match(/^apprb_([a-f0-9]{32})$/);
+    if (boundMatch) {
+      await this.routeBoundApprovalCallback(boundMatch[1], query, this.telegramApi);
+      return;
+    }
+    if (/^appr_(allow|deny)_/.test(data)) {
+      this.log(`approval callback REJECTED (legacy unbound button): ${data.slice(0, 60)}`);
+      if (this.telegramApi) {
+        try {
+          await this.telegramApi.answerCallbackQuery(
+            callbackQueryId,
+            'This button predates approval binding and can no longer authorize. Open the current request.',
+          );
+        } catch { /* ignore */ }
+      }
       return;
     }
 

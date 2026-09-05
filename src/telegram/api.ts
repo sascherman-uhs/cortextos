@@ -87,8 +87,20 @@ export class TelegramAPI {
   // diagnostic emitted at most once per chat_id per process lifetime.
   private warnedSelfChat: Set<string> = new Set();
 
+  /**
+   * Public half of the bot token (`<bot_id>:<secret>` -> `<bot_id>`).
+   *
+   * OS-02 approval bindings record which bot a button was posted on, so a
+   * callback arriving on a different bot can be refused. Only the id half is
+   * kept: it is not a credential, so a binding file, a log line or a backup
+   * never carries the secret.
+   */
+  readonly botId: string;
+
   constructor(token: string) {
     this.baseUrl = `https://api.telegram.org/bot${token}`;
+    const id = String(token ?? '').split(':')[0];
+    this.botId = /^\d+$/.test(id) ? id : 'unknown-bot';
   }
 
   /**
