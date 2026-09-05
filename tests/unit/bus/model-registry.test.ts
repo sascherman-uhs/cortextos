@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync, existsSync } from 'fs';
+import { homedir } from 'os';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   DEFAULT_ORG,
+  agentsDir,
   RegistryConflictError,
   RegistryNotFoundError,
   SwitchLockedError,
@@ -21,6 +23,7 @@ import {
   migrateBootstrap,
   observeClaudeModel,
   observeCodexModel,
+  promptCorrelates,
   probeEntryHealth,
   recordAttempt,
   releaseSwitchLock,
@@ -840,12 +843,116 @@ describe('observed-model capture', () => {
         JSON.stringify({ type: 'assistant', message: { model: '<synthetic>' } }),
       ].join('\n'),
     );
-    const observed = observeClaudeModel({ cwd, projectsRoot: projects });
-    expect(observed).toEqual({ model_id: 'claude-haiku-4-5-20251001', source: 'claude-transcript' });
+    const observed = observeClaudeModel({ cwd, sessionId: 'sess-1', projectsRoot: projects });
+    expect(observed).toEqual({
+      model_id: 'claude-haiku-4-5-20251001',
+      source: 'claude-transcript',
+      binding: 'session-id',
+    });
   });
 
   it('returns null when there is no transcript rather than guessing from config', () => {
     expect(observeClaudeModel({ cwd: '/nope/nothing', projectsRoot: join(root, 'claude-projects') })).toBeNull();
+  });
+
+  // --- shared-cwd binding (the production defect) ------------------------
+  //
+  // jarvis-accounting and jarvis-estimator both run in .../uhsEstimate, and
+  // five agents share .../uhsJARVIS. "Newest .jsonl in the slug directory"
+  // therefore attributed one agent's model to another.
+
+  const SHARED_CWD = '/Users/test/shared-workspace';
+
+  function seedTranscripts(): { projects: string; dir: string } {
+    const projects = join(root, 'claude-projects');
+    const dir = join(projects, SHARED_CWD.replace(/[/.\\ ]/g, '-'));
+    mkdirSync(dir, { recursive: true });
+    // Agent A: started earlier, runs haiku, boot prompt A.
+    writeFileSync(
+      join(dir, 'sess-a.jsonl'),
+      [
+        JSON.stringify({ type: 'user', message: { content: 'You are jarvis-accounting. Reconcile the ledger.' } }),
+        JSON.stringify({ type: 'assistant', message: { model: 'claude-haiku-4-5-20251001' } }),
+      ].join('\n'),
+    );
+    // Agent B: newest file in the same directory, runs sonnet.
+    writeFileSync(
+      join(dir, 'sess-b.jsonl'),
+      [
+        JSON.stringify({ type: 'user', message: { content: 'You are jarvis-estimator. Price the proposal.' } }),
+        JSON.stringify({ type: 'assistant', message: { model: 'claude-sonnet-4-6' } }),
+      ].join('\n'),
+    );
+    const old = new Date('2026-09-05T11:00:00Z');
+    const recent = new Date('2026-09-05T12:05:00Z');
+    utimesSync(join(dir, 'sess-a.jsonl'), old, old);
+    utimesSync(join(dir, 'sess-b.jsonl'), recent, recent);
+    return { projects, dir };
+  }
+
+  it('binds by session id, not by newest file, when two agents share a cwd', () => {
+    const { projects } = seedTranscripts();
+    const observed = observeClaudeModel({ cwd: SHARED_CWD, sessionId: 'sess-a', projectsRoot: projects });
+    expect(observed?.model_id).toBe('claude-haiku-4-5-20251001');
+    expect(observed?.binding).toBe('session-id');
+  });
+
+  it('returns null when the bound session has no transcript, instead of falling back to a neighbour', () => {
+    const { projects } = seedTranscripts();
+    expect(
+      observeClaudeModel({ cwd: SHARED_CWD, sessionId: 'sess-nonexistent', projectsRoot: projects }),
+    ).toBeNull();
+  });
+
+  it('correlates by boot prompt when no session id is available', () => {
+    const { projects } = seedTranscripts();
+    const observed = observeClaudeModel({
+      cwd: SHARED_CWD,
+      since: new Date('2026-09-05T10:00:00Z'),
+      bootPrompt: 'You are jarvis-accounting. Reconcile the ledger.',
+      projectsRoot: projects,
+    });
+    // The newest file (sess-b) does NOT win — the prompt says whose it is.
+    expect(observed?.model_id).toBe('claude-haiku-4-5-20251001');
+    expect(observed?.binding).toBe('prompt-correlated');
+  });
+
+  it('ignores a transcript last written before the spawn, however recently touched', () => {
+    const { projects } = seedTranscripts();
+    expect(
+      observeClaudeModel({
+        cwd: SHARED_CWD,
+        since: new Date('2026-09-05T12:00:00Z'), // after sess-a's mtime
+        bootPrompt: 'You are jarvis-accounting. Reconcile the ledger.',
+        projectsRoot: projects,
+      }),
+    ).toBeNull();
+  });
+
+  it('reports nothing (never a guess) when neither a session id nor a boot prompt is available', () => {
+    const { projects } = seedTranscripts();
+    expect(
+      observeClaudeModel({ cwd: SHARED_CWD, since: new Date('2026-09-05T10:00:00Z'), projectsRoot: projects }),
+    ).toBeNull();
+  });
+
+  it('does not correlate on a boot prompt too short to identify a session', () => {
+    expect(promptCorrelates('You are jarvis-accounting. Reconcile the ledger.', 'hello')).toBe(false);
+  });
+
+  it('skips a <synthetic> placeholder in a session-bound transcript', () => {
+    const projects = join(root, 'claude-projects');
+    const dir = join(projects, SHARED_CWD.replace(/[/.\\ ]/g, '-'));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'sess-syn.jsonl'),
+      [
+        JSON.stringify({ type: 'assistant', message: { model: 'claude-sonnet-4-6' } }),
+        JSON.stringify({ type: 'assistant', message: { model: '<synthetic>' } }),
+      ].join('\n'),
+    );
+    const observed = observeClaudeModel({ cwd: SHARED_CWD, sessionId: 'sess-syn', projectsRoot: projects });
+    expect(observed?.model_id).toBe('claude-sonnet-4-6');
   });
 
   it('reads turn_context.payload.model from a codex rollout bound by thread id', () => {
@@ -859,12 +966,131 @@ describe('observed-model capture', () => {
       ].join('\n'),
     );
     const observed = observeCodexModel({ threadId: 'thread_abc', sessionsRoot: join(root, 'codex-sessions') });
-    expect(observed).toEqual({ model_id: 'gpt-5-codex', source: 'codex-rollout' });
+    expect(observed).toEqual({ model_id: 'gpt-5-codex', source: 'codex-rollout', binding: 'thread-id' });
   });
 
   it('returns null for a codex thread with no matching rollout', () => {
     mkdirSync(join(root, 'codex-sessions'), { recursive: true });
     expect(observeCodexModel({ threadId: 'thread_missing', sessionsRoot: join(root, 'codex-sessions') })).toBeNull();
+  });
+});
+
+describe('observation confidence baseline (shadow vs enforced)', () => {
+  // In shadow the registry's pick is a PROPOSAL: the legacy config model is
+  // what actually runs. Comparing the observation against the proposal made
+  // every correctly-behaving shadow agent look like a mismatch.
+  it('compares a shadow observation against the legacy model that actually ran', () => {
+    writeAgentConfig('jarvis-orchestrator', { model: 'claude-haiku-4-5-20251001' });
+    const res = resolve({ agent: 'jarvis-orchestrator' }, ctx);
+    expect(res.activation).toBe('shadow');
+    expect(res.selected!.model_id).toBe('claude-sonnet-4-6');
+
+    const { path } = recordAttempt({ consumer: 'jarvis-orchestrator', resolution: res }, ctx);
+    expect(JSON.parse(readFileSync(path, 'utf-8')).expected_model_id).toBe('claude-haiku-4-5-20251001');
+
+    const rec = updateAttemptObserved(
+      path,
+      { model_id: 'claude-haiku-4-5-20251001', source: 'claude-transcript', binding: 'session-id' },
+      ctx,
+    );
+    expect(rec!.observed.confidence).toBe('verified');
+  });
+
+  it('still flags a shadow observation that contradicts the legacy model', () => {
+    writeAgentConfig('jarvis-orchestrator', { model: 'claude-haiku-4-5-20251001' });
+    const res = resolve({ agent: 'jarvis-orchestrator' }, ctx);
+    const { path } = recordAttempt({ consumer: 'jarvis-orchestrator', resolution: res }, ctx);
+    const rec = updateAttemptObserved(
+      path,
+      { model_id: 'claude-sonnet-4-6', source: 'claude-transcript', binding: 'session-id' },
+      ctx,
+    );
+    expect(rec!.observed.confidence).toBe('mismatch');
+  });
+
+  it('compares an enforced observation against the resolved model', () => {
+    const reg = loadRegistry(ctx);
+    reg.activation.org_default = 'enforced';
+    saveRegistryCAS(reg, reg.revision, ctx);
+    writeAgentConfig('jarvis-orchestrator', { model: 'claude-haiku-4-5-20251001' });
+
+    const res = resolve({ agent: 'jarvis-orchestrator' }, ctx);
+    const { path } = recordAttempt({ consumer: 'jarvis-orchestrator', resolution: res }, ctx);
+    expect(JSON.parse(readFileSync(path, 'utf-8')).expected_model_id).toBe('claude-sonnet-4-6');
+    const rec = updateAttemptObserved(
+      path,
+      { model_id: 'claude-haiku-4-5-20251001', source: 'claude-transcript', binding: 'session-id' },
+      ctx,
+    );
+    expect(rec!.observed.confidence).toBe('mismatch');
+  });
+
+  it('leaves an unbound observation unconfirmed rather than verified or mismatch', () => {
+    const res = resolve({ agent: 'jarvis-mls' }, ctx);
+    const { path } = recordAttempt({ consumer: 'jarvis-mls', resolution: res }, ctx);
+    const rec = updateAttemptObserved(
+      path,
+      { model_id: 'claude-haiku-4-5-20251001', source: 'claude-transcript', binding: 'unbound' },
+      ctx,
+    );
+    expect(rec!.observed.confidence).toBe('unconfirmed');
+  });
+});
+
+describe('root resolution (registry and agent configs must agree)', () => {
+  const ENV_KEYS = ['CTX_MODEL_REGISTRY_ROOT', 'CTX_FRAMEWORK_ROOT', 'CTX_PROJECT_ROOT', 'CTX_ROOT', 'CTX_ORG'];
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of ENV_KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  it('reads agent configs from the same root the registry resolved from (plain shell → ~/cortextos)', () => {
+    // A plain shell with no CTX_* env: the registry falls back to ~/cortextos,
+    // so the agents directory must be there too — not nowhere.
+    expect(resolveRegistryPaths({}).root).toBe(join(homedir(), 'cortextos'));
+    expect(agentsDir({})).toBe(join(homedir(), 'cortextos', 'orgs', DEFAULT_ORG, 'agents'));
+  });
+
+  it('scans the agent configs under the root the registry came from (CTX_ROOT, no other env)', () => {
+    // Reproduces the deploy defect: the registry resolved through a root that
+    // the agent-config reader did not consult, so bootstrap scanned zero
+    // configs while still bumping a revision.
+    process.env.CTX_ROOT = root;
+    writeAgentConfig('jarvis-mls', { model: 'claude-haiku-4-5-20251001' });
+    writeAgentConfig('jarvis-orchestrator', { model: 'claude-sonnet-4-6' });
+
+    const bare: RegistryContext = { now: () => FROZEN };
+    expect(agentsDir(bare)).toBe(join(root, 'orgs', DEFAULT_ORG, 'agents'));
+
+    const result = migrateBootstrap({ ...bare, createHumanTask: () => null });
+    expect(result.scanned).toEqual(expect.arrayContaining(['jarvis-mls', 'jarvis-orchestrator']));
+    expect(result.legacy_pins.length).toBe(2);
+    expect(loadRegistry(bare).revision).toBe(2);
+  });
+
+  it('does not bump the registry revision when it scans zero agent configs', () => {
+    process.env.CTX_ROOT = root; // registry present, no agents/ directory at all
+    const bare: RegistryContext = { now: () => FROZEN };
+    const result = migrateBootstrap({ ...bare, createHumanTask: () => null });
+
+    expect(result.scanned).toEqual([]);
+    expect(result.agents_dir).toBe(join(root, 'orgs', DEFAULT_ORG, 'agents'));
+    expect(result.registry_revision).toBe(1);
+    expect(loadRegistry(bare).revision).toBe(1);
+    const eventsDir = resolveRegistryPaths(bare).eventsDir;
+    expect(existsSync(eventsDir) ? readdirSync(eventsDir).filter((f) => f.endsWith('.json')) : []).toEqual([]);
   });
 });
 

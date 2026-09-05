@@ -284,4 +284,23 @@ describe('cortextos model migrate --bootstrap', () => {
   it('refuses a migrate without --bootstrap', async () => {
     await expect(run(['migrate', '--json'])).rejects.toThrow('process.exit:1');
   });
+
+  it('reports the directory it scanned so a wrong root is visible', async () => {
+    await run(['migrate', '--bootstrap', '--json']);
+    const result = json<{ agents_dir: string; scanned: string[] }>();
+    expect(result.agents_dir).toBe(join(root, 'orgs', 'uhs', 'agents'));
+    expect(result.scanned).toContain('jarvis-mls');
+  });
+});
+
+describe('cortextos model migrate --bootstrap with no agent configs', () => {
+  it('imports nothing, bumps no revision, and says where it looked', async () => {
+    // No agents/ directory under this root at all.
+    await run(['migrate', '--bootstrap']);
+    const reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
+    expect(reg.revision).toBe(1);
+    expect(logs.join('\n')).toContain(join(root, 'orgs', 'uhs', 'agents'));
+    expect(logs.join('\n')).toContain('registry untouched');
+    expect(existsSync(join(root, 'orgs', 'uhs', 'model-events'))).toBe(false);
+  });
 });

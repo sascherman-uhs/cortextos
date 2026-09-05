@@ -32,6 +32,7 @@ import type {
   ModelAttemptRecord,
   ModelEventRecord,
   ModelFallbackClass,
+  ModelObservationBinding,
   ModelObservedConfidence,
   ModelOperationKind,
   ModelOperationReceipt,
@@ -342,26 +343,28 @@ export function isPinDispatchable(pin: ModelPin | null | undefined, at: Date): b
 // Legacy config reading (shadow reporting only — never written)
 // ---------------------------------------------------------------------------
 
+/**
+ * Directory holding `<agent>/config.json`, always under the SAME root the
+ * registry itself resolved from (`resolveRegistryPaths`).
+ *
+ * Before this was true, `readAgentConfig` kept its own root list that omitted
+ * `CTX_ROOT` and the `~/cortextos` fallback: from a plain shell the registry
+ * was found (via the fallback) while zero agent configs were, so
+ * `cortextos model migrate --bootstrap` imported nothing and still bumped a
+ * revision. One root, or the registry and the agents it describes can disagree.
+ */
+export function agentsDir(ctx: RegistryContext = {}): string {
+  return join(resolveRegistryPaths(ctx).orgDir, 'agents');
+}
+
 export function readAgentConfig(agent: string, ctx: RegistryContext = {}): AgentConfig | null {
-  const org = ctx.org || process.env.CTX_ORG || DEFAULT_ORG;
-  const roots = [
-    ctx.frameworkRoot,
-    process.env.CTX_FRAMEWORK_ROOT,
-    process.env.CTX_PROJECT_ROOT,
-    ctx.root,
-    process.env.CTX_MODEL_REGISTRY_ROOT,
-  ].filter(Boolean) as string[];
-  for (const root of roots) {
-    const p = join(root, 'orgs', org, 'agents', agent, 'config.json');
-    if (existsSync(p)) {
-      try {
-        return JSON.parse(readFileSync(p, 'utf-8')) as AgentConfig;
-      } catch {
-        return null;
-      }
-    }
+  const p = join(agentsDir(ctx), agent, 'config.json');
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, 'utf-8')) as AgentConfig;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +570,20 @@ export interface RecordAttemptInput {
   fallback?: { from: string; reason: string };
 }
 
+/**
+ * The model that a spawn from this resolution ACTUALLY dispatches — the only
+ * honest baseline for an observation.
+ *
+ * In `shadow` the registry's `selected` entry is a proposal: the legacy config
+ * model is what runs, so comparing an observation against `selected` reported
+ * a "mismatch" for every correctly-behaving shadow agent. In `enforced` the
+ * resolved model is passed to the adapter, so it is the baseline.
+ */
+export function expectedModelId(res: ModelResolution): string | null {
+  if (res.activation === 'enforced') return res.selected?.model_id ?? null;
+  return res.legacy_effective?.model_id ?? res.selected?.model_id ?? null;
+}
+
 export function recordAttempt(input: RecordAttemptInput, ctx: RegistryContext = {}): { id: string; path: string } {
   const paths = resolveRegistryPaths(ctx);
   ensureDir(paths.attemptsDir);
@@ -585,6 +602,7 @@ export function recordAttempt(input: RecordAttemptInput, ctx: RegistryContext = 
     registry_revision: res.registry_revision,
     session_ref: input.sessionRef ?? null,
     activation: res.activation,
+    expected_model_id: expectedModelId(res),
     at,
     observed: {
       model_id: input.observed?.model_id ?? null,
@@ -615,22 +633,30 @@ export function readAttempt(attemptPath: string): ModelAttemptRecord | null {
  * was observed. A config-derived label is NEVER written here — the caller must
  * pass a value read from runtime evidence.
  */
+/** Bindings strong enough to attribute a transcript to THIS spawn. */
+export const STRONG_OBSERVATION_BINDINGS: ModelObservationBinding[] = ['session-id', 'thread-id', 'prompt-correlated'];
+
 export function updateAttemptObserved(
   attemptPath: string,
-  observed: { model_id: string | null; source: string | null },
+  observed: { model_id: string | null; source: string | null; binding?: ModelObservationBinding },
   ctx: RegistryContext = {},
 ): ModelAttemptRecord | null {
   const record = readAttempt(attemptPath);
   if (!record) return null;
+  // Baseline = what actually ran (see expectedModelId). Older records written
+  // before that field existed fall back to the resolved model.
+  const baseline = record.expected_model_id ?? record.model_id;
+  const bound = observed.binding ? STRONG_OBSERVATION_BINDINGS.includes(observed.binding) : true;
   let confidence: ModelObservedConfidence = 'unconfirmed';
-  if (observed.model_id) {
-    confidence = record.model_id && observed.model_id !== record.model_id ? 'mismatch' : 'verified';
+  if (observed.model_id && bound && baseline) {
+    confidence = observed.model_id !== baseline ? 'mismatch' : 'verified';
   }
   record.observed = {
     model_id: observed.model_id,
     source: observed.source,
     confidence,
     at: observed.model_id ? isoOf(ctx) : null,
+    ...(observed.binding ? { binding: observed.binding } : {}),
   };
   atomicWriteSync(attemptPath, JSON.stringify(record, null, 2));
   return record;
@@ -661,29 +687,145 @@ export function claudeProjectSlug(cwd: string): string {
   return cwd.replace(/[/.\\ ]/g, '-');
 }
 
+/** Read at most `bytes` from the head of a file (transcripts get large). */
+function readHead(path: string, bytes: number): string {
+  let fd: number | null = null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs') as typeof import('fs');
+    fd = fs.openSync(path, 'r');
+    const buf = Buffer.alloc(bytes);
+    const read = fs.readSync(fd, buf, 0, bytes, 0);
+    return buf.toString('utf-8', 0, read);
+  } catch {
+    return '';
+  } finally {
+    if (fd !== null) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        (require('fs') as typeof import('fs')).closeSync(fd);
+      } catch { /* ignore */ }
+    }
+  }
+}
+
+/** Whitespace-collapsed lowercase text, for prompt fingerprint comparison. */
+function normalizeText(v: string): string {
+  return v.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function textOfMessageContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string'
+        ? (part as { text: string }).text
+        : ''))
+      .join(' ');
+  }
+  return '';
+}
+
+/** First user message text in a transcript (head-limited read). */
+export function transcriptFirstUserText(path: string, headBytes = 256 * 1024): string | null {
+  const head = readHead(path, headBytes);
+  if (!head) return null;
+  for (const raw of head.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    let rec: Record<string, unknown>;
+    try {
+      rec = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue; // a truncated tail line at the head boundary
+    }
+    if (rec.type !== 'user') continue;
+    const message = rec.message as Record<string, unknown> | undefined;
+    const text = textOfMessageContent(message?.content);
+    if (text.trim()) return text;
+  }
+  return null;
+}
+
 /**
- * Newest assistant `message.model` from a Claude Code transcript, bound by cwd
- * (and session id when known). `<synthetic>` placeholders are ignored — they
- * are Claude Code's own filler, not a model identity.
+ * Does this transcript's first user message correlate with the prompt the PTY
+ * launched with? A fingerprint is enough — Claude Code may prepend/append its
+ * own scaffolding around the prompt we passed.
+ */
+export function promptCorrelates(firstUserText: string | null, bootPrompt: string): boolean {
+  if (!firstUserText) return false;
+  const prompt = normalizeText(bootPrompt);
+  if (prompt.length < 24) return false; // too short to identify a session
+  const haystack = normalizeText(firstUserText);
+  const fingerprint = prompt.slice(0, 160);
+  return haystack.includes(fingerprint) || prompt.includes(haystack.slice(0, 160));
+}
+
+/** Newest non-synthetic assistant `message.model` in one transcript file. */
+function newestModelInTranscript(path: string): string | null {
+  let lines: string[];
+  try {
+    lines = readFileSync(path, 'utf-8').split('\n');
+  } catch {
+    return null;
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let rec: Record<string, unknown>;
+    try {
+      rec = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const message = rec.message as Record<string, unknown> | undefined;
+    const model = message && typeof message.model === 'string' ? message.model : null;
+    // `<synthetic>` is Claude Code's own filler, not a model identity.
+    if (model && model !== '<synthetic>') return model;
+  }
+  return null;
+}
+
+/**
+ * Newest assistant `message.model` from the Claude Code transcript that belongs
+ * to THIS spawn.
+ *
+ * The cwd slug alone does not identify an agent: five UHS agents share
+ * `…/uhsJARVIS` and two share `…/uhsEstimate`, so "newest .jsonl in the slug
+ * directory" attributed another agent's (or Scott's own) session — the reason
+ * jarvis-accounting reported a model its config never names. Binding is
+ * therefore either the session id the PTY launched with, or a transcript that
+ * is BOTH newer than the spawn AND opens with the boot prompt. Anything weaker
+ * returns null, and the attempt stays `unconfirmed`.
  */
 export function observeClaudeModel(opts: {
   cwd: string;
   sessionId?: string | null;
   since?: Date;
+  bootPrompt?: string | null;
   projectsRoot?: string;
-}): { model_id: string; source: string } | null {
+}): { model_id: string; source: string; binding: ModelObservationBinding } | null {
   const root = opts.projectsRoot || join(homedir(), '.claude', 'projects');
   const dir = join(root, claudeProjectSlug(opts.cwd));
   if (!existsSync(dir)) return null;
+
+  // 1. Session id — exact. Never fall back to "some other file in this dir".
+  if (opts.sessionId) {
+    const p = join(dir, `${opts.sessionId}.jsonl`);
+    if (!existsSync(p)) return null;
+    const model = newestModelInTranscript(p);
+    return model ? { model_id: model, source: 'claude-transcript', binding: 'session-id' } : null;
+  }
+
+  // 2. Correlation — needs both a spawn timestamp and the prompt we launched
+  //    with. Without them there is no way to tell whose transcript this is.
+  if (!opts.since || !opts.bootPrompt) return null;
+
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.endsWith('.jsonl'));
   } catch {
     return null;
-  }
-  if (opts.sessionId) {
-    const match = files.find((f) => f === `${opts.sessionId}.jsonl`);
-    files = match ? [match] : files;
   }
   const ranked = files
     .map((f) => {
@@ -695,31 +837,15 @@ export function observeClaudeModel(opts: {
       }
     })
     .filter((x): x is { p: string; mtime: number } => x !== null)
-    .filter((x) => (opts.since ? x.mtime >= opts.since.getTime() - 60_000 : true))
+    // Strictly after the spawn: a file last written before this agent started
+    // cannot be its session, however recently it was touched.
+    .filter((x) => x.mtime >= (opts.since as Date).getTime())
     .sort((a, b) => b.mtime - a.mtime);
 
   for (const { p } of ranked) {
-    let lines: string[];
-    try {
-      lines = readFileSync(p, 'utf-8').split('\n');
-    } catch {
-      continue;
-    }
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      let rec: Record<string, unknown>;
-      try {
-        rec = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
-      const message = rec.message as Record<string, unknown> | undefined;
-      const model = message && typeof message.model === 'string' ? message.model : null;
-      if (model && model !== '<synthetic>') {
-        return { model_id: model, source: 'claude-transcript' };
-      }
-    }
+    if (!promptCorrelates(transcriptFirstUserText(p), opts.bootPrompt)) continue;
+    const model = newestModelInTranscript(p);
+    if (model) return { model_id: model, source: 'claude-transcript', binding: 'prompt-correlated' };
   }
   return null;
 }
@@ -733,7 +859,7 @@ export function observeCodexModel(opts: {
   threadId: string;
   since?: Date;
   sessionsRoot?: string;
-}): { model_id: string; source: string } | null {
+}): { model_id: string; source: string; binding: ModelObservationBinding } | null {
   const root = opts.sessionsRoot || join(homedir(), '.codex', 'sessions');
   if (!existsSync(root)) return null;
 
@@ -780,7 +906,9 @@ export function observeCodexModel(opts: {
         const rec = JSON.parse(line) as Record<string, unknown>;
         const payload = rec.payload as Record<string, unknown> | undefined;
         if (rec.type === 'turn_context' && payload && typeof payload.model === 'string') {
-          return { model_id: payload.model, source: 'codex-rollout' };
+          // The rollout file contains the thread id the PTY launched — that is
+          // an exact binding, not a newest-file guess.
+          return { model_id: payload.model, source: 'codex-rollout', binding: 'thread-id' };
         }
       } catch { /* skip malformed line */ }
     }
@@ -1266,6 +1394,8 @@ export function findOperationEvents(operationId: string, ctx: RegistryContext = 
 // ---------------------------------------------------------------------------
 
 export interface BootstrapResult {
+  /** Directory actually scanned for `<agent>/config.json` (root diagnosis). */
+  agents_dir: string;
   scanned: string[];
   legacy_pins: { agent: string; entry_id: string; expires_at: string }[];
   proposed_invalid: { agent: string; entry_id: string | null; model: string; runtime: string; reason: string; task_id?: string }[];
@@ -1294,6 +1424,7 @@ export function migrateBootstrap(opts: BootstrapOptions = {}): BootstrapResult {
   const reg = loadRegistry(ctx);
   const actor = opts.actor || 'jarvis';
   const result: BootstrapResult = {
+    agents_dir: agentsDir(ctx),
     scanned: [],
     legacy_pins: [],
     proposed_invalid: [],
@@ -1375,7 +1506,10 @@ export function migrateBootstrap(opts: BootstrapOptions = {}): BootstrapResult {
     result.proposed_invalid.push(item);
   }
 
-  if (!opts.dryRun) {
+  // A scan that found no agent config changed nothing: writing here would bump
+  // the revision (and journal an event) for a no-op, which is exactly what a
+  // misresolved root used to do silently.
+  if (!opts.dryRun && result.scanned.length > 0) {
     reg.updated_by = actor;
     const written = saveRegistryCAS(reg, result.registry_revision, ctx);
     result.registry_revision = written.revision;
