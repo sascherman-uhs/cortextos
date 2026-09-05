@@ -1,6 +1,7 @@
 import { join } from 'path';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
+import { randomUUID } from 'crypto';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 
@@ -43,6 +44,14 @@ export class AgentPTY {
    * byte-for-byte.
    */
   private modelOverride: string | null = null;
+  /**
+   * Provenance (OS-02b-core): the session id this PTY told Claude Code to use
+   * on a `fresh` spawn, so the transcript at
+   * `~/.claude/projects/<slug>/<id>.jsonl` is THIS agent's — several agents
+   * share a cwd, so the slug alone identifies nothing. Null on `--continue`
+   * (the CLI picks the existing session) and for non-Claude runtimes.
+   */
+  private sessionId: string | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -233,6 +242,11 @@ export class AgentPTY {
 
     if (mode === 'continue') {
       args.push('--continue');
+      // --continue resumes the existing session; forcing an id here is invalid.
+      this.sessionId = null;
+    } else {
+      this.sessionId = randomUUID();
+      args.push('--session-id', this.sessionId);
     }
 
     // Skip Claude Code's permission system by default (back-compat: agents have
@@ -302,6 +316,14 @@ export class AgentPTY {
    */
   setModelOverride(modelId: string | null): void {
     this.modelOverride = modelId;
+  }
+
+  /**
+   * The session id passed to `claude --session-id` for the current spawn, or
+   * null when the id is not ours to know (`--continue`, other runtimes).
+   */
+  getSessionId(): string | null {
+    return this.sessionId;
   }
 
   /** The model this PTY will actually pass to the CLI on its next spawn. */

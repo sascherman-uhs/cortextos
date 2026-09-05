@@ -26,10 +26,10 @@ const mockEnv = {
   projectRoot: '/tmp/fw',
 } as any;
 
-function argsFor(config: any): string[] {
+function argsFor(config: any, mode: 'fresh' | 'continue' = 'fresh'): string[] {
   const pty = new AgentPTY(mockEnv, config);
   return (pty as unknown as { buildClaudeArgs(m: 'fresh' | 'continue', p: string): string[] })
-    .buildClaudeArgs('fresh', 'PROMPT');
+    .buildClaudeArgs(mode, 'PROMPT');
 }
 
 describe('AgentPTY --dangerously-skip-permissions toggle', () => {
@@ -58,5 +58,36 @@ describe('AgentPTY --dangerously-skip-permissions toggle', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe('AgentPTY session id (model-routing provenance)', () => {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  it('pins a session id on a fresh spawn so the transcript is attributable', () => {
+    // Several agents share a working directory, so the cwd slug alone cannot
+    // say whose transcript is whose. The session id can.
+    const pty = new AgentPTY(mockEnv, {} as any);
+    const args = (pty as any).buildClaudeArgs('fresh', 'PROMPT') as string[];
+    const idx = args.indexOf('--session-id');
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toMatch(UUID);
+    expect(pty.getSessionId()).toBe(args[idx + 1]);
+  });
+
+  it('gives each fresh spawn its own session id', () => {
+    const a = new AgentPTY(mockEnv, {} as any);
+    const b = new AgentPTY(mockEnv, {} as any);
+    (a as any).buildClaudeArgs('fresh', 'PROMPT');
+    (b as any).buildClaudeArgs('fresh', 'PROMPT');
+    expect(a.getSessionId()).not.toBe(b.getSessionId());
+  });
+
+  it('does not force a session id on --continue (the CLI resumes its own)', () => {
+    const pty = new AgentPTY(mockEnv, {} as any);
+    const args = (pty as any).buildClaudeArgs('continue', 'PROMPT') as string[];
+    expect(args).toContain('--continue');
+    expect(args).not.toContain('--session-id');
+    expect(pty.getSessionId()).toBeNull();
   });
 });
