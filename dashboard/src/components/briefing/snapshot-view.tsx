@@ -34,6 +34,7 @@ import type {
   SectionId,
 } from '@/lib/uhs/briefing';
 import { REQUIRED_SECTIONS, snapshotAgeMinutes } from '@/lib/uhs/briefing';
+import { PersonFacets } from './person-facets';
 
 const SECTION_LABEL: Record<SectionId, string> = {
   decisions_for_scott: 'Decisions for you',
@@ -281,14 +282,20 @@ export function SnapshotView({
         </CardContent>
       </Card>
 
-      {REQUIRED_SECTIONS.map((id) => (
-        <SectionCard
-          key={id}
-          id={id}
-          section={snapshot.sections[id]}
-          businessDate={snapshot.business_date}
-        />
-      ))}
+      {/* The six required sections are Scott's body, carried on an ACL-tagged facet.
+          A persona view does not get a trimmed version of them — it does not get them.
+          Rendering nothing here is the correct outcome, not a missing feature. */}
+      {snapshot.body_included &&
+        REQUIRED_SECTIONS.map((id) => (
+          <SectionCard
+            key={id}
+            id={id}
+            section={snapshot.sections[id]}
+            businessDate={snapshot.business_date}
+          />
+        ))}
+
+      <PersonFacets snapshot={snapshot} />
     </div>
   );
 }
