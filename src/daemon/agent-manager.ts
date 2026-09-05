@@ -1140,6 +1140,33 @@ export class AgentManager {
     }
 
     const onFire = async (cron: CronDefinition): Promise<void> => {
+      // Pre-fire gate: "inbox" crons only wake the agent when there is
+      // actually something in its bus inbox. Returning without injecting
+      // counts as a successful dispatch, so the schedule advances normally.
+      if (cron.gate === 'inbox') {
+        const inboxDir = join(this.ctxRoot, 'inbox', agentName);
+        let pending = 0;
+        try {
+          pending = existsSync(inboxDir)
+            ? readdirSync(inboxDir).filter((f) => f.endsWith('.json')).length
+            : 0;
+        } catch (err) {
+          // Unreadable inbox → fail open (fire) so a filesystem hiccup can't
+          // silently starve the agent of real work.
+          console.log(
+            `[daemon] [cron-gate] WARNING: inbox check failed for "${agentName}" — firing anyway: ` +
+            `${err instanceof Error ? err.message : String(err)}`
+          );
+          pending = -1;
+        }
+        if (pending === 0) {
+          console.log(
+            `[daemon] [cron-gate] skipped cron "${cron.name}" for "${agentName}" — inbox empty`
+          );
+          return;
+        }
+      }
+
       const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
       // injects) does not reject identical cron prompts on subsequent fires.

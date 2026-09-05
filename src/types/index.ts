@@ -378,6 +378,19 @@ export interface CronDefinition {
   fire_count?: number;
 
   /**
+   * Optional pre-fire gate. When set to `"inbox"`, the daemon only injects the
+   * cron prompt if the agent's bus inbox ({CTX_ROOT}/inbox/{agentName}/) holds
+   * at least one pending message file. An empty inbox counts as a successful
+   * fire (schedule advances, fire_count untouched) with a `[cron-gate]` log
+   * line and NO PTY injection — so recurring "check inbox" crons stop burning
+   * an LLM turn just to discover there is nothing to do (2026-08-18: the three
+   * 10-minute task-check crons alone were ~432 idle sessions/day on API billing).
+   *
+   * @example "inbox"
+   */
+  gate?: 'inbox';
+
+  /**
    * ISO 8601 UTC timestamp for one-shot crons — when the cron should fire once
    * and then be deleted. Mutually exclusive with recurring `schedule` semantics:
    * if `fire_at` is set, the daemon treats this as a one-shot regardless of
