@@ -32,3 +32,37 @@ export const TASK_CONTRACT = ${JSON.stringify(data, null, 2)} as unknown as Task
 
 fs.writeFileSync(out, header);
 console.log(`wrote ${out}`);
+
+// ---------------------------------------------------------------------------
+// OS-02: the same treatment for the transition contract. One fixture, two
+// generated modules (core daemon/CLI, and the dashboard bundle), because the
+// two TypeScript projects are isolated and neither can import the other's
+// source. Tests in both trees deep-equal their generated copy against the
+// fixture, so a hand-edit to either one fails CI rather than drifting.
+// ---------------------------------------------------------------------------
+
+const tFixture = path.join(repo, 'tests/fixtures/task-transition-contract.json');
+const tData = JSON.parse(fs.readFileSync(tFixture, 'utf-8'));
+delete tData.cases;
+const tBody = JSON.stringify(tData, null, 2);
+
+const tHeader = (typeImport) => `// GENERATED from tests/fixtures/task-transition-contract.json — do not hand-edit.
+// Regenerate with: node dashboard/scripts/generate-task-contract.mjs
+//
+// The fixture is byte-identical in uhsJARVIS, where the Python half
+// (scripts/agent_os/task_contract.py) loads it directly. Keeping the rules in
+// data rather than in three hand-written copies is what stops the validator
+// that blocks a write and the projector that renders it from disagreeing.
+
+${typeImport}
+
+export const TRANSITION_CONTRACT = ${tBody} as unknown as TransitionContract;
+`;
+
+const coreOut = path.join(repo, 'src/bus/transition-contract.generated.ts');
+fs.writeFileSync(coreOut, tHeader("import type { TransitionContract } from './task-contract.js';"));
+console.log(`wrote ${coreOut}`);
+
+const dashOut = path.join(repo, 'dashboard/src/lib/data/transition-contract.generated.ts');
+fs.writeFileSync(dashOut, tHeader("import type { TransitionContract } from './transition-contract';"));
+console.log(`wrote ${dashOut}`);
