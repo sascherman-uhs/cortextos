@@ -905,9 +905,15 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     if (chatId && this.agent) {
       const senderName = sanitizeForPtyInjection(query.from?.first_name || 'User');
       const safeData = sanitizeForPtyInjection(data);
+      // T005: thread reply context from the button's parent message so the agent
+      // knows what it's responding to without a separate registry lookup.
+      const originalText = query.message?.text || query.message?.caption;
+      const replyCx = originalText
+        ? `[Replying to: "${sanitizeForPtyInjection(originalText.slice(0, 200))}"]\n`
+        : '';
       const msg = [
         `=== TELEGRAM from [USER: ${senderName}] (chat_id:${chatId}) ===`,
-        `callback_data: ${safeData}`,
+        `${replyCx}callback_data: ${safeData}`,
         `message_id: ${messageId}`,
         `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
       ].join('\n');

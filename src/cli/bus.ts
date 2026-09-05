@@ -955,7 +955,8 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--buttons <spec>', 'Inline keyboard buttons. Format: "Label 1:callback_1,Label 2:callback_2" — each pair is text:callback_data separated by comma. All buttons appear in a single row. Callbacks are routed back to the agent inbox as Telegram messages with callback_data: <value>.')
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; buttons?: string }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -987,6 +988,20 @@ busCommand
     }
 
     const api = new TelegramAPI(botToken);
+
+    // Build inline keyboard from --buttons spec if provided
+    let inlineKeyboard: object | undefined;
+    if (opts.buttons) {
+      const pairs = opts.buttons.split(',').map(b => b.trim()).filter(Boolean);
+      const row = pairs.map(pair => {
+        const colonIdx = pair.lastIndexOf(':');
+        const text = colonIdx > 0 ? pair.slice(0, colonIdx).trim() : pair;
+        const callback_data = colonIdx > 0 ? pair.slice(colonIdx + 1).trim() : pair;
+        return { text, callback_data };
+      });
+      inlineKeyboard = { inline_keyboard: [row] };
+    }
+
     try {
       let sentMessageId = 0;
       if (opts.image) {
@@ -996,7 +1011,7 @@ busCommand
         const result = await api.sendDocument(chatId, opts.file, message);
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
-        const result = await api.sendMessage(chatId, message, undefined, {
+        const result = await api.sendMessage(chatId, message, inlineKeyboard, {
           parseMode: opts.plainText ? null : 'HTML',
         });
         sentMessageId = result?.result?.message_id ?? 0;
