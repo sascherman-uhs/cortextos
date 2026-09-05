@@ -202,6 +202,11 @@ interface CoreService {
   listEvents?: (limit?: number) => Promise<unknown[]> | unknown[];
 }
 
+/** CLI first, then read-only file — used whenever the core module cannot load. */
+function fallbackAdapter(): ModelRoutingAdapter {
+  return cliAdapter() ?? fileAdapter();
+}
+
 function serviceAdapter(modulePath: string): ModelRoutingAdapter {
   let mod: CoreService | null = null;
   const load = async (): Promise<CoreService | null> => {
@@ -219,22 +224,22 @@ function serviceAdapter(modulePath: string): ModelRoutingAdapter {
     kind: 'service',
     async resolveAgent(agent) {
       const m = await load();
-      if (!m?.resolve) return fileAdapter().resolveAgent(agent);
+      if (!m?.resolve) return fallbackAdapter().resolveAgent(agent);
       try { return await m.resolve({ agent }); } catch (e) { return { error: errText(e) }; }
     },
     async summary() {
       const m = await load();
-      if (!m?.loadRegistry) return fileAdapter().summary();
+      if (!m?.loadRegistry) return fallbackAdapter().summary();
       try { return normalizeSummary(await m.loadRegistry()); } catch (e) { return { error: errText(e) }; }
     },
     async events(limit) {
       const m = await load();
-      if (!m?.listEvents) return fileAdapter().events(limit);
+      if (!m?.listEvents) return fallbackAdapter().events(limit);
       try { return { events: await m.listEvents(limit), attempts: [] }; } catch (e) { return { error: errText(e) }; }
     },
     async apply(op) {
       const m = await load();
-      if (!m?.applyOperation) return cliAdapter()?.apply(op) ?? ROUTING_UNAVAILABLE;
+      if (!m?.applyOperation) return fallbackAdapter().apply(op);
       try { return await m.applyOperation(op); } catch (e) { return { error: errText(e) }; }
     },
   };
