@@ -1,8 +1,26 @@
+/**
+ * GET/PATCH /api/agents/[name]/config
+ *
+ * OS-02b-ui (model-routing contract §5, §7):
+ *   - GET returns a REDACTED DTO (see @/lib/agent-config-dto) plus the routing
+ *     Resolution for the agent. Cron prompt bodies, env and tokens never leave.
+ *   - PATCH accepts `{ op: "model_routing", action, … }` and forwards it to the
+ *     routing service. `model` and `runtime` are no longer writable here; a
+ *     legacy raw `model` PATCH returns 409 { error: "use model_routing operation" }.
+ */
+
 import { NextRequest } from 'next/server';
 import { existsSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { getFrameworkRoot, getAllAgents, getAgentDir } from '@/lib/config';
 import { spawnSync } from 'child_process';
+import { buildAgentConfigDTO, WRITABLE_CONFIG_FIELDS } from '@/lib/agent-config-dto';
+import {
+  applyRoutingOperation,
+  isRoutingError,
+  resolveAgentRouting,
+  type RoutingOperation,
+} from '@/lib/model-routing';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,6 +44,60 @@ function resolveAgentConfigPath(frameworkRoot: string, name: string): string | n
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Secret scrubbing — belt and braces on top of the DTO allowlist.
+//
+// Collects every string in the raw config that is sensitive by position
+// (cron prompts, env values) or by key name (token/secret/key/password), then
+// removes those literals from ANY response body, including error strings that
+// bubbled up from a CLI. Nothing sensitive can survive serialization.
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_KEY = /(token|secret|password|api[_-]?key|credential|authorization)/i;
+
+function collectSensitiveStrings(value: unknown, keyHint = '', out: Set<string> = new Set()): Set<string> {
+  if (typeof value === 'string') {
+    if (value.length >= 8 && (SENSITIVE_KEY.test(keyHint) || keyHint === 'prompt' || keyHint === 'env')) out.add(value);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectSensitiveStrings(v, keyHint, out);
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      // Under `env:` every value is a credential candidate regardless of key.
+      collectSensitiveStrings(v, k === 'env' ? 'env' : (keyHint === 'env' ? 'env' : k), out);
+    }
+  }
+  return out;
+}
+
+function scrubbedJson(payload: unknown, sensitive: Set<string>, init?: ResponseInit): Response {
+  let text = JSON.stringify(payload);
+  for (const s of sensitive) {
+    if (!s) continue;
+    text = text.split(JSON.stringify(s).slice(1, -1)).join('[redacted]');
+  }
+  return new Response(text, {
+    ...init,
+    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+  });
+}
+
+function readRawConfig(configPath: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(readFileSync(configPath, 'utf-8'));
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET — redacted DTO + routing resolution
+// ---------------------------------------------------------------------------
+
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ name: string }> },
@@ -39,12 +111,74 @@ export async function GET(
   if (!configPath) {
     return Response.json({ error: 'Agent config not found' }, { status: 404 });
   }
-  try {
-    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    return Response.json({ config, name });
-  } catch {
+  const raw = readRawConfig(configPath);
+  if (!raw) {
     return Response.json({ error: 'Failed to read config' }, { status: 500 });
   }
+  const sensitive = collectSensitiveStrings(raw);
+  const config = buildAgentConfigDTO(raw);
+
+  let routing: unknown = null;
+  let routingError: string | null = null;
+  try {
+    const r = await resolveAgentRouting(name);
+    if (isRoutingError(r)) routingError = r.error;
+    else routing = r;
+  } catch (e) {
+    routingError = e instanceof Error ? e.message : 'routing service unavailable';
+  }
+
+  return scrubbedJson({ name, config, routing, routing_error: routingError, redacted: true }, sensitive);
+}
+
+// ---------------------------------------------------------------------------
+// PATCH
+// ---------------------------------------------------------------------------
+
+function parseRoutingOperation(body: Record<string, unknown>, agentName: string): RoutingOperation | { error: string } {
+  const action = body.action;
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+  if (!reason) return { error: 'reason is required for a model_routing operation' };
+  const actor = typeof body.actor === 'string' ? body.actor : 'dashboard';
+
+  if (action === 'switch') {
+    const role = typeof body.role === 'string' ? body.role : '';
+    const tier = typeof body.tier === 'string' ? body.tier : '';
+    if (!role || !tier) return { error: 'switch requires role and tier' };
+    return {
+      action: 'switch',
+      role,
+      tier,
+      reason,
+      actor,
+      clear_pins: body.clear_pins === true,
+      ...(typeof body.expected_revision === 'number' ? { expected_revision: body.expected_revision } : {}),
+    };
+  }
+  if (action === 'pin') {
+    const agent = typeof body.agent === 'string' && body.agent ? body.agent : agentName;
+    const entry_id = typeof body.entry_id === 'string' ? body.entry_id : '';
+    if (!agent || !entry_id) return { error: 'pin requires agent and entry_id' };
+    return {
+      action: 'pin',
+      agent,
+      entry_id,
+      reason,
+      actor,
+      ...(typeof body.expires_at === 'string' ? { expires_at: body.expires_at } : {}),
+    };
+  }
+  if (action === 'unpin') {
+    const agent = typeof body.agent === 'string' && body.agent ? body.agent : agentName;
+    if (!agent) return { error: 'unpin requires agent' };
+    return { action: 'unpin', agent, reason, actor };
+  }
+  if (action === 'revert') {
+    const operation_id = typeof body.operation_id === 'string' ? body.operation_id : '';
+    if (!operation_id) return { error: 'revert requires operation_id' };
+    return { action: 'revert', operation_id, reason, actor };
+  }
+  return { error: 'action must be one of switch, pin, unpin, revert' };
 }
 
 export async function PATCH(
@@ -68,7 +202,35 @@ export async function PATCH(
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const allowed = ['timezone', 'day_mode_start', 'day_mode_end', 'communication_style', 'approval_rules', 'max_session_seconds', 'max_crashes_per_day', 'startup_delay', 'model', 'ctx_warning_threshold', 'ctx_handoff_threshold'];
+  const rawForScrub = readRawConfig(configPath) ?? {};
+  const sensitive = collectSensitiveStrings(rawForScrub);
+
+  // --- Routing operations (contract §7) ------------------------------------
+  if (body.op === 'model_routing') {
+    const op = parseRoutingOperation(body, name);
+    if ('error' in op) return scrubbedJson(op, sensitive, { status: 400 });
+    try {
+      const receipt = await applyRoutingOperation(op);
+      if (isRoutingError(receipt)) return scrubbedJson(receipt, sensitive, { status: 503 });
+      return scrubbedJson({ success: true, name, receipt }, sensitive);
+    } catch (e) {
+      return scrubbedJson(
+        { error: e instanceof Error ? e.message : 'routing operation failed' },
+        sensitive,
+        { status: 500 },
+      );
+    }
+  }
+  if (body.op !== undefined) {
+    return Response.json({ error: 'unsupported op' }, { status: 400 });
+  }
+
+  // --- Legacy raw model write is refused (contract §5) ----------------------
+  if (body.model !== undefined || body.runtime !== undefined) {
+    return Response.json({ error: 'use model_routing operation' }, { status: 409 });
+  }
+
+  const allowed = WRITABLE_CONFIG_FIELDS as readonly string[];
   const timeRegex = /^\d{2}:\d{2}$/;
   if (body.day_mode_start && !timeRegex.test(body.day_mode_start as string)) {
     return Response.json({ error: 'day_mode_start must be HH:MM' }, { status: 400 });
@@ -145,7 +307,8 @@ export async function PATCH(
       console.error(`[api/agents/${name}/config] PATCH: send-message.sh failed (non-fatal):`, notifyErr);
     }
 
-    return Response.json({ success: true, config, name });
+    // Respond with the redacted DTO, never the raw config.
+    return scrubbedJson({ success: true, name, config: buildAgentConfigDTO(config), redacted: true }, sensitive);
   } catch {
     return Response.json({ error: 'Failed to write config' }, { status: 500 });
   }
