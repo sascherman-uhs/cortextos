@@ -13,13 +13,24 @@ import { PriorityBadge, StatusBadge, OrgBadge, TimeAgo } from '@/components/shar
 import { IconArrowsSort, IconSortAscending, IconSortDescending } from '@tabler/icons-react';
 // UHS MOD #7 — task number in table (components/uhs/ never overwritten by upstream)
 import { getTaskNumber } from '@/components/uhs/task-number-badge';
-import type { Task } from '@/lib/types';
+import type { Task, TaskStatus } from '@/lib/types';
 
 type SortField = 'task_num' | 'title' | 'status' | 'priority' | 'assignee' | 'org' | 'created_at';
 type SortDir = 'asc' | 'desc';
 
 const PRIORITY_ORDER: Record<string, number> = { critical: 0, urgent: 0, high: 1, normal: 2, low: 3 };
-const STATUS_ORDER = { blocked: 0, in_progress: 1, pending: 2, completed: 3 };
+// Sort order for the status column. Typed against TaskStatus so a new status
+// cannot be added to the model without deciding where it sorts — OS-01 added
+// failed and cancelled, and an untyped map had silently sorted them as
+// undefined.
+const STATUS_ORDER: Record<TaskStatus, number> = {
+  blocked: 0,
+  failed: 1,
+  in_progress: 2,
+  pending: 3,
+  completed: 4,
+  cancelled: 5,
+};
 
 // Extract a numeric sort key from any task ID format
 // supa_720 → 720 | task_{ts}_{N} → N | fallback → 0

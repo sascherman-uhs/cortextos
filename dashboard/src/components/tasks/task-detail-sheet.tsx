@@ -61,6 +61,16 @@ const STATUS_TRANSITIONS: Record<TaskStatus, { label: string; status: TaskStatus
   completed: [
     { label: 'Reopen', status: 'pending', variant: 'outline' },
   ],
+  // OS-01 surfaced failed and cancelled work. Both were absent here, so a
+  // failed task offered no way forward at all. The server still validates
+  // every move against the work contract and explains any refusal.
+  failed: [
+    { label: 'Retry', status: 'pending', variant: 'default' },
+    { label: 'Cancel', status: 'cancelled', variant: 'outline' },
+  ],
+  cancelled: [
+    { label: 'Reopen', status: 'pending', variant: 'outline' },
+  ],
 };
 
 function getOutputIcon(filePath: string) {
