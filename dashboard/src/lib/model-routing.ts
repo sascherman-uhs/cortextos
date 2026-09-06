@@ -65,7 +65,13 @@ export interface RegistryPin {
 
 export interface RegistryRole {
   tier: string;
+  /** Matched against an entry's `capability_tags` — a model requirement. */
   required_capabilities: string[];
+  /**
+   * A property of the ROLE (e.g. `continuous-improvement`), never matched
+   * against a model entry. Absent means the empty list.
+   */
+  role_capabilities?: string[];
   min_context: number;
   data_scope: string;
 }

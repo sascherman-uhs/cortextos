@@ -902,7 +902,20 @@ export interface ModelPin {
 
 export interface ModelRoleAssignment {
   tier: string;
+  /**
+   * Capability tags the MODEL must carry. Matched against a registry entry's
+   * `capability_tags` during resolution (`validateCandidate`), so every value
+   * here has to exist on some entry or the role becomes unresolvable.
+   */
   required_capabilities: string[];
+  /**
+   * Properties of the ROLE itself — what this role participates in, e.g.
+   * `continuous-improvement` (weekly Kaizen enrollment). Deliberately a
+   * SEPARATE field from `required_capabilities`: it is never matched against
+   * a model entry, so declaring one here can never make a role unresolvable.
+   * Absent means the empty list.
+   */
+  role_capabilities?: string[];
   min_context: number;
   data_scope: string;
 }
@@ -1027,7 +1040,7 @@ export interface ModelRemediation {
   detail: string;
 }
 
-export type ModelOperationKind = 'switch' | 'pin' | 'unpin' | 'revert' | 'activation';
+export type ModelOperationKind = 'switch' | 'pin' | 'unpin' | 'revert' | 'activation' | 'role_capability';
 
 export type ModelOperationState =
   | 'requested'
