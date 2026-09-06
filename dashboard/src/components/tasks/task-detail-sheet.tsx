@@ -34,11 +34,26 @@ import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
 import { RecurringPanel } from '@/components/uhs/recurring-tasks-tab';
 import type { Task, TaskOutput, TaskStatus, TaskPriority } from '@/lib/types';
 
+/** What the page reports back about a move it attempted on the sheet's behalf.
+ *  A refused move used to be swallowed by the page and rendered in a banner
+ *  BEHIND this sheet — inside the dialog's aria-hidden region, and off-screen
+ *  whenever the page was scrolled. The person clicked, nothing appeared to
+ *  happen, and the record had not moved. The refusal now comes back here and is
+ *  shown inside the sheet, where the click was. */
+export interface StatusChangeResult {
+  ok: boolean;
+  message?: string;
+}
+
 export interface TaskDetailSheetProps {
   task: Task | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onStatusChange: (taskId: string, status: TaskStatus, note?: string) => void;
+  onStatusChange: (
+    taskId: string,
+    status: TaskStatus,
+    note?: string,
+  ) => void | Promise<StatusChangeResult | void>;
   onDelete?: (taskId: string) => void;
   onEdit?: (taskId: string) => void;
 }
@@ -181,6 +196,16 @@ export function TaskDetailSheet({
       setError('Title is required');
       return;
     }
+    // OS-02: an edit is a versioned write like any other. If the record
+    // reached this form without a version, refuse rather than post blind.
+    const editVersion = (task as unknown as { version?: number }).version;
+    if (typeof editVersion !== 'number') {
+      setError(
+        'This record was loaded without a version, so the edit was not sent — '
+        + 'saving it could overwrite a change made since it was opened. Close and reopen the task.',
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -195,7 +220,7 @@ export function TaskDetailSheet({
           // OS-02: the version this form was populated from. If an agent moved
           // the task while the drawer was open, the save is refused rather than
           // overwriting whatever the agent recorded.
-          expectedVersion: (task as unknown as { version?: number }).version,
+          expectedVersion: editVersion,
         }),
       });
       if (res.ok) {
@@ -221,7 +246,13 @@ export function TaskDetailSheet({
     setUpdating(true);
     setError(null);
     try {
-      await onStatusChange(task.id, newStatus, note.trim() || undefined);
+      const result = await onStatusChange(task.id, newStatus, note.trim() || undefined);
+      // A move the server refused is stated here, in the sheet the person is
+      // looking at. Only a move that actually took clears the note.
+      if (result && result.ok === false) {
+        setError(result.message ?? 'This move was refused. The task was not changed.');
+        return;
+      }
       setNote('');
     } catch {
       setError('Failed to update status');
@@ -258,10 +289,24 @@ export function TaskDetailSheet({
           </SheetDescription>
         </SheetHeader>
 
-        {/* Error banner */}
+        {/* Error banner. role=alert so a refusal is announced, not merely
+            coloured, and dismissible so it does not sit over the record. */}
         {error && (
-          <div className="mx-4 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {error}
+          <div
+            role="alert"
+            aria-live="assertive"
+            data-testid="task-sheet-error"
+            className="mx-4 flex items-start justify-between gap-3 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            <span>{error}</span>
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              className="shrink-0 underline underline-offset-2"
+              aria-label="Dismiss"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
