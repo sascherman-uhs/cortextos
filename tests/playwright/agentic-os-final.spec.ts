@@ -631,3 +631,187 @@ test('L7/L8: no horizontal page scroll at 390 and 1366, and no console or reques
   expect.soft(failed, `failed requests: ${JSON.stringify(failed.slice(0, 10))}`).toHaveLength(0);
   expect.soft(errors, `console errors: ${JSON.stringify(errors.slice(0, 10))}`).toHaveLength(0);
 });
+
+// ===========================================================================
+// M1. Failed work is legible and actionable (c5808d8), and the move it offers
+//     is validated by the contract rather than silently applied.
+// ===========================================================================
+test('M1: a failed task reads as Failed and offers Retry/Cancel, and the move is validated', async ({ page }) => {
+  test.setTimeout(300_000);
+  await page.setViewportSize({ width: 1600, height: 1200 });
+
+  const title = 'ZZTEST-final-M1 failed task probe';
+  const id = createNativeTask(title);
+  const evidence: Record<string, unknown> = { task_id: id };
+
+  try {
+    patchNativeTask(id, (t) => {
+      t.status = 'failed';
+      t.canonical_state = 'failed_terminal';
+      t.outcome = 'ZZTEST outcome: failed work must stay actionable';
+      t.acceptance_criteria = ['ZZTEST criterion: a failure is legible'];
+      t.agent_role_id = 'dispatcher';
+    });
+    expect(await waitForCard(page, title), 'the failed ZZTEST fixture must reach the board').toBe(true);
+
+    // --- on the board -------------------------------------------------------
+    const card = cardByTitle(page, title);
+    await card.scrollIntoViewIfNeeded();
+    const cardText = (await card.innerText()).replace(/\s+/g, ' ');
+    evidence.board_card_text = cardText;
+    evidence.board_shows_failed = /failed/i.test(cardText);
+    evidence.board_shows_raw_status_only = /\bfailed\b/.test(cardText) && !/Failed|Abandoned/.test(cardText);
+    evidence.terminal_lane_present = (await page.getByTestId('lane-terminal').count()) > 0;
+    await shot(page, 'M1-board-failed-card');
+
+    // --- on the task list, where the transitions live -----------------------
+    // The default Kanban view has columns for pending/in_progress/blocked/
+    // completed only, so failed work is not in it. Record that, then switch to
+    // List, which shows every status.
+    await page.goto(`${URL}/tasks`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(4000);
+    evidence.visible_in_default_kanban_view = (await page.getByText(title).count()) > 0;
+    await shot(page, 'M1-tasks-kanban-view');
+    await page.getByRole('button', { name: /^List$/ }).click();
+    await page.waitForTimeout(2000);
+    evidence.visible_in_list_view = (await page.getByText(title).count()) > 0;
+    await expect(page.getByText(title).first()).toBeVisible({ timeout: 60_000 });
+    await page.getByText(title).first().click();
+    const sheet = page.getByRole('dialog');
+    await expect(sheet).toBeVisible({ timeout: 20_000 });
+    const sheetText = (await sheet.innerText()).replace(/\s+/g, ' ');
+    evidence.sheet_text = sheetText.slice(0, 800);
+    evidence.badge_says_failed = /Failed/.test(sheetText);
+    evidence.has_retry = (await sheet.getByRole('button', { name: /^Retry$/ }).count()) > 0;
+    evidence.has_cancel = (await sheet.getByRole('button', { name: /^Cancel$/ }).count()) > 0;
+    await shot(page, 'M1-task-sheet-failed');
+
+    // --- the move must be answered, not swallowed ---------------------------
+    const patches: Record<string, unknown>[] = [];
+    page.on('request', (req) => {
+      if (req.method() === 'PATCH' && /\/api\/tasks\/[^/]+$/.test(req.url())) {
+        try { patches.push(JSON.parse(req.postData() ?? '{}')); } catch { /* ignore */ }
+      }
+    });
+
+    if (evidence.has_retry) {
+      await sheet.getByRole('button', { name: /^Retry$/ }).click();
+      await page.waitForTimeout(6000);
+    }
+    evidence.patch_bodies = patches;
+    evidence.patch_carries_expected_version = patches.some((b) => 'expectedVersion' in b);
+
+    // The refusal is rendered, but the question is whether a person can reach
+    // it. Judge the accessibility tree and the viewport, not the DOM alone.
+    evidence.banner_shown = (await page.getByRole('alert').count()) > 0;
+    const reach = await page.evaluate(() => {
+      const el = document.querySelector('[role="alert"]') as HTMLElement | null;
+      if (!el) return { exists: false };
+      let hidden = false;
+      let node: HTMLElement | null = el;
+      while (node) {
+        if (node.getAttribute?.('aria-hidden') === 'true') { hidden = true; break; }
+        node = node.parentElement;
+      }
+      const r = el.getBoundingClientRect();
+      return {
+        exists: true,
+        text: el.innerText.replace(/\s+/g, ' ').slice(0, 300),
+        insideAriaHidden: hidden,
+        inViewport: r.top >= 0 && r.top < window.innerHeight,
+        top: Math.round(r.top),
+      };
+    });
+    evidence.refusal_reachability = reach;
+    evidence.banner_text = (reach as { text?: string }).text ?? null;
+    const after = readNativeTask(id) as Record<string, unknown> | null;
+    evidence.state_after = { status: after?.status, canonical_state: after?.canonical_state, version: after?.version };
+    evidence.move_took = after?.status !== 'failed';
+    await shot(page, 'M1-after-retry');
+
+    saveEvidence('M1-failed-task-evidence', evidence);
+
+    expect(evidence.board_shows_failed, 'a failed card must read as failed on the board').toBe(true);
+    expect(evidence.badge_says_failed, 'the detail sheet must show a Failed badge, not a raw status').toBe(true);
+    expect
+      .soft(
+        evidence.visible_in_default_kanban_view,
+        'failed work should be reachable from the default task view, not only after switching to List',
+      )
+      .toBe(true);
+    expect(evidence.has_retry, 'failed work must offer Retry').toBe(true);
+    expect(evidence.has_cancel, 'failed work must offer Cancel').toBe(true);
+    // Either the retry took, or the person was told why not. Never neither.
+    // Either the retry took, or the person was actually told why not. A message
+    // that exists only in the DOM, off-screen and inside an aria-hidden
+    // subtree, is not being told.
+    const r = evidence.refusal_reachability as { exists?: boolean; insideAriaHidden?: boolean; inViewport?: boolean };
+    const personWasTold = r?.exists === true && r.insideAriaHidden === false && r.inViewport === true;
+    evidence.person_was_told = personWasTold;
+    expect(
+      evidence.move_took === true || personWasTold,
+      'the retry must either take or visibly say why it did not — an off-screen, aria-hidden message is a silent no-op',
+    ).toBe(true);
+    expect
+      .soft(evidence.patch_carries_expected_version, 'the task list must send the version it rendered')
+      .toBe(true);
+  } finally {
+    deleteNativeTask(id);
+  }
+});
+
+// ===========================================================================
+// M2. A move the contract forbids must be refused visibly on the task list.
+// ===========================================================================
+test('M2: a contract-forbidden move from the task list is refused in words, not silence', async ({ page }) => {
+  test.setTimeout(300_000);
+  await page.setViewportSize({ width: 1600, height: 1200 });
+
+  const title = 'ZZTEST-final-M2 forbidden move probe';
+  const id = createNativeTask(title);
+  const evidence: Record<string, unknown> = { task_id: id };
+
+  try {
+    patchNativeTask(id, (t) => {
+      t.acceptance_criteria = [];
+      t.agent_role_id = null;
+      t.human_accountable_id = null;
+    });
+    expect(await waitForCard(page, title), 'the ZZTEST fixture must reach the board').toBe(true);
+
+    await page.goto(`${URL}/tasks`, { waitUntil: 'domcontentloaded' });
+    await expect(page.getByText(title).first()).toBeVisible({ timeout: 60_000 });
+    await page.getByText(title).first().click();
+    const sheet = page.getByRole('dialog');
+    await expect(sheet).toBeVisible({ timeout: 20_000 });
+
+    evidence.state_before = readNativeTask(id);
+    // Backlog straight to completed: no acceptance criteria, no evidence, no verifier.
+    await sheet.getByRole('button', { name: /^Complete$/ }).click();
+    await page.waitForTimeout(7000);
+
+    const banner = page.getByRole('alert');
+    evidence.banner_shown = (await banner.count()) > 0;
+    evidence.banner_text =
+      (await banner.count()) > 0 ? (await banner.first().innerText()).replace(/\s+/g, ' ') : null;
+    const body = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
+    evidence.page_mentions_refusal = /Could not move|refused|contract|changed while you were/i.test(body);
+    const after = readNativeTask(id) as Record<string, unknown> | null;
+    evidence.state_after = { status: after?.status, canonical_state: after?.canonical_state };
+    evidence.move_landed = after?.canonical_state === 'done' || after?.status === 'completed';
+    await shot(page, 'M2-after-forbidden-move');
+
+    saveEvidence('M2-forbidden-move-evidence', evidence);
+
+    expect(
+      evidence.move_landed,
+      'work with no acceptance criteria must never reach completed from the task list',
+    ).toBe(false);
+    expect(
+      evidence.banner_shown === true || evidence.page_mentions_refusal === true,
+      'a refused move must be stated; a silent no-op looks exactly like success',
+    ).toBe(true);
+  } finally {
+    deleteNativeTask(id);
+  }
+});
