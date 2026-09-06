@@ -9,8 +9,46 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { offeredActions, PATCHABLE_NATIVE } from '../offered-actions';
 import { toCanonical, resolveInteractivePath } from '@/lib/data/transition-contract';
+
+/**
+ * The contract read straight off disk, NOT through the module under test.
+ * The whole point of this file is that the buttons cannot drift away from the
+ * rules, so the expectation has to be derived from the rules independently —
+ * asserting the helper agrees with itself would prove nothing.
+ */
+const FIXTURE = JSON.parse(
+  readFileSync(join(__dirname, '../../../../../tests/fixtures/task-transition-contract.json'), 'utf-8'),
+) as {
+  allowed_transitions: Record<string, string[]>;
+  interactive_paths?: Record<string, Record<string, string[]>>;
+  canonical_to_native: Record<string, Record<string, string>>;
+  native_to_canonical: Record<string, Record<string, string>>;
+};
+
+const STATES = [
+  'backlog', 'ready', 'doing', 'verify', 'waiting', 'done', 'cancelled', 'failed_terminal',
+] as const;
+
+/** What the sheet SHOULD offer, worked out from the fixture alone. */
+function expectedTargets(source: 'cortexos_tasks' | 'jarvis_tasks', from: string): string[] {
+  const direct = FIXTURE.allowed_transitions[from] ?? [];
+  const gestures = Object.keys(FIXTURE.interactive_paths?.[from] ?? {});
+  const reachable = new Set([...direct, ...gestures]);
+  return STATES.filter((to) => {
+    if (!reachable.has(to)) return false;
+    const native = FIXTURE.canonical_to_native[source]?.[to];
+    if (!native) return false;
+    // Only what PATCH accepts, and only when the native word means the state
+    // the button claims — cortexos spells both waiting and failed_terminal
+    // 'blocked', so one of them cannot be offered honestly.
+    if (!(PATCHABLE_NATIVE as readonly string[]).includes(native)) return false;
+    return FIXTURE.native_to_canonical[source]?.[native] === to;
+  });
+}
 
 describe('offeredActions', () => {
   it('offers exactly one move out of failed_terminal, and it is the legal one', () => {
@@ -71,5 +109,25 @@ describe('offeredActions', () => {
         }
       }
     }
+  });
+
+  // The anti-drift test. If the contract's state graph changes, this fails
+  // until the UI follows it — which is the failure mode that produced Retry
+  // and Cancel buttons on failed work that the server had always refused.
+  it('offers exactly the contract-legal, endpoint-expressible moves for every state', () => {
+    for (const source of ['cortexos_tasks', 'jarvis_tasks'] as const) {
+      for (const from of STATES) {
+        expect(
+          offeredActions(source, from).map((a) => a.to),
+          `${source} from ${from}`,
+        ).toEqual(expectedTargets(source, from));
+      }
+    }
+  });
+
+  it('the independent expectation is not vacuous — it does constrain something', () => {
+    expect(expectedTargets('jarvis_tasks', 'failed_terminal')).toEqual(['waiting']);
+    expect(expectedTargets('cortexos_tasks', 'done')).toEqual([]);
+    expect(expectedTargets('cortexos_tasks', 'backlog').length).toBeGreaterThan(0);
   });
 });
