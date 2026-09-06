@@ -161,6 +161,14 @@ export function createTask(
  * Mutate an existing task to add an edge to its blocks/blocked_by list.
  * No-op if the peer id is already present. Used to maintain symmetric
  * edges when a new task declares its dependencies.
+ *
+ * Goes through `mutateTask` — the same lock+version+journal machinery every
+ * other writer in this file uses — rather than a raw read/mutate/
+ * `atomicWriteSync`. The unlocked version of this function read the peer file,
+ * mutated the array in memory, and wrote it back with no lock: two `createTask`
+ * calls declaring the same peer as a blocker concurrently could both read the
+ * peer's `blocks` list before either write landed, and the second write would
+ * silently clobber the first, dropping one of the two edges with no trace.
  */
 function addSymmetricEdge(
   paths: BusPaths,
@@ -171,13 +179,24 @@ function addSymmetricEdge(
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) return; // Peer task missing — surfaced at resolution time.
   try {
-    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
-    const list = task[field] ?? [];
-    if (!list.includes(peerId)) {
-      task[field] = [...list, peerId];
-      atomicWriteSync(filePath, JSON.stringify(task));
-    }
-  } catch { /* best-effort */ }
+    mutateTask(
+      paths,
+      filePath,
+      taskId,
+      { actor: 'system', event: 'edge_added', payload: { field, peer: peerId } },
+      (task) => {
+        const list = (task[field] as string[] | undefined) ?? [];
+        if (!list.includes(peerId)) {
+          task[field] = [...list, peerId];
+        }
+      },
+    );
+  } catch (err) {
+    // Unlike the missing-peer case above, a lock or write failure here is not
+    // benign — it means the symmetric edge genuinely did not get written and
+    // must be visible, not swallowed as "best-effort".
+    console.error(`[bus/task] addSymmetricEdge ${taskId}.${field} += ${peerId} failed: ${err}`);
+  }
 }
 
 /**
@@ -1202,14 +1221,42 @@ export function archiveTasks(paths: BusPaths, dryRun: boolean = false): ArchiveR
       if (!dryRun) {
         const archiveDir = join(paths.taskDir, 'archive');
         ensureDir(archiveDir);
-
-        // Mark as archived
-        task.archived = true;
         const srcPath = join(paths.taskDir, `${task.id}.json`);
-        atomicWriteSync(srcPath, JSON.stringify(task));
 
-        // Move to archive
-        renameSync(srcPath, join(archiveDir, `${task.id}.json`));
+        // Mark as archived AND move the file to archive/ under the SAME lock
+        // held by every other writer in this file (transitionTask/mutateTask
+        // lock this exact path). The unlocked version of this function read
+        // the task, set `archived = true`, wrote it back with a bare
+        // `atomicWriteSync`, and renamed it — no lock, no version bump, no
+        // journal entry — so a status transition racing the archive could
+        // read the task between the write and the rename and then write its
+        // own update to a path that was about to disappear underneath it,
+        // silently losing whichever write landed second. Holding the lock
+        // through the rename means a concurrent `transitionTask` either
+        // finishes first (and archive sees its result) or fails loudly with
+        // "unreadable"/ENOENT after the file has moved — never a silent
+        // clobber.
+        try {
+          withTaskLock(srcPath, () => {
+            const current = JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>;
+            const meta = readMeta(current);
+            const nextVersion = meta.version + 1;
+            current.archived = true;
+            current.version = nextVersion;
+            current.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+            atomicWriteSync(srcPath, JSON.stringify(current));
+            appendTaskEvent(paths, srcPath, task.id, {
+              version: nextVersion,
+              event: 'archived',
+              actor: 'archive-tasks',
+            });
+            renameSync(srcPath, join(archiveDir, `${task.id}.json`));
+          });
+        } catch (err) {
+          console.error(`[bus/task] archive ${task.id}: locked write/move failed: ${err}`);
+          skipped++;
+          continue;
+        }
 
         // fix8 — archiving moves the record out of the active list, so any
         // message still naming it points at work nobody is going to pick up.
