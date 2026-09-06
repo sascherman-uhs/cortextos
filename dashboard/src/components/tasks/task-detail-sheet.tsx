@@ -33,6 +33,7 @@ import { DeliverablePreview } from '@/components/tasks/deliverable-preview';
 import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
 import { RecurringPanel } from '@/components/uhs/recurring-tasks-tab';
 import type { Task, TaskOutput, TaskStatus, TaskPriority } from '@/lib/types';
+import type { OfferedAction } from '@/lib/tasks/offered-actions';
 
 /** What the page reports back about a move it attempted on the sheet's behalf.
  *  A refused move used to be swallowed by the page and rendered in a banner
@@ -58,35 +59,11 @@ export interface TaskDetailSheetProps {
   onEdit?: (taskId: string) => void;
 }
 
-const STATUS_TRANSITIONS: Record<TaskStatus, { label: string; status: TaskStatus; variant: 'default' | 'outline' | 'destructive' | 'secondary' }[]> = {
-  pending: [
-    { label: 'Start', status: 'in_progress', variant: 'default' },
-    { label: 'Complete', status: 'completed', variant: 'secondary' },
-    { label: 'Block', status: 'blocked', variant: 'destructive' },
-  ],
-  in_progress: [
-    { label: 'Complete', status: 'completed', variant: 'default' },
-    { label: 'Block', status: 'blocked', variant: 'destructive' },
-    { label: 'Back to Pending', status: 'pending', variant: 'outline' },
-  ],
-  blocked: [
-    { label: 'Unblock', status: 'in_progress', variant: 'default' },
-    { label: 'Back to Pending', status: 'pending', variant: 'outline' },
-  ],
-  completed: [
-    { label: 'Reopen', status: 'pending', variant: 'outline' },
-  ],
-  // OS-01 surfaced failed and cancelled work. Both were absent here, so a
-  // failed task offered no way forward at all. The server still validates
-  // every move against the work contract and explains any refusal.
-  failed: [
-    { label: 'Retry', status: 'pending', variant: 'default' },
-    { label: 'Cancel', status: 'cancelled', variant: 'outline' },
-  ],
-  cancelled: [
-    { label: 'Reopen', status: 'pending', variant: 'outline' },
-  ],
-};
+// The button table that used to live here is gone. It was keyed on native
+// status, drifted from the work contract, and for failed work every move it
+// offered was illegal while the one legal move was offered nowhere. The server
+// now derives the moves from the contract and the record's own canonical
+// state, and this component renders what it is given.
 
 function getOutputIcon(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
@@ -115,6 +92,11 @@ export function TaskDetailSheet({
   const [editAssignee, setEditAssignee] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** The moves the contract permits for THIS record, as the server derived
+   *  them. `null` until the record has been read — the sheet says so rather
+   *  than guessing, because a guess is what produced buttons that could not
+   *  work. */
+  const [actions, setActions] = useState<OfferedAction[] | null>(null);
 
   // Deliverables state
   const [outputs, setOutputs] = useState<TaskOutput[]>([]);
@@ -139,6 +121,7 @@ export function TaskDetailSheet({
       if (res.ok) {
         const data = await res.json();
         setOutputs(Array.isArray(data.outputs) ? data.outputs : []);
+        setActions(Array.isArray(data.offeredActions) ? data.offeredActions : []);
         // UHS MOD #7 — populate result/error if present
         setSupaResult(data.supaResult ?? null);
         setSupaError(data.supaError ?? null);
@@ -171,6 +154,7 @@ export function TaskDetailSheet({
       fetchTaskOutputs(task.id, task.org);
     } else {
       setOutputs([]);
+      setActions(null);
       setPreviewOutput(null);
       setRecurringInfo(null); // UHS MOD #7
       setSupaResult(null);    // UHS MOD #7
@@ -179,8 +163,6 @@ export function TaskDetailSheet({
   }, [open, task?.id, task?.org, fetchTaskOutputs, task]);
 
   if (!task) return null;
-
-  const transitions = STATUS_TRANSITIONS[task.status] ?? [];
 
   function startEditing() {
     setEditTitle(task!.title);
@@ -555,17 +537,28 @@ export function TaskDetailSheet({
         {!editing && (
           <SheetFooter>
             <div className="flex flex-wrap items-center gap-2 w-full">
-              {transitions.map((t) => (
-                <Button
-                  key={t.status}
-                  variant={t.variant}
-                  size="sm"
-                  disabled={updating || deleting}
-                  onClick={() => handleStatusChange(t.status)}
-                >
-                  {t.label}
-                </Button>
-              ))}
+              {actions === null ? (
+                <span className="text-xs text-muted-foreground" data-testid="task-actions-loading">
+                  Reading the moves this task allows…
+                </span>
+              ) : actions.length === 0 ? (
+                <span className="text-xs text-muted-foreground" data-testid="task-actions-none">
+                  Nothing moves out of this state — it is a final outcome.
+                </span>
+              ) : (
+                actions.map((a) => (
+                  <Button
+                    key={a.to}
+                    variant={a.variant}
+                    size="sm"
+                    title={a.meaning}
+                    disabled={updating || deleting}
+                    onClick={() => handleStatusChange(a.status as TaskStatus)}
+                  >
+                    {a.label}
+                  </Button>
+                ))
+              )}
               <div className="ml-auto">
                 {confirmDelete ? (
                   <div className="flex items-center gap-1">
