@@ -934,6 +934,10 @@ export function completeTask(
   transitionTask(paths, taskId, 'completed', {
     actor,
     evidence,
+    // Optimistic concurrency reaches the completion path too. Dropping it here
+    // made every dashboard completion a blind write over whatever an agent had
+    // recorded since the record was read.
+    expectedVersion: options.expectedVersion,
     fenceToken: options.fenceToken,
     origin: options.origin,
     suppressLegacyAudit: true,

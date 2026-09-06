@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # complete-task.sh — wrapper for Node.js CLI
 # Usage: complete-task.sh <id> [result_summary] [--evidence <json>] [--origin interactive|writer]
+#                          [--expected-version <n>]
 #
 # --origin is forwarded to the CLI so a caller acting for a human at a UI can
 # say so: interactive completions are contract-ENFORCED regardless of the
@@ -15,7 +16,7 @@ RESULT=""
 EXTRA=()
 
 if [[ -z "$ID" ]]; then
-  echo "Usage: complete-task.sh <id> [result_summary] [--evidence <json>] [--origin interactive|writer]" >&2
+  echo "Usage: complete-task.sh <id> [result_summary] [--evidence <json>] [--origin interactive|writer] [--expected-version <n>]" >&2
   exit 1
 fi
 shift
@@ -27,12 +28,12 @@ fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --origin|--evidence)
+    --origin|--evidence|--expected-version)
       [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 1; }
       EXTRA+=("$1" "$2")
       shift 2
       ;;
-    --origin=*|--evidence=*)
+    --origin=*|--evidence=*|--expected-version=*)
       EXTRA+=("${1%%=*}" "${1#*=}")
       shift
       ;;

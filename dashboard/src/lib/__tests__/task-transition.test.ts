@@ -82,9 +82,13 @@ describe('OS-02 dashboard transition service', () => {
       vi.restoreAllMocks();
     });
 
+    // transitionTask now REFUSES a request with no expectedVersion rather than
+    // substituting the current version — a versionless write is a blind write.
+    // These tests are about the store's behaviour, not about concurrency, so
+    // the helper supplies the fixture's version unless the test states one.
     async function callTransition(args: Parameters<typeof import('../task-transition').transitionTask>[0]) {
       const { transitionTask } = await import('../task-transition');
-      return transitionTask(args);
+      return transitionTask({ expectedVersion: 1, ...args });
     }
 
     it('a version conflict comes back as a 409 carrying the current record', async () => {

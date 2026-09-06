@@ -6,6 +6,7 @@ import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { ContractViolation, type CanonicalState, type TransitionOrigin } from '../bus/task-contract.js';
+import { requireOrgForTaskWrite } from '../utils/org.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -219,11 +220,25 @@ busCommand
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .option('--org <name>', 'Organization this task belongs to. Falls back to CTX_ORG. Required: tasks are stored per org, and a task written outside an org is read by nothing.')
+  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string; org?: string }) => {
     const env = resolveEnv();
-    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+
+    // A task with no org used to be written to <instance>/tasks/ — a directory
+    // nothing reads. Sync walks <instance>/orgs/<org>/tasks/ and only that, so
+    // the CLI printed an id, the caller believed the task existed, and it
+    // reached no board, no projection and no agent. Silent task loss.
+    // Refuse instead, and name the orgs that would have worked.
+    const resolved = requireOrgForTaskWrite(opts.org || env.org, env.frameworkRoot);
+    if (!resolved.ok) {
+      console.error(resolved.message);
+      process.exit(1);
+    }
+    const org = resolved.org;
+
+    const paths = resolvePaths(env.agentName, env.instanceId, org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
-    const taskId = createTask(paths, env.agentName, env.org, title, {
+    const taskId = createTask(paths, env.agentName, org, title, {
       description: opts.desc,
       assignee: opts.assignee,
       priority: opts.priority as Priority,
@@ -235,7 +250,7 @@ busCommand
     console.log(taskId);
     // Auto-notify assignee so the task is visible immediately (issue #78)
     if (opts.assignee && opts.assignee !== env.agentName) {
-      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
+      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, org);
       const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
@@ -251,7 +266,8 @@ busCommand
   .option('--actor <name>', 'Who this transition is recorded against. A person when a human is driving it — the journal entry for an upgraded or waived legacy record has to name someone, and "dashboard" names a program.')
   .option('--canonical <state>', 'The canonical state this move is aiming at (backlog|ready|doing|verify|waiting|done|cancelled|failed_terminal). Needed because the native vocabulary is coarser: backlog and ready are both "pending", so without it a backlog -> ready move looks like a no-op and skips the Ready gate.')
   .option('--grandfather <json>', 'A named person\'s explicit waiver of the fields a legacy record never had: {"actor","reason"}. Recorded as a legacy_grandfathered event. Cannot waive dependencies, an illegal transition, or any part of the completion proof gate.')
-  .action((id: string, status: string, opts: { origin?: string; fields?: string; grandfather?: string; canonical?: string; actor?: string }) => {
+  .option('--expected-version <n>', 'Optimistic concurrency: the version the caller read. The move is refused with a version conflict if the record has changed since. Without it the write lands on whatever is current, which is a blind write over anyone who got there first.')
+  .action((id: string, status: string, opts: { origin?: string; fields?: string; grandfather?: string; canonical?: string; actor?: string; expectedVersion?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -289,9 +305,19 @@ busCommand
       | { actor?: string; reason?: string }
       | undefined;
 
+    let expectedVersion: number | undefined;
+    if (opts.expectedVersion !== undefined) {
+      expectedVersion = Number(opts.expectedVersion);
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+        console.error('--expected-version must be a non-negative integer');
+        process.exit(1);
+      }
+    }
+
     try {
       updateTask(paths, id, status as TaskStatus, {
         origin: resolveOrigin(opts.origin),
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
         ...(opts.canonical ? { canonicalState: opts.canonical as CanonicalState } : {}),
         // Only overridden when the caller names someone. Left alone otherwise
         // so the existing audit line keeps its current actor.
@@ -401,7 +427,8 @@ busCommand
   .option('--result <text>', 'Completion result')
   .option('--evidence <json>', 'Evidence object as JSON (artifact/result/verifier/acceptance_results)')
   .option('--origin <origin>', 'interactive (a human at a UI — always enforced) or writer (a migrating background writer — honours the shadow flag)')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string; evidence?: string; origin?: string }) => {
+  .option('--expected-version <n>', 'Optimistic concurrency: the version the caller read. Completion is refused with a version conflict if the record has changed since.')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; evidence?: string; origin?: string; expectedVersion?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
@@ -428,9 +455,19 @@ busCommand
       }
     }
 
+    let expectedVersion: number | undefined;
+    if (opts.expectedVersion !== undefined) {
+      expectedVersion = Number(opts.expectedVersion);
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+        console.error('--expected-version must be a non-negative integer');
+        process.exit(1);
+      }
+    }
+
     try {
       completeTask(paths, id, effectiveResult, {
         origin: resolveOrigin(opts.origin),
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
         ...(evidence ? { evidence } : {}),
       });
     } catch (err) {
