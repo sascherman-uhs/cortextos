@@ -161,8 +161,12 @@ export default function TasksPage() {
         return;
       }
       // A failed move used to fail silently, which is indistinguishable from a
-      // move that worked. Say so.
-      setConflict(data.error ? `Could not move this task: ${data.error}` : 'Could not move this task.');
+      // move that worked. Say so — and when the work contract refused it (422),
+      // show the sentence that names the legal moves rather than an error code.
+      setConflict(
+        data.message ??
+          (data.error ? `Could not move this task: ${data.error}` : 'Could not move this task.'),
+      );
     } catch {
       setConflict('Could not reach the server. This task was not moved.');
     }

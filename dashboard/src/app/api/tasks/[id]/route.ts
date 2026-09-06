@@ -6,6 +6,7 @@ import { getTaskById } from '@/lib/data/tasks';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { syncAll } from '@/lib/sync';
 import { db } from '@/lib/db';
+import { auth } from '@/lib/auth';
 import { transitionTask } from '@/lib/task-transition';
 import { sourceForTaskId, toCanonical } from '@/lib/data/transition-contract';
 
@@ -28,6 +29,15 @@ function isValidId(id: string): boolean {
 // passing values into bus shell scripts as positional arguments.
 function isValidAgentName(name: string): boolean {
   return typeof name === 'string' && /^[a-z0-9_-]+$/.test(name) && name.length <= 64;
+}
+
+// A person's name, reduced to something safe to record as an actor/verifier in
+// the task journal and to pass as a positional CLI argument. Returns undefined
+// when there is nothing usable, so the caller can fall back.
+function sanitizeActor(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  const cleaned = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? cleaned.slice(0, 64) : undefined;
 }
 
 // Cap free-text fields (note, outputSummary) to a safe upper bound before
@@ -81,12 +91,18 @@ export async function GET(
         try {
           // Fetch payload + result + error for full task context
           const payloadRes = await fetch(
-            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error`,
+            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error,version`,
             { headers: sbHeaders, cache: 'no-store' },
           );
           if (payloadRes.ok) {
             const rows = await payloadRes.json();
             const payload = rows[0]?.payload ?? {};
+            // The owning store's version wins over the SQLite projection, which
+            // can lag a sync cycle. The detail view sends this back as
+            // expectedVersion, so a stale number here is a blind write.
+            if (Number.isFinite(Number(rows[0]?.version))) {
+              Object.assign(task, { version: Number(rows[0].version) });
+            }
             const rtId = payload.recurring_task_id;
             // Pass result + error through to the task object
             if (rows[0]?.result !== undefined) {
@@ -488,17 +504,46 @@ export async function PATCH(
   // ---------------------------------------------------------------------------
   const expectedVersion =
     typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined;
-  const evidence =
-    body.evidence && typeof body.evidence === 'object'
-      ? (body.evidence as Record<string, unknown>)
-      : outputSummary
-        ? { result: capText(outputSummary) }
-        : undefined;
 
+  // Who is doing this. The signed-in person if there is one — the contract asks
+  // for a NAMED verifier, and 'dashboard' names a program, not a person. Never
+  // taken from the request body for anything that matters; body.actor is only a
+  // hint and must still pass the agent-name whitelist.
+  const session = await auth().catch(() => null);
+  const sessionActor = sanitizeActor(session?.user?.name);
+  const actor =
+    sessionActor ??
+    (typeof body.actor === 'string' && isValidAgentName(body.actor) ? body.actor : 'dashboard');
+
+  const suppliedEvidence =
+    body.evidence && typeof body.evidence === 'object' && !Array.isArray(body.evidence)
+      ? { ...(body.evidence as Record<string, unknown>) }
+      : {};
+  if (suppliedEvidence.result === undefined && outputSummary) {
+    suppliedEvidence.result = capText(outputSummary);
+  }
+  if (suppliedEvidence.result === undefined && suppliedEvidence.artifact === undefined && note) {
+    suppliedEvidence.result = capText(note);
+  }
+  if (status === 'completed') {
+    // The person who clicked Complete IS the verifier, and recording that is a
+    // true statement. What is NOT invented here is acceptance-check results: a
+    // task that declares acceptance criteria with no recorded results stays
+    // refused (plan §12 — no verified Done without proof).
+    if (suppliedEvidence.verifier === undefined) suppliedEvidence.verifier = actor;
+    if (suppliedEvidence.verification_method === undefined) {
+      suppliedEvidence.verification_method = 'human_review';
+    }
+  }
+  const evidence = Object.keys(suppliedEvidence).length > 0 ? suppliedEvidence : undefined;
+
+  // NOTE: `origin` is deliberately NOT read from the body. This is an HTTP
+  // caller acting for a human, so the transition service marks it interactive
+  // and the contract is enforced regardless of the per-source shadow flag.
   const outcome = await transitionTask({
     taskId: id,
     to: status,
-    actor: typeof body.actor === 'string' && isValidAgentName(body.actor) ? body.actor : 'dashboard',
+    actor,
     expectedVersion,
     evidence,
     reason: note ? capText(note) : undefined,
@@ -506,6 +551,21 @@ export async function PATCH(
   });
 
   if (!outcome.ok) {
+    if (outcome.status === 422) {
+      // A move the work contract refuses. 422 rather than 500: the request was
+      // well formed, the rules said no. The board renders `message` in its
+      // live-region alert, which names the legal moves.
+      return Response.json(
+        {
+          error: outcome.error,
+          message: outcome.message,
+          detail: outcome.detail,
+          violation: outcome.violation,
+          legalTransitions: outcome.legalTransitions,
+        },
+        { status: 422 },
+      );
+    }
     if (outcome.status === 409) {
       return Response.json(
         {
@@ -530,8 +590,14 @@ export async function PATCH(
   if (id.startsWith('supa_')) {
     const now = new Date().toISOString();
     db.prepare(
-      `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?`,
-    ).run(outcome.nativeStatus, now, outcome.nativeStatus === 'completed' ? now : null, id);
+      `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, version = ? WHERE id = ?`,
+    ).run(
+      outcome.nativeStatus,
+      now,
+      outcome.nativeStatus === 'completed' ? now : null,
+      outcome.version ?? 1,
+      id,
+    );
     return Response.json({
       success: true,
       version: outcome.version,

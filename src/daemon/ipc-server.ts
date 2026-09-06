@@ -647,6 +647,36 @@ export class IPCServer {
           }
           break;
 
+        case 'ingress-transfer': {
+          // OS-07: fenced hand-off of one bot's listener between the
+          // agent-owned poller and multiplexed ingress. Routed through the
+          // daemon because only the daemon can stop the in-process poller
+          // between "persist the checkpoint" and "move the fence".
+          const bot = request.agent;
+          const direction = String(request.data?.direction ?? '');
+          if (!bot) {
+            response = { success: false, error: 'Bot identity required', code: 'INVALID_INPUT' };
+            break;
+          }
+          if (direction !== 'ingress' && direction !== 'agent') {
+            response = { success: false, error: "direction must be 'ingress' or 'agent'", code: 'INVALID_INPUT' };
+            break;
+          }
+          const actor = typeof request.data?.actor === 'string' ? request.data.actor : undefined;
+          const reason = typeof request.data?.reason === 'string' ? request.data.reason : undefined;
+          const op = direction === 'ingress'
+            ? this.agentManager.transferBotToIngress(bot, actor, reason)
+            : this.agentManager.revertBotToAgentPoller(bot, actor, reason);
+          op.then((result) => {
+            this.sendResponse(socket, result.ok
+              ? { success: true, data: result }
+              : { success: false, error: result.error ?? 'transfer failed', data: result });
+          }).catch((err) => {
+            this.sendResponse(socket, { success: false, error: err instanceof Error ? err.message : String(err) });
+          });
+          return; // response is sent asynchronously above
+        }
+
         case 'wake':
           // Wake a specific agent's fast checker (replaces SIGUSR1)
           if (request.agent) {
@@ -858,6 +888,15 @@ export class IPCServer {
       response = { success: false, error: String(err) };
     }
 
+    this.sendResponse(socket, response);
+  }
+
+  /**
+   * Write one response and close. Factored out so async handlers (OS-07's
+   * `ingress-transfer`, which must await a fenced cutover) can reply from a
+   * promise instead of the synchronous switch.
+   */
+  private sendResponse(socket: Socket, response: IPCResponse): void {
     try {
       socket.write(JSON.stringify(response));
       socket.end();

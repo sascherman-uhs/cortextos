@@ -20,6 +20,7 @@ import {
   recordAttempt,
   resolve as resolveModel,
   resolveRegistryPaths,
+  roleCapabilities,
   updateAttemptObserved,
   type HealthResult,
   type ModelOperation,
@@ -345,6 +346,109 @@ modelCommand
       },
       opts as never,
     );
+  });
+
+// ---------------------------------------------------------------------------
+// role-capability (a property of the ROLE, never a requirement on the model)
+// ---------------------------------------------------------------------------
+
+/**
+ * `role_capabilities` says what a role PARTICIPATES IN — the weekly Kaizen
+ * cycle enrolls on `continuous-improvement`. It is deliberately not
+ * `required_capabilities`: that field is matched against a model entry's
+ * `capability_tags`, so putting a role property there would make the role
+ * unresolvable the moment it was declared.
+ *
+ * Consequences that the verbs below depend on: a capability change moves no
+ * route, so it never restarts an agent (`restart_required: false`). It still
+ * does a CAS write and journals an event, because "who improves their own job"
+ * is exactly the sort of change that has to be answerable a month later.
+ */
+const roleCapabilityCommand = modelCommand
+  .command('role-capability')
+  .description('Manage role-level capabilities (role properties, e.g. continuous-improvement)');
+
+roleCapabilityCommand
+  .command('add')
+  .description('Declare a role capability on a role (no restart)')
+  .requiredOption('--role <role>', 'Role id')
+  .requiredOption('--capability <cap>', 'Role capability, e.g. continuous-improvement')
+  .requiredOption('--reason <reason>', 'Why this role carries this capability')
+  .option('--actor <actor>', 'Who is making the change', 'scott')
+  .option('--expected-revision <n>', 'CAS guard: registry revision you read')
+  .option('--json', 'Output JSON')
+  .option('--org <org>', 'Org name', DEFAULT_ORG)
+  .option('--root <path>', 'Registry root')
+  .option('--instance <id>', 'Instance ID', 'default')
+  .action(async (opts: Record<string, string | boolean | undefined>) => {
+    await runOperation(
+      {
+        kind: 'role_capability',
+        mode: 'add',
+        role: String(opts.role),
+        capability: String(opts.capability),
+        actor: String(opts.actor || 'scott'),
+        reason: String(opts.reason),
+        ...(opts.expectedRevision !== undefined ? { expectedRevision: Number(opts.expectedRevision) } : {}),
+      },
+      opts as never,
+    );
+  });
+
+roleCapabilityCommand
+  .command('remove')
+  .description('Remove a role capability from a role (no restart)')
+  .requiredOption('--role <role>', 'Role id')
+  .requiredOption('--capability <cap>', 'Role capability to remove')
+  .requiredOption('--reason <reason>', 'Why it is being removed')
+  .option('--actor <actor>', 'Who is making the change', 'scott')
+  .option('--expected-revision <n>', 'CAS guard: registry revision you read')
+  .option('--json', 'Output JSON')
+  .option('--org <org>', 'Org name', DEFAULT_ORG)
+  .option('--root <path>', 'Registry root')
+  .option('--instance <id>', 'Instance ID', 'default')
+  .action(async (opts: Record<string, string | boolean | undefined>) => {
+    await runOperation(
+      {
+        kind: 'role_capability',
+        mode: 'remove',
+        role: String(opts.role),
+        capability: String(opts.capability),
+        actor: String(opts.actor || 'scott'),
+        reason: String(opts.reason),
+        ...(opts.expectedRevision !== undefined ? { expectedRevision: Number(opts.expectedRevision) } : {}),
+      },
+      opts as never,
+    );
+  });
+
+roleCapabilityCommand
+  .command('list')
+  .description('Show role capabilities for one role or every role')
+  .option('--role <role>', 'Only this role')
+  .option('--json', 'Output JSON')
+  .option('--org <org>', 'Org name', DEFAULT_ORG)
+  .option('--root <path>', 'Registry root')
+  .action((opts: Record<string, string | boolean | undefined>) => {
+    const json = !!opts.json;
+    const ctx = ctxFrom(opts as { org?: string; root?: string });
+    try {
+      const reg = loadRegistry(ctx);
+      const wanted = opts.role ? String(opts.role) : null;
+      if (wanted && !reg.roles[wanted]) die(json, `No role "${wanted}" in registry`);
+      const roles = Object.entries(reg.roles)
+        .filter(([id]) => !wanted || id === wanted)
+        .map(([id, role]) => ({ role: id, role_capabilities: roleCapabilities(role) }))
+        .sort((a, b) => a.role.localeCompare(b.role));
+      out(json, { registry_revision: reg.revision, roles }, () => {
+        console.log(`registry revision ${reg.revision}`);
+        for (const r of roles) {
+          console.log(`  ${r.role.padEnd(22)} ${r.role_capabilities.join(', ') || '(none)'}`);
+        }
+      });
+    } catch (err) {
+      die(json, (err as Error).message);
+    }
   });
 
 // ---------------------------------------------------------------------------

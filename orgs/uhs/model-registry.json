@@ -3,7 +3,7 @@
   "revision": 1,
   "updated_at": "2026-09-05T00:00:00Z",
   "updated_by": "jarvis",
-  "_readme": "Single authority for model routing (OS-02b-core). Never hand-edit pins or activation \u2014 use `cortextos model switch|pin|unpin|activation`, which does a CAS write and journals an event. Agent config.json `model` fields are LEGACY.",
+  "_readme": "Single authority for model routing (OS-02b-core). Never hand-edit pins, activation or role capabilities \u2014 use `cortextos model switch|pin|unpin|activation|role-capability`, which does a CAS write and journals an event. Agent config.json `model` fields are LEGACY. TWO DIFFERENT CAPABILITY FIELDS LIVE ON A ROLE AND THEY ARE NOT INTERCHANGEABLE: `required_capabilities` is matched against a model entry's `capability_tags` during resolution, so a value there that no entry carries makes the role UNRESOLVABLE; `role_capabilities` describes the ROLE itself (what it participates in, e.g. `continuous-improvement` for weekly Kaizen enrollment), is never matched against any model, and therefore can never break resolution. Manage it with `cortextos model role-capability add|remove|list` (no restart \u2014 a capability changes no route).",
   "activation": {
     "org_default": "shadow",
     "consumers": {
@@ -485,6 +485,7 @@
         "scoped-retrieval",
         "tool-use"
       ],
+      "role_capabilities": [],
       "min_context": 100000,
       "data_scope": "scott"
     },
@@ -494,6 +495,9 @@
         "structured-output",
         "planning",
         "scoped-retrieval"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
       ],
       "min_context": 100000,
       "data_scope": "org"
@@ -505,6 +509,9 @@
         "business-rules",
         "structured-output"
       ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
       "min_context": 100000,
       "data_scope": "org"
     },
@@ -514,6 +521,9 @@
         "tool-use",
         "browser",
         "business-rules"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
       ],
       "min_context": 100000,
       "data_scope": "org"
@@ -525,6 +535,9 @@
         "structured-output",
         "financial-scope"
       ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
       "min_context": 100000,
       "data_scope": "finance"
     },
@@ -533,6 +546,9 @@
       "required_capabilities": [
         "structured-output",
         "scoped-retrieval"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
       ],
       "min_context": 50000,
       "data_scope": "org"
@@ -543,6 +559,9 @@
         "content",
         "scoped-retrieval"
       ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
       "min_context": 100000,
       "data_scope": "org"
     },
@@ -552,6 +571,9 @@
         "conversation",
         "tool-use"
       ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
       "min_context": 100000,
       "data_scope": "raquel"
     },
@@ -560,6 +582,9 @@
       "required_capabilities": [
         "conversation",
         "vision"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
       ],
       "min_context": 100000,
       "data_scope": "angelic"
@@ -571,6 +596,9 @@
         "tool-use",
         "sandbox"
       ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
       "min_context": 100000,
       "data_scope": "repos"
     },
@@ -580,6 +608,9 @@
         "coding",
         "tool-use",
         "evidence-review"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
       ],
       "min_context": 100000,
       "data_scope": "repos"

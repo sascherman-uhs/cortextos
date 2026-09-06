@@ -8,7 +8,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { resolveTarget, canMove } from '../task-transition';
+import {
+  resolveTarget,
+  canMove,
+  parseContractRefusal,
+  interactiveLegalityRefusal,
+  contractRefusal,
+} from '../task-transition';
 import { sourceForTaskId, toCanonical, toNative, isAllowedMove } from '../data/transition-contract';
 
 describe('OS-02 dashboard transition service', () => {
@@ -142,6 +148,88 @@ describe('OS-02 dashboard transition service', () => {
       globalThis.fetch = vi.fn(async () => { throw new Error('ECONNREFUSED'); }) as unknown as typeof fetch;
       const out = await callTransition({ taskId: 'supa_7', to: 'done', actor: 'dashboard' });
       expect(out).toMatchObject({ ok: false, error: 'supabase_unreachable' });
+    });
+  });
+
+  describe('an interactive move is enforced regardless of the shadow flag', () => {
+    // The defect: the board applied a contract-violating move, the bus logged
+    // "[task-contract:shadow] cortexos_tasks: backlog -> done violates
+    // illegal_transition" and exited 0, and the API answered 200. Nothing
+    // refused, and the UI showed nothing.
+
+    it('refuses backlog -> done before the store is touched', () => {
+      const refusal = interactiveLegalityRefusal('backlog', 'done');
+      expect(refusal).not.toBeNull();
+      expect(refusal!.status).toBe(422);
+      expect(refusal!.violation).toBe('illegal_transition');
+      // The message must tell the person what they CAN do.
+      expect(refusal!.legalTransitions).toEqual(['ready', 'waiting', 'cancelled', 'failed_terminal']);
+      expect(refusal!.message).toMatch(/Legal moves from "backlog": ready, waiting, cancelled, failed terminal/);
+    });
+
+    it('still allows the two-step completion path for work under way', () => {
+      // doing -> done is not a single contract hop; it is doing -> verify ->
+      // done, and each leg costs its own proof at the store boundary.
+      expect(interactiveLegalityRefusal('doing', 'verify')).toBeNull();
+      expect(interactiveLegalityRefusal('doing', 'done')).toBeNull();
+      expect(interactiveLegalityRefusal('waiting', 'done')).toBeNull();
+    });
+
+    it('refuses to reopen a terminal record', () => {
+      const refusal = interactiveLegalityRefusal('done', 'doing');
+      expect(refusal!.status).toBe(422);
+      expect(refusal!.legalTransitions).toEqual([]);
+      expect(refusal!.message).toMatch(/terminal state/);
+    });
+
+    it('a Supabase-backed task is refused before the compare-and-set RPC runs', async () => {
+      const calls: string[] = [];
+      globalThis.fetch = vi.fn(async (url: string | URL | Request) => {
+        calls.push(String(url));
+        if (String(url).includes('/rest/v1/tasks?id=eq.')) {
+          return new Response(JSON.stringify([{ id: 7, status: 'pending', version: 2 }]), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true, version: 3 }), { status: 200 });
+      }) as unknown as typeof fetch;
+
+      const { transitionTask } = await import('../task-transition');
+      const out = await transitionTask({
+        taskId: 'supa_7', to: 'done', actor: 'scott', expectedVersion: 2,
+      });
+
+      expect(out).toMatchObject({ ok: false, status: 422, error: 'contract_violation' });
+      // The RPC is a compare-and-set, not a validator: it must never be reached
+      // with a move the contract refuses.
+      expect(calls.some((c) => c.includes('rpc/task_transition'))).toBe(false);
+    });
+
+    it('reads the bus CLI refusal into the one shape the board renders', () => {
+      const stderr = [
+        'CONTRACT_REFUSED ' + JSON.stringify({
+          source: 'cortexos_tasks', from: 'verify', to: 'done',
+          error: 'acceptance_checks_incomplete',
+          detail: 'no recorded result for acceptance check: tests pass',
+          legal_transitions: ['done', 'doing', 'waiting', 'cancelled'],
+        }),
+        '[cortexos_tasks] verify -> done refused: acceptance_checks_incomplete',
+      ].join('\n');
+
+      const parsed = parseContractRefusal(stderr);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.status).toBe(422);
+      expect(parsed!.violation).toBe('acceptance_checks_incomplete');
+      expect(parsed!.message).toMatch(/no recorded result for acceptance check: tests pass/);
+    });
+
+    it('leaves an ordinary failure alone rather than dressing it as a refusal', () => {
+      expect(parseContractRefusal('bash: node: command not found')).toBeNull();
+      expect(parseContractRefusal('')).toBeNull();
+    });
+
+    it('names the rule, not an error code, in what the person reads', () => {
+      const r = contractRefusal('verify', 'done', 'missing_verifier', 'Verify -> Done requires a named verifier');
+      expect(r.message).toMatch(/refused by the work contract/);
+      expect(r.message).toMatch(/requires a named verifier/);
     });
   });
 

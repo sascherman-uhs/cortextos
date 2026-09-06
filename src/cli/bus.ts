@@ -5,6 +5,7 @@ import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { ContractViolation, type CanonicalState, type TransitionOrigin } from '../bus/task-contract.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -25,6 +26,70 @@ import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
+
+/**
+ * Where a CLI-driven transition came from.
+ *
+ * The CLI is the legacy fleet's writer surface: agents, cron jobs and bus shell
+ * scripts all land here, and they are the population the OS-02 shadow flag
+ * exists to migrate one at a time. So an unqualified CLI call is a `writer`.
+ *
+ * `interactive` is asserted ONLY by a caller that knows it is acting for a
+ * human at a UI — in practice the dashboard's transition service, which passes
+ * `--origin interactive` and never lets an HTTP client pick the value. Claiming
+ * `interactive` only ever buys MORE enforcement, so there is nothing to gain by
+ * spoofing it; claiming `writer` buys the shadow window, which is why it is
+ * never accepted from the network and an unrecognised value fails closed to
+ * `interactive`.
+ */
+function resolveOrigin(opt?: string): TransitionOrigin {
+  const raw = (opt ?? process.env.CTX_TRANSITION_ORIGIN ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'writer') return 'writer';
+  return 'interactive';
+}
+
+/**
+ * Print a contract refusal in a shape a caller can parse, then exit non-zero.
+ * The dashboard turns this into the board's refusal alert; a human reading a
+ * terminal gets the same sentence.
+ */
+/** An actor name reduced to something safe to store and compare. Undefined when
+ *  there is nothing usable, so the caller falls back rather than recording ''. */
+function sanitizeActorName(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const cleaned = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? cleaned.slice(0, 64) : undefined;
+}
+
+function exitOnContractViolation(err: unknown): never {
+  if (err instanceof ContractViolation) {
+    const legal = err.legalTransitions;
+    console.error(
+      'CONTRACT_REFUSED ' +
+        JSON.stringify({
+          source: err.source,
+          from: err.from,
+          to: err.to,
+          error: err.result.error,
+          detail: err.result.detail,
+          legal_transitions: legal,
+          // What the record is missing, and whether a human may supply or waive
+          // it. Without these the dashboard can only say "no"; with them it can
+          // offer the form that fixes the record for good.
+          missing: err.result.missing,
+          legacy: err.result.legacy,
+          waivable: err.result.waivable,
+        }),
+    );
+    console.error(
+      err.message +
+        (legal.length ? ` Legal moves from ${err.from}: ${legal.join(', ')}.` : ''),
+    );
+    process.exit(3);
+  }
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+}
 
 /**
  * Check if the org requires deliverables and the task has none attached.
@@ -181,7 +246,12 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--origin <origin>', 'interactive (a human at a UI — always enforced) or writer (a migrating background writer — honours the shadow flag)')
+  .option('--fields <json>', 'Contract fields a person is supplying inline for a record that predates the contract: {"outcome","acceptanceCriteria":[],"humanAccountableId","agentRoleId"}. Recorded as a legacy_upgraded event.')
+  .option('--actor <name>', 'Who this transition is recorded against. A person when a human is driving it — the journal entry for an upgraded or waived legacy record has to name someone, and "dashboard" names a program.')
+  .option('--canonical <state>', 'The canonical state this move is aiming at (backlog|ready|doing|verify|waiting|done|cancelled|failed_terminal). Needed because the native vocabulary is coarser: backlog and ready are both "pending", so without it a backlog -> ready move looks like a no-op and skips the Ready gate.')
+  .option('--grandfather <json>', 'A named person\'s explicit waiver of the fields a legacy record never had: {"actor","reason"}. Recorded as a legacy_grandfathered event. Cannot waive dependencies, an illegal transition, or any part of the completion proof gate.')
+  .action((id: string, status: string, opts: { origin?: string; fields?: string; grandfather?: string; canonical?: string; actor?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -201,7 +271,39 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
+    const parseJsonOption = (name: string, raw: string | undefined) => {
+      if (raw === undefined) return undefined;
+      try {
+        const value = JSON.parse(raw);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+        return value as Record<string, unknown>;
+      } catch {
+        console.error(`--${name} must be a JSON object`);
+        process.exit(1);
+      }
+    };
+    const fields = parseJsonOption('fields', opts.fields) as
+      | { outcome?: string; acceptanceCriteria?: unknown[]; humanAccountableId?: string; agentRoleId?: string }
+      | undefined;
+    const grandfather = parseJsonOption('grandfather', opts.grandfather) as
+      | { actor?: string; reason?: string }
+      | undefined;
+
+    try {
+      updateTask(paths, id, status as TaskStatus, {
+        origin: resolveOrigin(opts.origin),
+        ...(opts.canonical ? { canonicalState: opts.canonical as CanonicalState } : {}),
+        // Only overridden when the caller names someone. Left alone otherwise
+        // so the existing audit line keeps its current actor.
+        ...(opts.actor || grandfather?.actor
+          ? { actor: sanitizeActorName(opts.actor) ?? grandfather!.actor }
+          : {}),
+        fields,
+        grandfather,
+      });
+    } catch (err) {
+      exitOnContractViolation(err);
+    }
     console.log(`Updated ${id} -> ${status}`);
   });
 
@@ -297,7 +399,9 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--evidence <json>', 'Evidence object as JSON (artifact/result/verifier/acceptance_results)')
+  .option('--origin <origin>', 'interactive (a human at a UI — always enforced) or writer (a migrating background writer — honours the shadow flag)')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; evidence?: string; origin?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
@@ -312,7 +416,26 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
+    let evidence: Record<string, unknown> | undefined;
+    if (opts.evidence) {
+      try {
+        const parsed = JSON.parse(opts.evidence);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+        evidence = parsed as Record<string, unknown>;
+      } catch (err) {
+        console.error(`--evidence must be a JSON object: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+    }
+
+    try {
+      completeTask(paths, id, effectiveResult, {
+        origin: resolveOrigin(opts.origin),
+        ...(evidence ? { evidence } : {}),
+      });
+    } catch (err) {
+      exitOnContractViolation(err);
+    }
     console.log(`Completed ${id}`);
   });
 

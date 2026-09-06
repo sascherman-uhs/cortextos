@@ -276,6 +276,34 @@ export function adapterHostsRuntime(reg: ModelRegistry, adapterId: string, runti
   return adapterId === runtime;
 }
 
+/**
+ * Role-level capabilities: what the ROLE participates in, as opposed to what a
+ * MODEL has to be able to do.
+ *
+ * This is deliberately NOT read by `validateCandidate` — a role property such
+ * as `continuous-improvement` describes the role's job, not a tag any model
+ * entry carries, so matching it against `capability_tags` would make every
+ * role that declared it unresolvable. Absent means the empty list.
+ */
+export function roleCapabilities(role: ModelRoleAssignment | null | undefined): string[] {
+  return role?.role_capabilities ?? [];
+}
+
+/** A role capability is a slug: lowercase letters, digits and dashes. */
+export const ROLE_CAPABILITY_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+export function roleHasCapability(role: ModelRoleAssignment | null | undefined, capability: string): boolean {
+  return roleCapabilities(role).includes(capability);
+}
+
+/** Roles declaring `capability`, sorted. The enrollment question, answered once. */
+export function rolesWithCapability(reg: ModelRegistry, capability: string): string[] {
+  return Object.entries(reg.roles)
+    .filter(([, role]) => roleHasCapability(role, capability))
+    .map(([id]) => id)
+    .sort();
+}
+
 export function validateCandidate(
   reg: ModelRegistry,
   entryId: string,
@@ -1105,7 +1133,18 @@ export type ModelOperation =
   | { kind: 'pin'; agent: string; entry_id: string; actor: string; reason: string; expiresAt: string | null; expectedRevision?: number; fallback?: string[] }
   | { kind: 'unpin'; agent: string; actor: string; reason: string; expectedRevision?: number }
   | { kind: 'activation'; consumer?: string; org?: boolean; mode: ModelActivationMode; actor: string; reason: string; expectedRevision?: number }
-  | { kind: 'revert'; operation_id: string; actor: string; reason: string; expectedRevision?: number };
+  | { kind: 'revert'; operation_id: string; actor: string; reason: string; expectedRevision?: number }
+  // Role PROPERTY, not model requirement: never touches resolution, never
+  // restarts an agent. See `roleCapabilities()`.
+  | {
+      kind: 'role_capability';
+      role: string;
+      capability: string;
+      mode: 'add' | 'remove';
+      actor: string;
+      reason: string;
+      expectedRevision?: number;
+    };
 
 export type Restarter = (agent: string) => Promise<ModelRestartResult>;
 
@@ -1135,6 +1174,11 @@ export function affectedAgents(reg: ModelRegistry, op: ModelOperation, at: Date)
     case 'activation':
       if (op.org) return Object.keys(reg.agents);
       return op.consumer && reg.agents[op.consumer] ? [op.consumer] : [];
+    case 'role_capability':
+      // A role capability changes no route, so no agent's model changes and no
+      // agent has to be restarted. Returning [] is what makes the receipt say
+      // `restart_required: false`.
+      return [];
     case 'revert':
       return [];
   }
@@ -1186,6 +1230,9 @@ export function revertAffectedAgents(reg: ModelRegistry, from: unknown, at: Date
   if (!from || typeof from !== 'object') return [];
   const f = from as Record<string, unknown>;
   const out = new Set<string>();
+  // Reverting a role capability moves no route, so it restarts nobody. Without
+  // this guard the `f.role` branch below would restart the whole role.
+  if (Array.isArray(f.role_capabilities)) return [];
   if (typeof f.target_agent === 'string') out.add(f.target_agent);
   if (Array.isArray(f.cleared_pins)) {
     for (const c of f.cleared_pins as { agent?: unknown }[]) {
@@ -1511,6 +1558,26 @@ function validateOperation(reg: ModelRegistry, op: ModelOperation, at: Date): vo
     case 'activation':
       if (!op.org && !op.consumer) throw new Error('activation requires --org or --consumer');
       return;
+    case 'role_capability': {
+      const role = reg.roles[op.role];
+      if (!role) throw new Error(`No role "${op.role}" in registry`);
+      if (!ROLE_CAPABILITY_PATTERN.test(op.capability)) {
+        throw new Error(
+          `Role capability "${op.capability}" is not a slug ` +
+          '(lowercase letters, digits and dashes, max 64 chars)',
+        );
+      }
+      const present = roleHasCapability(role, op.capability);
+      // Refuse the no-op rather than burning a registry revision and an audit
+      // event on a change that changes nothing.
+      if (op.mode === 'add' && present) {
+        throw new Error(`Role "${op.role}" already declares role capability "${op.capability}"`);
+      }
+      if (op.mode === 'remove' && !present) {
+        throw new Error(`Role "${op.role}" does not declare role capability "${op.capability}"`);
+      }
+      return;
+    }
     case 'revert':
       return;
   }
@@ -1587,6 +1654,21 @@ function mutateRegistry(
       next.activation.consumers[op.consumer!] = op.mode;
       return { from: { consumer: op.consumer, mode: from }, to: { consumer: op.consumer, mode: op.mode } };
     }
+    case 'role_capability': {
+      const before = roleCapabilities(next.roles[op.role]);
+      const after =
+        op.mode === 'add'
+          ? [...before, op.capability].sort()
+          : before.filter((c) => c !== op.capability);
+      next.roles[op.role] = { ...next.roles[op.role], role_capabilities: after };
+      // `role_capabilities` on BOTH sides is what tells revert (and a human
+      // reading the journal) that this snapshot is a role property and not a
+      // tier switch — the two would otherwise both look like `{ role: ... }`.
+      return {
+        from: { role: op.role, role_capabilities: before },
+        to: { role: op.role, role_capabilities: after },
+      };
+    }
     case 'revert': {
       const target = findOperationEvents(op.operation_id, ctx).find((e) => e.state === 'desired_written');
       if (!target) throw new Error(`No desired_written event for operation ${op.operation_id}`);
@@ -1613,6 +1695,16 @@ function applyRevertDetail(
 ): void {
   if (!from || typeof from !== 'object') throw new Error('Operation has no revertible prior state');
   const f = from as Record<string, unknown>;
+  // Checked BEFORE the tier branch: a role-capability snapshot also carries a
+  // `role`, and falling through would try to read a tier that is not there.
+  if (typeof f.role === 'string' && Array.isArray(f.role_capabilities)) {
+    if (!next.roles[f.role]) throw new Error(`Role "${f.role}" no longer exists`);
+    next.roles[f.role] = {
+      ...next.roles[f.role],
+      role_capabilities: (f.role_capabilities as unknown[]).filter((c): c is string => typeof c === 'string'),
+    };
+    return;
+  }
   if (typeof f.role === 'string' && typeof f.tier === 'string') {
     if (!next.roles[f.role]) throw new Error(`Role "${f.role}" no longer exists`);
     next.roles[f.role] = { ...next.roles[f.role], tier: f.tier };

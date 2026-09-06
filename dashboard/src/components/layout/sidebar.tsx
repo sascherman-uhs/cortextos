@@ -8,6 +8,7 @@ import {
   IconRobot,
   IconListCheck,
   IconLayoutList,
+  IconLayoutKanban,
   IconSunrise,
   IconShieldCheck,
   IconActivity,
@@ -20,8 +21,10 @@ import {
   IconSearch,
   IconClock,
   IconTarget,
+  IconTrendingUp,
   IconMessages,
   IconNotes,
+  IconFolders,
   // === JARVIS MOD #19 (2026-07-03): Cosmos tab nav icon ===
   IconPlanet,
   // === END JARVIS MOD #19 ===
@@ -41,7 +44,12 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   // Core
-  { label: 'Overview', href: '/', icon: IconLayoutDashboard, section: 'core' },
+  // === OS-03 (2026-09-05): Today is the default home; Overview keeps every
+  // card it had, at /overview. Board is the accessible Kanban. ===
+  { label: 'Today', href: '/', icon: IconSunrise, section: 'core' },
+  { label: 'Board', href: '/board', icon: IconLayoutKanban, section: 'core' },
+  // === END OS-03 ===
+  { label: 'Overview', href: '/overview', icon: IconLayoutDashboard, section: 'core' },
   { label: 'Queue', href: '/queue', icon: IconLayoutList, section: 'core' },
   // === OS-04 (2026-09-05): the morning briefing snapshot ===
   { label: 'Briefing', href: '/briefing', icon: IconSunrise, section: 'core' },
@@ -61,10 +69,18 @@ const navItems: NavItem[] = [
   { label: 'Analytics', href: '/analytics', icon: IconChartDots3, section: 'ops' },
 
   // Intelligence
+  // === OS-05 (2026-09-05): Projects — the portfolio-v1 registry surface ===
+  { label: 'Projects', href: '/projects', icon: IconFolders, section: 'intel' },
+  // === END OS-05 ===
   { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2, section: 'intel' },
   { label: 'KB Checklist', href: '/knowledge-base/checklist', icon: IconChecklist, section: 'intel' },
   { label: 'Wiki', href: '/wiki', icon: IconNotes, section: 'intel' },
   { label: 'Experiments', href: '/experiments', icon: IconFlask, section: 'intel' },
+  // === OS-08 (2026-09-05): the self-improvement loop, with its rejected and
+  // reverted changes. Distinct from 'Experiments' above, which is the existing
+  // CortexOS A/B surface. ===
+  { label: 'Improvements', href: '/improvements', icon: IconTrendingUp, section: 'intel' },
+  // === END OS-08 ===
   { label: 'Skills', href: '/skills', icon: IconPuzzle, section: 'intel' },
 ];
 

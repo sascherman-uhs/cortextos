@@ -32,6 +32,7 @@ import {
 import {
   checkTransition,
   guardTransition,
+  effectiveMode,
   enforcementMode,
   toCanonical,
   toNative,
@@ -84,6 +85,10 @@ describe('OS-02 task contract', () => {
         expect({ name: c.name, ok: r.ok, error: r.error ?? null })
           .toEqual({ name: c.name, ok: c.ok, error: c.ok ? (r.error ?? null) : c.error });
         if (c.noop) expect(r.noop).toBe(true);
+        if (c.grandfathered) {
+          expect({ name: c.name, grandfathered: r.grandfathered, waived: r.waived })
+            .toEqual({ name: c.name, grandfathered: true, waived: c.waived });
+        }
       }
       expect(contract).toBeDefined();
     });
@@ -212,6 +217,10 @@ describe('OS-02 task contract', () => {
         },
       });
       const file = findTaskFile(paths, id)!;
+      // Work has to be under way before it can be finished: backlog -> verify is
+      // not a move the contract has, and markVerify now refuses it rather than
+      // writing first and validating second.
+      claimTask(paths, id, 'agent-a');
 
       process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'enforced';
       expect(() => completeTask(paths, id, 'I did it, trust me')).toThrow(/remains in verify/);
@@ -232,6 +241,7 @@ describe('OS-02 task contract', () => {
           impactClass: 'code',
         },
       });
+      claimTask(paths, id, 'agent-a');
       process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'enforced';
       completeTask(paths, id, 'done', {
         actor: 'agent-a',
@@ -251,6 +261,7 @@ describe('OS-02 task contract', () => {
           acceptanceCriteria: ['tests pass'], impactClass: 'code',
         },
       });
+      claimTask(paths, id, 'alice');
       process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'enforced';
       expect(() =>
         completeTask(paths, id, 'done', {
@@ -289,13 +300,63 @@ describe('OS-02 task contract', () => {
       expect(enforcementMode('cortexos_tasks')).toBe('shadow');
     });
 
-    it('guardTransition throws only when the source is enforced', () => {
+    it('a background writer throws only when the source is enforced', () => {
       const item = { outcome: 'x' };
-      expect(() => guardTransition('cortexos_tasks', 'backlog', 'ready', item, {}, {}, { log: () => {} }))
+      const opts = { log: () => {}, origin: 'writer' as const };
+      expect(() => guardTransition('cortexos_tasks', 'backlog', 'ready', item, {}, {}, opts))
         .not.toThrow();
       process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'enforced';
-      expect(() => guardTransition('cortexos_tasks', 'backlog', 'ready', item, {}, {}, { log: () => {} }))
+      expect(() => guardTransition('cortexos_tasks', 'backlog', 'ready', item, {}, {}, opts))
         .toThrow(ContractViolation);
+    });
+
+    it('an interactive caller is enforced even while the source is in shadow', () => {
+      // The defect this closes: a human clicking Complete on the board produced
+      // a [task-contract:shadow] log line and an HTTP 200. The shadow flag is a
+      // migration window for background writers; it was never a licence for a
+      // UI to write a transition the contract refuses.
+      process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'shadow';
+      const item = { outcome: 'x' };
+      expect(enforcementMode('cortexos_tasks')).toBe('shadow');
+      expect(effectiveMode('cortexos_tasks', 'writer')).toBe('shadow');
+      expect(effectiveMode('cortexos_tasks', 'interactive')).toBe('enforced');
+      expect(() =>
+        guardTransition('cortexos_tasks', 'backlog', 'done', item, {}, {}, { log: () => {}, origin: 'interactive' }),
+      ).toThrow(ContractViolation);
+    });
+
+    it('a caller that declares no origin fails closed to enforced', () => {
+      // Nothing in-process may inherit the writer's window by omission. The bus
+      // library passes 'writer' explicitly because it IS the writer surface;
+      // any new caller that forgets gets the strict path.
+      process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'shadow';
+      expect(effectiveMode('cortexos_tasks')).toBe('enforced');
+      expect(() =>
+        guardTransition('cortexos_tasks', 'backlog', 'done', { outcome: 'x' }, {}, {}, { log: () => {} }),
+      ).toThrow(ContractViolation);
+    });
+
+    it('a refusal names the legal moves, so the board can say what IS possible', () => {
+      try {
+        guardTransition('cortexos_tasks', 'backlog', 'done', { outcome: 'x' }, {}, {}, { log: () => {}, origin: 'interactive' });
+        throw new Error('expected a refusal');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ContractViolation);
+        expect((err as ContractViolation).legalTransitions).toEqual([
+          'ready', 'waiting', 'cancelled', 'failed_terminal',
+        ]);
+      }
+    });
+
+    it('a completion a human clicks is refused before anything is written', () => {
+      const id = createTask(paths, 'alice', 'TestOrg', 'UI complete', {
+        contract: { outcome: 'x', agentRoleId: 'backend', acceptanceCriteria: ['c'], impactClass: 'code' },
+      });
+      process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'shadow';
+      expect(() => completeTask(paths, id, 'clicked complete', { origin: 'interactive' }))
+        .toThrow(ContractViolation);
+      // Unchanged: the refused move left no half-applied write behind.
+      expect(canonicalStateOf(paths, id)).toBe('backlog');
     });
   });
 

@@ -11,6 +11,12 @@ export default defineConfig({
       // from dashboard/node_modules, because root's package.json does not
       // depend on Next.js.
       'next/server': path.resolve(__dirname, 'dashboard/node_modules/next/server.js'),
+      // OS-03: component tests render dashboard components to static markup with
+      // react-dom/server. React lives only in dashboard/node_modules, so the
+      // same aliasing the next/server line above uses applies to React too.
+      react: path.resolve(__dirname, 'dashboard/node_modules/react'),
+      'react-dom': path.resolve(__dirname, 'dashboard/node_modules/react-dom'),
+      'next/link': path.resolve(__dirname, 'dashboard/src/lib/os03/__tests__/stubs/next-link.tsx'),
     },
   },
   test: {
@@ -19,6 +25,7 @@ export default defineConfig({
     include: [
       'tests/**/*.test.ts',
       'dashboard/src/**/__tests__/**/*.test.ts',
+      'dashboard/src/**/__tests__/**/*.test.tsx',
     ],
   },
 });
