@@ -138,16 +138,21 @@ describe('OS-07 — a persona answers while its worker restarts', () => {
       dedupe_key: `reply:${inbound[0].dedupe_key}`,
     });
     const sent: Array<[string, string]> = [];
-    await drainOutbox(paths, async (bot, chatId) => {
+    await drainOutbox(paths, async (bot, chatId, _text, onNetworkStart) => {
+      onNetworkStart();
       sent.push([bot, chatId]);
-      return 1;
+      return { status: 'sent', messageId: 1 };
     });
     expect(sent).toEqual([['vera', '1001']]);
     expect(ackWork(paths, handle).state).toBe('done');
 
     // A second drain sends nothing — `sent` rows are terminal.
     const again: string[] = [];
-    await drainOutbox(paths, async (bot) => { again.push(bot); return 1; });
+    await drainOutbox(paths, async (bot, _chatId, _text, onNetworkStart) => {
+      onNetworkStart();
+      again.push(bot);
+      return { status: 'sent', messageId: 1 };
+    });
     expect(again).toEqual([]);
 
     // --- revert loses nothing ---------------------------------------------

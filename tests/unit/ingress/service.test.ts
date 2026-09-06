@@ -153,9 +153,10 @@ describe('OS-07 multiplexed ingress', () => {
       in_reply_to: { bot: 'vera', update_id: 500 },
     });
     const sends: Array<[string, string, string]> = [];
-    await drainOutbox(paths, async (bot, chatId, text) => {
+    await drainOutbox(paths, async (bot, chatId, text, onNetworkStart) => {
+      onNetworkStart();
       sends.push([bot, chatId, text]);
-      return 77;
+      return { status: 'sent', messageId: 77 };
     });
     expect(sends).toEqual([['vera', '1001', 'Yes — Tuesday 9am, crew of three.']]);
     expect(listAll(paths)[0].status).toBe('sent');

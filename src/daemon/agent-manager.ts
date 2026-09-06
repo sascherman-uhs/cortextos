@@ -227,13 +227,19 @@ export class AgentManager {
     // and it goes out through the bot it was recorded against.
     const identityById = new Map(identities.map((i) => [i.id, i]));
     this.ingressDrain = setInterval(() => {
-      drainOutbox(paths, async (bot, chatId, text) => {
+      drainOutbox(paths, async (bot, chatId, text, onNetworkStart) => {
+        // These two checks are provably pre-effect: no request has gone out yet,
+        // so a throw here is safe to retry (drainOutbox treats it as such).
         const identity = identityById.get(bot);
         if (!identity) throw new Error(`No configured identity for bot ${bot} — refusing to reply through another bot.`);
         const token = loadToken(identity);
         if (!token) throw new Error(`Token for ${bot} (key ${identity.tokenEnvKey}) is unreadable.`);
+        onNetworkStart();
+        // Anything past this point (network error, timeout, malformed response)
+        // is unprovable — we don't know if Telegram received it — so a thrown
+        // error here is classified 'ambiguous', not retried.
         const res = await new TelegramAPI(token).sendMessage(chatId, text);
-        return res?.result?.message_id as number | undefined;
+        return { status: 'sent', messageId: res?.result?.message_id as number | undefined };
       }).catch((err) => console.error('[ingress] outbox drain error:', err));
     }, 5000);
     this.ingressDrain.unref?.();
