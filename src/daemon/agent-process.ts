@@ -480,7 +480,9 @@ export class AgentProcess {
   } | null {
     try {
       const resolution = resolveModelRouting(
-        { agent: this.name },
+        // `withObserved: false` — the spawn path pays a journal scan for an
+        // answer it never reads. Every other consumer wants desired-vs-running.
+        { agent: this.name, withObserved: false },
         {
           org: this.env.org,
           frameworkRoot: this.env.frameworkRoot || this.env.projectRoot,

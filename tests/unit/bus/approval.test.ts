@@ -122,8 +122,13 @@ describe('createApproval', () => {
     expect(Array.isArray(rows)).toBe(true);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toHaveLength(2);
-    expect(rows[0][0].callback_data).toBe(`appr_allow_${id}`);
-    expect(rows[0][1].callback_data).toBe(`appr_deny_${id}`);
+    // OS-02: the button no longer carries the approval id in the clear. It
+    // carries an opaque single-use reference to a binding that pins the
+    // approval's version, payload hash, bot, chat, decider and expiry.
+    expect(rows[0][0].callback_data).toMatch(/^apprb_[a-f0-9]{32}$/);
+    expect(rows[0][1].callback_data).toMatch(/^apprb_[a-f0-9]{32}$/);
+    expect(rows[0][0].callback_data).not.toBe(rows[0][1].callback_data);
+    expect(String(rows[0][0].callback_data)).not.toContain(id);
     // Button labels should clearly say Approve / Deny regardless of emoji.
     expect(String(rows[0][0].text)).toMatch(/Approve/);
     expect(String(rows[0][1].text)).toMatch(/Deny/);

@@ -34,11 +34,13 @@ import type {
   ModelFallbackClass,
   ModelObservationBinding,
   ModelObservedConfidence,
+  ModelObservedSummary,
   ModelOperationKind,
   ModelOperationReceipt,
   ModelOperationState,
   ModelPin,
   ModelRegistry,
+  ModelRemediation,
   ModelResolution,
   ModelResolveInput,
   ModelRestartResult,
@@ -82,6 +84,13 @@ export const LOCK_EXPIRY_MS = 10 * 60 * 1000;
 export const DRAIN_DEADLINE_MS = 5 * 60 * 1000;
 /** Contract §5: legacy pins imported by bootstrap expire after 30 days. */
 export const LEGACY_PIN_DAYS = 30;
+/**
+ * Attempt files read while filtering by consumer. Bounds the cost of asking
+ * "what is this one agent actually running" on a busy journal.
+ */
+export const ATTEMPT_SCAN_LIMIT = 500;
+/** How long a restart may wait for a fresh session before it counts as failed. */
+export const RESTART_CONFIRM_MS = 15 * 1000;
 
 export function resolveRegistryPaths(ctx: RegistryContext = {}): RegistryPaths {
   const org = ctx.org || process.env.CTX_ORG || DEFAULT_ORG;
@@ -397,6 +406,7 @@ export function resolve(
 
   const errors: ModelValidationError[] = [];
   const warnings: string[] = [];
+  let remediation: ModelRemediation | undefined;
 
   if (roleId && !role) {
     errors.push({ code: VALIDATION_CODES.ROLE_UNKNOWN, message: `No role "${roleId}" in registry` });
@@ -412,10 +422,19 @@ export function resolve(
     requested = { source: 'pin', entry_id: pin!.entry_id };
   } else {
     if (pin && pin.kind === 'proposed-invalid') {
-      errors.push({
-        code: VALIDATION_CODES.PIN_NOT_DISPATCHABLE,
-        message: `Agent has a proposed-invalid pin on "${pin.entry_id}" awaiting human remediation; inheriting role route instead`,
-      });
+      const message =
+        `Agent has a proposed-invalid pin on "${pin.entry_id}" awaiting human remediation; ` +
+        'inheriting role route instead';
+      errors.push({ code: VALIDATION_CODES.PIN_NOT_DISPATCHABLE, message });
+      // A non-dispatchable pin is a WORK ITEM, not a failed command: the UI
+      // should offer "decide this route", so hand it the pieces it needs.
+      remediation = {
+        kind: 'proposed-invalid-pin',
+        ...(input.agent ? { agent: input.agent } : {}),
+        entry_id: pin.entry_id,
+        ...(pin.task_id ? { task_id: pin.task_id } : {}),
+        detail: pin.reason || message,
+      };
     } else if (pin && isPinExpired(pin, at)) {
       warnings.push(`Pin on "${pin.entry_id}" expired at ${pin.expires_at}; inheriting role route`);
     }
@@ -486,6 +505,10 @@ export function resolve(
       : null,
     validation: { ok: !!selectedEntry && errors.length === 0, errors, warnings },
     ...(roleId ? { role: roleId } : {}),
+    // Filled in below, once legacy_effective is known.
+    expected_model_id: null,
+    observed: null,
+    ...(remediation ? { remediation } : {}),
   };
 
   if (input.agent) {
@@ -496,6 +519,18 @@ export function resolve(
         ...(cfg.runtime ? { runtime: cfg.runtime } : {}),
       };
     }
+  }
+
+  // Desired half of desired-vs-running: what a spawn from THIS resolution
+  // would actually dispatch (legacy config in shadow, resolved in enforced).
+  resolution.expected_model_id = expectedModelId(resolution);
+
+  // Running half: the newest thing we actually saw. Opt-out rather than
+  // opt-in — a consumer that forgets a flag should get the truth, not a
+  // silent "unconfirmed". The spawn path passes `withObserved: false`
+  // because it pays a directory scan for an answer it never reads.
+  if (input.withObserved !== false && consumer) {
+    resolution.observed = newestObservationFor(consumer, ctx);
   }
 
   return resolution;
@@ -662,20 +697,61 @@ export function updateAttemptObserved(
   return record;
 }
 
-export function listAttempts(ctx: RegistryContext = {}, limit = 50): ModelAttemptRecord[] {
+export interface ListAttemptsOptions {
+  /** Only attempts for this consumer (agent name or call-site id). */
+  consumer?: string;
+  /**
+   * How many FILES to read while filtering, so a narrow consumer filter on a
+   * large journal stays bounded. Ignored when no filter is set.
+   */
+  scanLimit?: number;
+}
+
+export function listAttempts(
+  ctx: RegistryContext = {},
+  limit = 50,
+  opts: ListAttemptsOptions = {},
+): ModelAttemptRecord[] {
   const paths = resolveRegistryPaths(ctx);
   if (!existsSync(paths.attemptsDir)) return [];
-  const files = readdirSync(paths.attemptsDir)
+  const names = readdirSync(paths.attemptsDir)
     .filter((f) => f.endsWith('.json'))
     .sort()
-    .reverse()
-    .slice(0, limit);
+    .reverse();
+  const scanCap = opts.consumer ? Math.max(limit, opts.scanLimit ?? ATTEMPT_SCAN_LIMIT) : limit;
   const out: ModelAttemptRecord[] = [];
-  for (const f of files) {
+  for (const f of names.slice(0, scanCap)) {
     const rec = readAttempt(join(paths.attemptsDir, f));
-    if (rec) out.push(rec);
+    if (!rec) continue;
+    if (opts.consumer && rec.consumer !== opts.consumer) continue;
+    out.push(rec);
+    if (out.length >= limit) break;
   }
   return out;
+}
+
+/**
+ * Newest attempt recorded for one consumer, or `null` when it has never run.
+ *
+ * This is the "running" half of desired-vs-running. Before it existed the UI
+ * could only ever say "unconfirmed", because a `resolve()` had no way to see
+ * the attempts sitting on disk that already said verified or mismatch.
+ */
+export function newestAttemptFor(consumer: string, ctx: RegistryContext = {}): ModelAttemptRecord | null {
+  return listAttempts(ctx, 1, { consumer })[0] ?? null;
+}
+
+export function newestObservationFor(consumer: string, ctx: RegistryContext = {}): ModelObservedSummary | null {
+  const rec = newestAttemptFor(consumer, ctx);
+  if (!rec) return null;
+  return {
+    model_id: rec.observed.model_id,
+    source: rec.observed.source,
+    binding: rec.observed.binding ?? null,
+    confidence: rec.observed.confidence,
+    at: rec.observed.at,
+    attempt_id: rec.attempt_id,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1115,8 @@ export interface ApplyOptions extends RegistryContext {
   /** Skip restarts entirely (preview / `--no-restart`). */
   skipRestart?: boolean;
   drainDeadlineMs?: number;
+  /** How long the default restarter waits for a fresh session (tests use ms). */
+  restartConfirmMs?: number;
 }
 
 /** Agents whose routing changes as a result of this operation. */
@@ -1062,7 +1140,74 @@ export function affectedAgents(reg: ModelRegistry, op: ModelOperation, at: Date)
   }
 }
 
-function defaultRestarter(ctx: RegistryContext): Restarter {
+/**
+ * A start response the daemon collapses against its own registry.
+ *
+ * `inspectAgentOp('start')` answers DEDUPED whenever the agent is still in the
+ * in-memory registry when the start lands — which is exactly what happens on a
+ * stop+start pair whose stop has not finished unwinding. The agent DOES come
+ * back (agent-manager queues it in `pendingRestarts`), so treating this string
+ * as a failure marked healthy switches `blocked`. It is a "look again", not a
+ * verdict.
+ */
+export function isDedupedStart(response: { success: boolean; error?: string; code?: string }): boolean {
+  if (response.success) return false;
+  if (response.code === 'DEDUPED') return true;
+  const e = (response.error || '').toLowerCase();
+  return e.includes('deduped') || e.includes('already in registry') || e.includes('already running');
+}
+
+/** Identity of one agent run — what has to CHANGE for a restart to be real. */
+export interface AgentSessionSnapshot {
+  pid: number | null;
+  sessionStart: string | null;
+  status: string | null;
+}
+
+const NO_SESSION: AgentSessionSnapshot = { pid: null, sessionStart: null, status: null };
+
+/** True when `after` is a different run of the agent than `before`. */
+export function isFreshSession(before: AgentSessionSnapshot, after: AgentSessionSnapshot): boolean {
+  if (after.pid === null && after.sessionStart === null) return false;
+  if (after.pid !== null && before.pid !== null && after.pid !== before.pid) return true;
+  if (after.pid !== null && before.pid === null) return true;
+  if (after.sessionStart && after.sessionStart !== before.sessionStart) return true;
+  return false;
+}
+
+/**
+ * Agents a revert actually moves, read off the prior-state snapshot.
+ *
+ * `affectedAgents()` cannot answer this: at validation time a revert is just an
+ * operation id, and the snapshot it restores only becomes known once the
+ * target's `desired_written` event has been read.
+ */
+export function revertAffectedAgents(reg: ModelRegistry, from: unknown, at: Date): string[] {
+  if (!from || typeof from !== 'object') return [];
+  const f = from as Record<string, unknown>;
+  const out = new Set<string>();
+  if (typeof f.target_agent === 'string') out.add(f.target_agent);
+  if (Array.isArray(f.cleared_pins)) {
+    for (const c of f.cleared_pins as { agent?: unknown }[]) {
+      if (c && typeof c.agent === 'string') out.add(c.agent);
+    }
+  }
+  if (typeof f.role === 'string') {
+    for (const [name, a] of Object.entries(reg.agents)) {
+      if (a.role === f.role && !isPinDispatchable(a.pin, at)) out.add(name);
+    }
+  }
+  if (typeof f.consumer === 'string' && reg.agents[f.consumer]) out.add(f.consumer);
+  if (typeof f.org_default === 'string') for (const name of Object.keys(reg.agents)) out.add(name);
+  return [...out].filter((name) => !!reg.agents[name]);
+}
+
+/**
+ * The stop+start restarter `applyOperation` uses when the caller injects none.
+ * Exported so the dedupe/confirm wiring can be tested against a fake IPC —
+ * the pure helpers above do not cover the sequencing, which is where the bug was.
+ */
+export function createDaemonRestarter(ctx: RegistryContext, confirmMs = RESTART_CONFIRM_MS): Restarter {
   return async (agent: string): Promise<ModelRestartResult> => {
     try {
       // Imported lazily so the registry service stays usable in tests and in
@@ -1072,11 +1217,91 @@ function defaultRestarter(ctx: RegistryContext): Restarter {
       if (!(await ipc.isDaemonRunning())) {
         return { agent, ok: false, detail: 'daemon not running; agent will pick up the new route on next start' };
       }
+
+      const snapshot = async (): Promise<AgentSessionSnapshot> => {
+        try {
+          const res = await ipc.send({ type: 'status', source: 'cortextos model switch' } as never);
+          if (!res.success || !Array.isArray(res.data)) return NO_SESSION;
+          const row = (res.data as { name?: string; pid?: number; sessionStart?: string; status?: string }[])
+            .find((r) => r?.name === agent);
+          if (!row) return NO_SESSION;
+          return {
+            pid: typeof row.pid === 'number' ? row.pid : null,
+            sessionStart: row.sessionStart ?? null,
+            status: row.status ?? null,
+          };
+        } catch {
+          return NO_SESSION;
+        }
+      };
+
+      const before = await snapshot();
+
       const stop = await ipc.send({ type: 'stop-agent', agent, source: 'cortextos model switch' } as never);
-      if (!stop.success) return { agent, ok: false, detail: `stop failed: ${stop.error}` };
+      if (!stop.success) {
+        return { agent, ok: false, detail: `stop failed: ${stop.error}`, pid_before: before.pid };
+      }
+
       const start = await ipc.send({ type: 'start-agent', agent, source: 'cortextos model switch' } as never);
-      if (!start.success) return { agent, ok: false, detail: `start failed: ${start.error}` };
-      return { agent, ok: true, detail: 'restarted' };
+      const deduped = isDedupedStart(start);
+      if (!start.success && !deduped) {
+        return { agent, ok: false, detail: `start failed: ${start.error}`, pid_before: before.pid };
+      }
+
+      // Read the agent back rather than trusting the ack. A successful start is
+      // still asynchronous, and a deduped one is only a claim about the
+      // daemon's registry — neither tells us a process exists.
+      const deadline = Date.now() + confirmMs;
+      let after = await snapshot();
+      while (!isFreshSession(before, after) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        after = await snapshot();
+      }
+      const fresh = isFreshSession(before, after);
+      const attempt = newestAttemptFor(agent, ctx);
+      const attemptIsNew =
+        !!attempt && (!before.sessionStart || Date.parse(attempt.at) >= Date.parse(before.sessionStart));
+
+      if (fresh || (deduped && attemptIsNew)) {
+        return {
+          agent,
+          ok: true,
+          detail: deduped
+            ? `restarted (start was deduped by the daemon registry; confirmed a fresh session${after.pid !== null ? ` pid ${after.pid}` : ''})`
+            : 'restarted',
+          pid_before: before.pid,
+          pid: after.pid,
+          session_start: after.sessionStart,
+          attempt_id: attempt?.attempt_id ?? null,
+          ...(deduped ? { deduped_but_restarted: true } : {}),
+        };
+      }
+
+      if (deduped) {
+        return {
+          agent,
+          ok: false,
+          detail:
+            `start failed: ${start.error} — and no fresh session appeared within ` +
+            `${Math.round(confirmMs / 1000)}s, so the agent is still on the old route`,
+          pid_before: before.pid,
+          pid: after.pid,
+          session_start: after.sessionStart,
+        };
+      }
+
+      // The start was acknowledged but nothing new showed up. Report what we
+      // saw instead of asserting a restart we cannot see.
+      return {
+        agent,
+        ok: false,
+        detail:
+          `start acknowledged but no fresh session appeared within ${Math.round(confirmMs / 1000)}s ` +
+          `(status ${after.status ?? 'unknown'})`,
+        pid_before: before.pid,
+        pid: after.pid,
+        session_start: after.sessionStart,
+      };
     } catch (err) {
       return { agent, ok: false, detail: `restart error: ${(err as Error).message}` };
     }
@@ -1111,6 +1336,8 @@ export async function applyOperation(op: ModelOperation, opts: ApplyOptions = {}
     registry_revision_after: before,
     state: 'requested',
     restart_results: [],
+    restart_required: false,
+    ...(op.kind === 'revert' ? { revert_of: op.operation_id } : {}),
     created_at: isoOf(ctx),
     applied_at: null,
     error: null,
@@ -1164,6 +1391,15 @@ export async function applyOperation(op: ModelOperation, opts: ApplyOptions = {}
   receipt.from = change.from;
   receipt.to = change.to;
 
+  if (op.kind === 'revert') {
+    // Only now is the restored snapshot known, so only now can we say who
+    // moved. Without this a reverted pin was written and nothing restarted.
+    const revertAffected = revertAffectedAgents(next, change.from, at);
+    receipt.affected_consumers = revertAffected;
+    affected.splice(0, affected.length, ...revertAffected);
+  }
+  receipt.restart_required = !opts.skipRestart && affected.length > 0;
+
   let written: ModelRegistry;
   try {
     written = saveRegistryCAS(next, before, ctx);
@@ -1181,7 +1417,14 @@ export async function applyOperation(op: ModelOperation, opts: ApplyOptions = {}
   if (opts.skipRestart || affected.length === 0) {
     receipt.state = 'applied';
     receipt.applied_at = isoOf(ctx);
-    emit('applied', { restart_results: receipt.restart_results, restarts_skipped: !!opts.skipRestart });
+    // `restart_required: false` is what lets a consumer say "no restart
+    // needed" rather than reading an empty restart_results as a silent
+    // failure to restart anything.
+    emit('applied', {
+      restart_results: receipt.restart_results,
+      restarts_skipped: !!opts.skipRestart,
+      restart_required: receipt.restart_required,
+    });
     return receipt;
   }
 
@@ -1198,7 +1441,7 @@ export async function applyOperation(op: ModelOperation, opts: ApplyOptions = {}
   receipt.state = 'draining';
   emit('draining', { agents: affected, lock_expires_at: lock.expires_at });
 
-  const restart = opts.restart ?? defaultRestarter(ctx);
+  const restart = opts.restart ?? createDaemonRestarter(ctx, opts.restartConfirmMs);
   const startedAt = Date.now();
   try {
     for (const agent of affected) {
@@ -1214,7 +1457,7 @@ export async function applyOperation(op: ModelOperation, opts: ApplyOptions = {}
       // Concurrency 1: never restart two agents at once.
       const result = await restart(agent);
       if (result.ok) {
-        const after = resolve({ agent }, ctx, written);
+        const after = resolve({ agent, withObserved: false }, ctx, written);
         result.observed_after = after.selected?.model_id ?? null;
       }
       receipt.restart_results.push(result);
@@ -1282,26 +1525,32 @@ function mutateRegistry(
 ): { from: unknown; to: unknown } {
   switch (op.kind) {
     case 'switch': {
-      const from = { role: op.role, tier: next.roles[op.role].tier };
-      next.roles[op.role] = { ...next.roles[op.role], tier: op.tier };
-      const cleared: string[] = [];
+      // `cleared_pins` carries the whole prior pin, not just the agent name.
+      // A name alone is not revertible — restoring it would mean guessing which
+      // entry the agent had been pinned to.
+      const cleared: { agent: string; pin: ModelPin }[] = [];
       if (op.clearPins) {
         for (const [name, assignment] of Object.entries(next.agents)) {
           if (assignment.role === op.role && assignment.pin) {
-            cleared.push(name);
+            cleared.push({ agent: name, pin: assignment.pin });
             assignment.pin = null;
           }
         }
       }
+      const from = { role: op.role, tier: next.roles[op.role].tier, cleared_pins: cleared };
+      next.roles[op.role] = { ...next.roles[op.role], tier: op.tier };
       // Explicit switches opt the affected consumers into validated routing
       // immediately (contract §5 "Explicit switch during shadow").
       for (const agent of receipt.affected_consumers) {
         if (!next.activation.consumers[agent]) next.activation.consumers[agent] = 'enforced';
       }
-      return { from, to: { role: op.role, tier: op.tier, cleared_pins: cleared } };
+      return {
+        from,
+        to: { role: op.role, tier: op.tier, cleared_pins: cleared.map((c) => c.agent) },
+      };
     }
     case 'pin': {
-      const from = next.agents[op.agent].pin;
+      const priorPin = next.agents[op.agent].pin;
       const pin: ModelPin = {
         entry_id: op.entry_id,
         kind: 'explicit',
@@ -1313,12 +1562,20 @@ function mutateRegistry(
       };
       next.agents[op.agent].pin = pin;
       if (!next.activation.consumers[op.agent]) next.activation.consumers[op.agent] = 'enforced';
-      return { from, to: pin };
+      // `target_agent` is what makes this revertible: a bare pin object does
+      // not say whose pin it was, which is why revert used to refuse.
+      return {
+        from: { target_agent: op.agent, pin: priorPin },
+        to: { target_agent: op.agent, pin },
+      };
     }
     case 'unpin': {
-      const from = next.agents[op.agent].pin;
+      const priorPin = next.agents[op.agent].pin;
       next.agents[op.agent].pin = null;
-      return { from, to: null };
+      return {
+        from: { target_agent: op.agent, pin: priorPin },
+        to: { target_agent: op.agent, pin: null },
+      };
     }
     case 'activation': {
       if (op.org) {
@@ -1340,6 +1597,12 @@ function mutateRegistry(
   }
 }
 
+/** Set one agent's pin back to a recorded prior value (null = no pin). */
+function restorePin(next: ModelRegistry, agent: string, pin: unknown): void {
+  if (!next.agents[agent]) throw new Error(`Agent "${agent}" is no longer in the registry`);
+  next.agents[agent].pin = (pin as ModelPin | null) ?? null;
+}
+
 /** Restore the `from` snapshot recorded on the operation being reverted. */
 function applyRevertDetail(
   next: ModelRegistry,
@@ -1353,6 +1616,17 @@ function applyRevertDetail(
   if (typeof f.role === 'string' && typeof f.tier === 'string') {
     if (!next.roles[f.role]) throw new Error(`Role "${f.role}" no longer exists`);
     next.roles[f.role] = { ...next.roles[f.role], tier: f.tier };
+    // A switch may have cleared pins to make the tier take effect. Reverting
+    // the tier without restoring them would leave the agents on a route
+    // nobody chose.
+    if (Array.isArray(f.cleared_pins)) {
+      for (const entry of f.cleared_pins as unknown[]) {
+        if (!entry || typeof entry !== 'object') continue;
+        const c = entry as { agent?: unknown; pin?: unknown };
+        if (typeof c.agent !== 'string') continue;
+        restorePin(next, c.agent, c.pin);
+      }
+    }
     return;
   }
   if (typeof f.org_default === 'string') {
@@ -1363,11 +1637,19 @@ function applyRevertDetail(
     next.activation.consumers[f.consumer] = f.mode as ModelActivationMode;
     return;
   }
+  // pin / unpin. `target_agent` is recorded by mutateRegistry precisely so
+  // this branch never has to guess whose pin it is.
+  if (typeof f.target_agent === 'string') {
+    restorePin(next, f.target_agent, f.pin ?? null);
+    return;
+  }
   if (typeof f.entry_id === 'string') {
-    // Reverting to a previous pin. Find the agent it belonged to by entry match
-    // is ambiguous, so pins carry their agent in the receipt `to`; the CLI passes
-    // `--agent` for that case. Guard rather than guess.
-    throw new Error('Reverting a pin requires `cortextos model pin/unpin --agent`; refusing to guess the target');
+    // A receipt written before `target_agent` existed: the pin object alone
+    // does not say whose pin it was, and matching by entry id is ambiguous.
+    throw new Error(
+      'This pin operation predates target_agent recording; revert it explicitly with ' +
+      '`cortextos model pin/unpin --agent <name>`',
+    );
   }
   void at; void actor; void reason;
   throw new Error('Unrecognized prior state; refusing to revert blindly');
@@ -1474,7 +1756,7 @@ export function migrateBootstrap(opts: BootstrapOptions = {}): BootstrapResult {
     })
       .map((e) => e.message)
       .join('; ');
-    reg.agents[agent].pin = {
+    const invalidPin: ModelPin = {
       entry_id: entryId,
       kind: 'proposed-invalid',
       reason: `Legacy pair is invalid and cannot dispatch: ${why}`,
@@ -1482,6 +1764,7 @@ export function migrateBootstrap(opts: BootstrapOptions = {}): BootstrapResult {
       created_at: at.toISOString(),
       expires_at: expiresAt,
     };
+    reg.agents[agent].pin = invalidPin;
     const item = {
       agent,
       entry_id: entryId,
@@ -1501,7 +1784,13 @@ export function migrateBootstrap(opts: BootstrapOptions = {}): BootstrapResult {
           `or clear the pin and let the role tier apply:\n` +
           `  cortextos model unpin --agent ${agent} --reason "..."`,
       );
-      if (taskId) item.task_id = taskId;
+      if (taskId) {
+        item.task_id = taskId;
+        // Carry the task on the pin too, so `resolve()` can hand the UI a
+        // remediation item pointing at the open decision rather than a bare
+        // error code the operator has to go hunt for.
+        invalidPin.task_id = taskId;
+      }
     }
     result.proposed_invalid.push(item);
   }

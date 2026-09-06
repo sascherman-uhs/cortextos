@@ -891,6 +891,12 @@ export interface ModelPin {
   created_at: string;
   expires_at: string | null;
   fallback?: string[];
+  /**
+   * Human task raised for a `proposed-invalid` pin. Carried here so `resolve()`
+   * can hand the UI a remediation item instead of only an error code — a
+   * non-dispatchable pin is a work item, not a failed command.
+   */
+  task_id?: string;
 }
 
 export interface ModelRoleAssignment {
@@ -945,6 +951,13 @@ export interface ModelResolveInput {
   callsite?: string;
   role?: string;
   override?: ModelResolveOverride;
+  /**
+   * Attach the newest attempt record for this consumer as `observed`.
+   * Defaults to true. The spawn path passes `false` because it costs a
+   * directory scan it does not need — everything else (CLI, dashboard) wants
+   * desired-vs-running, so the honest answer is the default.
+   */
+  withObserved?: boolean;
 }
 
 export interface ModelSelection {
@@ -972,6 +985,45 @@ export interface ModelResolution {
   legacy_effective?: { model_id?: string; runtime?: string };
   /** Resolved role id, when one could be determined. */
   role?: string;
+  /**
+   * The model a spawn from this resolution would ACTUALLY dispatch: the legacy
+   * config model in shadow, the resolved model in enforced. This — not
+   * `selected.model_id` — is the "desired" half of desired-vs-running.
+   */
+  expected_model_id: string | null;
+  /**
+   * Newest runtime observation for this consumer, read from the attempt
+   * journal. `null` means no attempt has been recorded yet (genuinely
+   * unknown), which is different from an attempt that came back unconfirmed.
+   */
+  observed: ModelObservedSummary | null;
+  /**
+   * A validation failure a human can act on, surfaced as a work item rather
+   * than only an error code. Present when the consumer carries a
+   * `proposed-invalid` pin awaiting a routing decision.
+   */
+  remediation?: ModelRemediation;
+}
+
+export interface ModelObservedSummary {
+  model_id: string | null;
+  source: string | null;
+  binding: ModelObservationBinding | null;
+  confidence: ModelObservedConfidence;
+  at: string | null;
+  attempt_id: string;
+}
+
+export interface ModelRemediation {
+  kind: 'proposed-invalid-pin';
+  /** Consumer the pin sits on. */
+  agent?: string;
+  /** Entry the invalid pin names. */
+  entry_id?: string;
+  /** Human task raised when the pin was created, when one exists. */
+  task_id?: string;
+  /** Why it cannot dispatch, and what a human should decide. */
+  detail: string;
 }
 
 export type ModelOperationKind = 'switch' | 'pin' | 'unpin' | 'revert' | 'activation';
@@ -990,6 +1042,20 @@ export interface ModelRestartResult {
   ok: boolean;
   detail: string;
   observed_after?: string | null;
+  /** PID the agent was running under BEFORE the restart, when known. */
+  pid_before?: number | null;
+  /** PID read back AFTER the restart — proof a fresh process exists. */
+  pid?: number | null;
+  /** `sessionStart` read back after the restart. */
+  session_start?: string | null;
+  /** Newest attempt id recorded for this agent after the restart, if any. */
+  attempt_id?: string | null;
+  /**
+   * True when the daemon answered the start with DEDUPED / "already in
+   * registry" and a fresh session was nevertheless confirmed within the drain
+   * window. The restart happened; the response was just the wrong shape.
+   */
+  deduped_but_restarted?: boolean;
 }
 
 export interface ModelOperationReceipt {
@@ -1004,6 +1070,15 @@ export interface ModelOperationReceipt {
   registry_revision_after: number;
   state: ModelOperationState;
   restart_results: ModelRestartResult[];
+  /**
+   * Whether this operation needed any agent restarted at all. `false` with
+   * state `applied` is the "no restart needed" case — an empty
+   * `restart_results` then means nothing was owed, not that something failed
+   * to run.
+   */
+  restart_required: boolean;
+  /** Operation id this receipt reverts, for `kind: 'revert'`. */
+  revert_of?: string;
   created_at: string;
   applied_at: string | null;
   error: string | null;

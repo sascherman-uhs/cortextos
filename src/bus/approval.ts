@@ -8,6 +8,14 @@ import { validateApprovalCategory } from '../utils/validate.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { sendMessage } from './message.js';
 import { postActivity } from './system.js';
+import {
+  createBinding,
+  appendApprovalEvent,
+  revokeBindingsFor,
+  approvalVersion,
+  payloadHash,
+  botIdentityFor,
+} from './approval-binding.js';
 
 /**
  * Build the inline keyboard posted to the activity channel alongside a
@@ -15,11 +23,11 @@ import { postActivity } from './system.js';
  * keyed on the approval id so fast-checker's activity-channel callback
  * handler can route them to updateApproval.
  */
-function buildApprovalKeyboard(approvalId: string): object {
+function buildApprovalKeyboard(allowRef: string, denyRef: string): object {
   return {
     inline_keyboard: [[
-      { text: '✅ Approve', callback_data: `appr_allow_${approvalId}` },
-      { text: '❌ Deny', callback_data: `appr_deny_${approvalId}` },
+      { text: '✅ Approve', callback_data: `apprb_${allowRef}` },
+      { text: '❌ Deny', callback_data: `apprb_${denyRef}` },
     ]],
   };
 }
@@ -54,13 +62,12 @@ function buildApprovalKeyboard(approvalId: string): object {
 function postApprovalToActivityChannel(
   paths: BusPaths,
   org: string,
-  approvalId: string,
-  title: string,
-  category: ApprovalCategory,
-  agentName: string,
-  context: string | undefined,
+  approval: Approval,
   frameworkRoot: string | undefined,
 ): Promise<void> {
+  const approvalId = approval.id;
+  const { title, category, requesting_agent: agentName } = approval;
+  const context = approval.description || undefined;
   const root = frameworkRoot ?? process.env.CTX_FRAMEWORK_ROOT;
   if (!root) {
     console.warn(
@@ -71,6 +78,20 @@ function postApprovalToActivityChannel(
   }
 
   const orgDir = join(root, 'orgs', org);
+
+  // Bind the buttons to THIS approval version, payload, bot and chat before
+  // posting. The old keyboard carried the bare approval id, so a button was
+  // valid forever, for anyone it was forwarded to, against whatever the
+  // approval later said.
+  const env = (() => {
+    try { return parseEnvFile(join(orgDir, 'activity-channel.env')); } catch { return {} as Record<string, string>; }
+  })();
+  const chatId = env.ACTIVITY_CHAT_ID ?? '';
+  const botIdentity = botIdentityFor(env.ACTIVITY_BOT_TOKEN);
+  const allowedDecider = env.ACTIVITY_ALLOWED_USER_ID ?? env.ACTIVITY_CHAT_ID ?? '';
+  const allow = createBinding(paths, approval, 'allow', { botIdentity, chatId, allowedDecider });
+  const deny = createBinding(paths, approval, 'deny', { botIdentity, chatId, allowedDecider });
+
   const lines = [
     `🔔 Approval request: ${title}`,
     `Category: ${category}`,
@@ -82,7 +103,7 @@ function postApprovalToActivityChannel(
   lines.push('', `id: ${approvalId}`);
   const message = lines.join('\n');
 
-  return postActivity(orgDir, paths.ctxRoot, org, message, buildApprovalKeyboard(approvalId))
+  return postActivity(orgDir, paths.ctxRoot, org, message, buildApprovalKeyboard(allow.ref, deny.ref))
     .then((posted) => {
       if (!posted) {
         // postActivity returns false when activity-channel.env is missing
@@ -206,9 +227,23 @@ export async function createApproval(
     resolved_by: null,
   };
 
+  // Additive: a version a binding can be checked against, and the hash of the
+  // request as posted. Editing the request bumps one or both, which is what
+  // invalidates a button already sitting in somebody's chat.
+  Object.assign(approval as unknown as Record<string, unknown>, {
+    version: 1,
+    payload_hash: payloadHash(approval),
+  });
+
   const pendingDir = join(paths.approvalDir, 'pending');
   ensureDir(pendingDir);
   atomicWriteSync(join(pendingDir, `${approvalId}.json`), JSON.stringify(approval));
+  appendApprovalEvent(paths, {
+    approval_id: approvalId,
+    event: 'created',
+    actor: agentName,
+    payload: { title, category, version: 1 },
+  });
 
   // Fan-out to the activity channel so the operator can approve/deny from
   // Telegram without opening the dashboard. AWAITED so short-lived CLI callers do
@@ -217,7 +252,7 @@ export async function createApproval(
   // unreachable must not block approval creation. Callbacks route back
   // via the orchestrator's activity-channel poller (see
   // daemon/agent-manager.ts).
-  await postApprovalToActivityChannel(paths, org, approvalId, title, category, agentName, context, frameworkRoot);
+  await postApprovalToActivityChannel(paths, org, approval, frameworkRoot);
 
   // Best-effort ping to the requesting agent's own Telegram bot (the
   // operator's 1:1 conversation with the agent). Closes the gap where
@@ -237,6 +272,7 @@ export function updateApproval(
   approvalId: string,
   status: ApprovalStatus,
   note?: string,
+  options: { route?: string; decider?: string; bindingRef?: string } = {},
 ): void {
   const pendingDir = join(paths.approvalDir, 'pending');
   const filePath = join(pendingDir, `${approvalId}.json`);
@@ -244,6 +280,7 @@ export function updateApproval(
   try {
     const content = readFileSync(filePath, 'utf-8');
     const approval: Approval = JSON.parse(content);
+    const decidedVersion = approvalVersion(approval);
     approval.status = status;
     approval.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     approval.resolved_at = approval.updated_at;
@@ -257,6 +294,24 @@ export function updateApproval(
     // Remove from pending
     const { unlinkSync } = require('fs');
     unlinkSync(filePath);
+
+    // Append the decision, then retire every outstanding button for this
+    // approval whatever route it was posted on. Without the revoke, a decision
+    // made on the dashboard would leave a live Telegram button that could
+    // decide the same request a second time.
+    appendApprovalEvent(paths, {
+      approval_id: approvalId,
+      event: `decision:${status}`,
+      actor: options.decider ?? note ?? 'unknown',
+      route: options.route ?? 'unspecified',
+      payload: {
+        version: decidedVersion,
+        payload_hash: payloadHash(approval),
+        binding_ref: options.bindingRef ?? null,
+        note: note ?? null,
+      },
+    });
+    revokeBindingsFor(paths, approvalId, `decided:${status}`);
 
     // Notify requesting agent via inbox
     if (approval.requesting_agent) {

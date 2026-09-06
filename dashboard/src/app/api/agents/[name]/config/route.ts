@@ -17,6 +17,7 @@ import { spawnSync } from 'child_process';
 import { buildAgentConfigDTO, WRITABLE_CONFIG_FIELDS } from '@/lib/agent-config-dto';
 import {
   applyRoutingOperation,
+  isReceipt,
   isRoutingError,
   resolveAgentRouting,
   type RoutingOperation,
@@ -211,8 +212,15 @@ export async function PATCH(
     if ('error' in op) return scrubbedJson(op, sensitive, { status: 400 });
     try {
       const receipt = await applyRoutingOperation(op);
-      if (isRoutingError(receipt)) return scrubbedJson(receipt, sensitive, { status: 503 });
-      return scrubbedJson({ success: true, name, receipt }, sensitive);
+      // A receipt is returned as a receipt even when it reports a blocked or
+      // failed operation — the Fleet page renders its state and reason. Only a
+      // bare routing error (service unreachable) is a 503.
+      if (!isReceipt(receipt)) {
+        if (isRoutingError(receipt)) return scrubbedJson(receipt, sensitive, { status: 503 });
+        return scrubbedJson({ error: 'routing service returned no receipt' }, sensitive, { status: 503 });
+      }
+      const succeeded = receipt.state !== 'blocked' && receipt.state !== 'failed';
+      return scrubbedJson({ success: succeeded, name, receipt }, sensitive);
     } catch (e) {
       return scrubbedJson(
         { error: e instanceof Error ? e.message : 'routing operation failed' },

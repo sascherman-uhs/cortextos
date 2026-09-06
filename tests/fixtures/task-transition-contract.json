@@ -1,0 +1,123 @@
+{
+  "contract_version": 1,
+  "description": "OS-02 canonical work-contract transition rules. Byte-identical in the uhsJARVIS repo (tests/fixtures/) and the CortexOS repo (tests/fixtures/). The Python half (scripts/agent-os/task_contract.py) and the TypeScript half (src/bus/task-contract.ts + dashboard/src/lib/task-transition.ts) both load it, so the writer that mutates a store and the reader that renders it cannot disagree about what a legal transition is. Complements task-status-contract.json, which owns identity + lane projection; this file owns which transitions are permitted and what proof each one costs.",
+
+  "canonical_states": ["backlog", "ready", "doing", "verify", "waiting", "done", "cancelled", "failed_terminal"],
+  "terminal_states": ["done", "cancelled", "failed_terminal"],
+  "waiting_subtypes": ["human", "retry", "dependency", "external"],
+  "run_statuses": ["started", "succeeded", "failed", "abandoned"],
+
+  "allowed_transitions": {
+    "backlog": ["ready", "waiting", "cancelled", "failed_terminal"],
+    "ready": ["doing", "backlog", "waiting", "cancelled"],
+    "doing": ["verify", "waiting", "cancelled"],
+    "verify": ["done", "doing", "waiting", "cancelled"],
+    "waiting": ["ready", "doing", "verify", "backlog", "cancelled", "failed_terminal"],
+    "done": [],
+    "cancelled": [],
+    "failed_terminal": ["waiting"]
+  },
+
+  "requirements": {
+    "ready": {
+      "fields": ["outcome", "agent_role_id_or_human_accountable_id", "acceptance_criteria"],
+      "dependencies_satisfied": true,
+      "reason": "Plan section 4: Ready requires owner, outcome, sufficient input context, acceptance criteria, and satisfied dependencies/authority."
+    },
+    "verify": {
+      "evidence_keys_any": ["artifact", "artifacts", "result", "pr", "release", "receipt", "run_id"],
+      "reason": "Plan section 4: Doing to Verify requires an artifact/result. A model saying done, an exit code, or HTTP 200 alone is insufficient."
+    },
+    "done": {
+      "acceptance_checks_all_pass": true,
+      "verifier_required": true,
+      "verifier_distinct_from_author_for": ["code", "external", "high_impact"],
+      "machine_validator_allowed_for": ["low_impact_deterministic"],
+      "reason": "Plan section 4: Verify to Done requires the stated acceptance checks and independent verification for code, external writes, and high-impact results. Low-impact deterministic jobs may use a machine validator."
+    },
+    "failed_terminal": {
+      "forbidden_for_types": ["obligation"],
+      "fields": ["reason", "disposition"],
+      "reason": "Plan section 3: failed_terminal is allowed only for non-obligation work with reason and disposition. Obligations cannot be silently cancelled or dead-lettered."
+    },
+    "cancelled": {
+      "fields": ["reason", "actor"],
+      "reason": "Plan section 3: Cancellation is a distinct terminal state with reason and actor."
+    }
+  },
+
+  "impact_classes": ["low_impact_deterministic", "code", "external", "high_impact"],
+  "work_types": ["work", "obligation", "improvement"],
+
+  "native_to_canonical": {
+    "cortexos_tasks": {
+      "pending": "backlog",
+      "in_progress": "doing",
+      "blocked": "waiting",
+      "completed": "done",
+      "cancelled": "cancelled"
+    },
+    "jarvis_tasks": {
+      "pending": "backlog",
+      "in_progress": "doing",
+      "blocked": "waiting",
+      "failed": "waiting",
+      "completed": "done",
+      "cancelled": "cancelled"
+    },
+    "jarvis_skill_runs": {
+      "in_progress": "doing",
+      "blocked": "waiting",
+      "complete": "done",
+      "abandoned": "cancelled"
+    }
+  },
+
+  "canonical_to_native": {
+    "cortexos_tasks": {
+      "backlog": "pending",
+      "ready": "pending",
+      "doing": "in_progress",
+      "verify": "in_progress",
+      "waiting": "blocked",
+      "done": "completed",
+      "cancelled": "cancelled",
+      "failed_terminal": "blocked"
+    },
+    "jarvis_tasks": {
+      "backlog": "pending",
+      "ready": "pending",
+      "doing": "in_progress",
+      "verify": "in_progress",
+      "waiting": "blocked",
+      "done": "completed",
+      "cancelled": "cancelled",
+      "failed_terminal": "failed"
+    }
+  },
+
+  "legacy_completion_label": "historical, evidence not recorded",
+
+  "cases": [
+    {"name": "ready needs an owner", "from": "backlog", "to": "ready", "item": {"outcome": "x", "acceptance_criteria": ["c"]}, "ok": false, "error": "missing_owner"},
+    {"name": "ready needs an outcome", "from": "backlog", "to": "ready", "item": {"agent_role_id": "backend", "acceptance_criteria": ["c"]}, "ok": false, "error": "missing_outcome"},
+    {"name": "ready needs acceptance criteria", "from": "backlog", "to": "ready", "item": {"outcome": "x", "agent_role_id": "backend"}, "ok": false, "error": "missing_acceptance_criteria"},
+    {"name": "ready with unsatisfied dependency is refused", "from": "backlog", "to": "ready", "item": {"outcome": "x", "agent_role_id": "backend", "acceptance_criteria": ["c"], "dependency_ids": ["t1"]}, "context": {"unsatisfied_dependencies": ["t1"]}, "ok": false, "error": "unsatisfied_dependencies"},
+    {"name": "ready when everything is present", "from": "backlog", "to": "ready", "item": {"outcome": "x", "agent_role_id": "backend", "acceptance_criteria": ["c"]}, "ok": true},
+    {"name": "human-only decision is ready with a decider and no agent role", "from": "backlog", "to": "ready", "item": {"outcome": "decide", "human_accountable_id": "scott", "acceptance_criteria": ["decided"]}, "ok": true},
+    {"name": "doing to verify without an artifact is refused", "from": "doing", "to": "verify", "item": {"outcome": "x"}, "evidence": {}, "ok": false, "error": "missing_evidence"},
+    {"name": "doing to verify with an artifact", "from": "doing", "to": "verify", "item": {"outcome": "x"}, "evidence": {"artifact": "output/report.html"}, "ok": true},
+    {"name": "agent claims success without proof stays in verify", "from": "verify", "to": "done", "item": {"outcome": "x", "impact_class": "code", "author": "agent-a", "acceptance_criteria": ["tests pass"]}, "evidence": {"artifact": "pr/1"}, "ok": false, "error": "acceptance_checks_incomplete"},
+    {"name": "code work cannot be verified by its own author", "from": "verify", "to": "done", "item": {"outcome": "x", "impact_class": "code", "author": "agent-a", "acceptance_criteria": ["tests pass"]}, "evidence": {"artifact": "pr/1", "acceptance_results": [{"check": "tests pass", "passed": true}], "verifier": "agent-a"}, "ok": false, "error": "verifier_is_author"},
+    {"name": "code work verified by a different agent reaches done", "from": "verify", "to": "done", "item": {"outcome": "x", "impact_class": "code", "author": "agent-a", "acceptance_criteria": ["tests pass"]}, "evidence": {"artifact": "pr/1", "acceptance_results": [{"check": "tests pass", "passed": true}], "verifier": "agent-b"}, "ok": true},
+    {"name": "a failing acceptance check keeps the item in verify", "from": "verify", "to": "done", "item": {"outcome": "x", "impact_class": "code", "author": "agent-a", "acceptance_criteria": ["tests pass"]}, "evidence": {"artifact": "pr/1", "acceptance_results": [{"check": "tests pass", "passed": false}], "verifier": "agent-b"}, "ok": false, "error": "acceptance_check_failed"},
+    {"name": "low-impact deterministic work may self-verify with a machine validator", "from": "verify", "to": "done", "item": {"outcome": "x", "impact_class": "low_impact_deterministic", "author": "agent-a", "acceptance_criteria": ["file exists"]}, "evidence": {"artifact": "f", "acceptance_results": [{"check": "file exists", "passed": true}], "verifier": "agent-a", "verification_method": "machine_validator"}, "ok": true},
+    {"name": "an obligation can never be failed_terminal", "from": "waiting", "to": "failed_terminal", "item": {"outcome": "x", "type": "obligation"}, "evidence": {"reason": "gave up", "disposition": "dropped"}, "ok": false, "error": "obligation_cannot_fail_terminal"},
+    {"name": "non-obligation failed_terminal needs a reason and disposition", "from": "waiting", "to": "failed_terminal", "item": {"outcome": "x", "type": "work"}, "evidence": {"reason": "provider removed the API"}, "ok": false, "error": "missing_disposition"},
+    {"name": "non-obligation failed_terminal with both", "from": "waiting", "to": "failed_terminal", "item": {"outcome": "x", "type": "work"}, "evidence": {"reason": "provider removed the API", "disposition": "will not retry"}, "ok": true},
+    {"name": "cancellation needs a reason and an actor", "from": "doing", "to": "cancelled", "item": {"outcome": "x", "type": "work"}, "evidence": {"reason": "duplicate"}, "ok": false, "error": "missing_actor"},
+    {"name": "done is terminal", "from": "done", "to": "doing", "item": {"outcome": "x"}, "ok": false, "error": "illegal_transition"},
+    {"name": "backlog cannot jump straight to done", "from": "backlog", "to": "done", "item": {"outcome": "x"}, "ok": false, "error": "illegal_transition"},
+    {"name": "a same-state transition is a no-op, not an error", "from": "doing", "to": "doing", "item": {"outcome": "x"}, "ok": true, "noop": true}
+  ]
+}

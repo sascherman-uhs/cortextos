@@ -7,7 +7,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { normalizeSummary, resolveFromRegistry, isRoutingError, ROUTING_UNAVAILABLE } from '@/lib/model-routing';
+import {
+  normalizeSummary,
+  resolveFromRegistry,
+  isRoutingError,
+  interpretCliOutput,
+  isReceipt,
+  normalizeAttempts,
+  ROUTING_UNAVAILABLE,
+} from '@/lib/model-routing';
 
 const raw = {
   schema_version: 1,
@@ -86,5 +94,84 @@ describe('routing errors', () => {
     expect(isRoutingError(ROUTING_UNAVAILABLE)).toBe(true);
     expect(ROUTING_UNAVAILABLE.error).toBe('routing service unavailable');
     expect(isRoutingError({ revision: 1 })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 1 — a JSON document on stdout is the answer, whatever the exit code
+// ---------------------------------------------------------------------------
+
+describe('interpretCliOutput', () => {
+  const failedResolution = JSON.stringify({
+    registry_revision: 9,
+    validation: {
+      ok: false,
+      errors: [{ code: 'pin_not_dispatchable', message: 'Pin kimi-k2 is not dispatchable — awaiting human remediation' }],
+      warnings: [],
+    },
+  });
+
+  it('keeps the resolution when the CLI exits non-zero on a failed validation', () => {
+    const out = interpretCliOutput(failedResolution, '', 2) as { validation: { errors: { code: string }[] } };
+    expect(isRoutingError(out)).toBe(false);
+    expect(out.validation.errors[0].code).toBe('pin_not_dispatchable');
+  });
+
+  it('never turns an exit code into the displayed value', () => {
+    const out = interpretCliOutput(failedResolution, 'some stderr noise', 2);
+    expect(JSON.stringify(out)).not.toMatch(/exited 2/);
+  });
+
+  it('keeps a receipt that carries its own error field', () => {
+    const out = interpretCliOutput(
+      JSON.stringify({ operation_id: 'op-9', state: 'blocked', error: 'tier has no candidates' }),
+      '',
+      1,
+    );
+    expect(isReceipt(out)).toBe(true);
+    expect((out as { state: string }).state).toBe('blocked');
+  });
+
+  it('still treats a bare { error } envelope as a routing error', () => {
+    expect(isRoutingError(interpretCliOutput('{"error":"registry locked"}', '', 1))).toBe(true);
+  });
+
+  it('falls back to stderr only when there is no JSON at all', () => {
+    const out = interpretCliOutput('not json', 'command not found', 127) as { error: string };
+    expect(out.error).toBe('command not found');
+    const bare = interpretCliOutput('', '', 3) as { error: string };
+    expect(bare.error).toMatch(/exit 3/);
+  });
+});
+
+describe('normalizeAttempts', () => {
+  it('maps loose CLI shapes onto the display record', () => {
+    const rows = normalizeAttempts({
+      attempts: [
+        {
+          attempt_id: 'att-1',
+          at: '2026-09-05T10:00:00Z',
+          agent: 'vera',
+          requested_model_id: 'claude-sonnet-4-6',
+          resolved_model_id: 'claude-sonnet-4-6',
+          observed: { model_id: 'claude-haiku-4-5-20251001', confidence: 'mismatch', binding: 'sess-1' },
+        },
+        { id: 'att-2' },
+      ],
+    });
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      attempt_id: 'att-1',
+      requested: 'claude-sonnet-4-6',
+      observed: 'claude-haiku-4-5-20251001',
+      confidence: 'mismatch',
+      binding: 'sess-1',
+    });
+    expect(rows[1]).toMatchObject({ attempt_id: 'att-2', confidence: 'unknown', requested: null });
+  });
+
+  it('survives junk and a bare array', () => {
+    expect(normalizeAttempts(null)).toEqual([]);
+    expect(normalizeAttempts([{ id: 'x' }])).toHaveLength(1);
   });
 });

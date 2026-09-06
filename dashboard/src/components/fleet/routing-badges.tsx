@@ -13,6 +13,7 @@ import {
   describeDesiredVsRunning,
   describeEffectiveSource,
   evalStateLabel,
+  remediationItems,
   type ReceiptTone,
 } from './model-routing-view';
 import type { Resolution } from '@/lib/model-routing';
@@ -68,20 +69,31 @@ export function EvalStateBadge({ resolution }: { resolution: Resolution | null }
   );
 }
 
+/**
+ * Validation output rendered as remediation items: the operator-facing message
+ * leads, the machine code is a chip beside it. A failed validation is a thing
+ * to fix, not a shell exit status.
+ */
 export function ValidationErrors({ resolution }: { resolution: Resolution | null }) {
-  const errors = resolution?.validation?.errors ?? [];
-  const warnings = resolution?.validation?.warnings ?? [];
-  if (errors.length === 0 && warnings.length === 0) return null;
+  const items = remediationItems(resolution);
+  if (items.length === 0) return null;
   return (
-    <ul className="mt-1 space-y-0.5 text-xs">
-      {errors.map((e) => (
-        <li key={e.code} className="text-destructive">
-          {e.code}: {e.message}
-        </li>
-      ))}
-      {warnings.map((w) => (
-        <li key={w} className="text-muted-foreground">
-          {w}
+    <ul className="mt-1 space-y-1 text-xs">
+      {items.map((item) => (
+        <li
+          key={item.code}
+          className={
+            item.severity === 'error'
+              ? 'rounded-lg border border-destructive/40 bg-destructive/5 px-1.5 py-1'
+              : 'text-muted-foreground'
+          }
+        >
+          {item.severity === 'error' && (
+            <span className="mr-1 font-mono text-[10px] uppercase tracking-wide text-destructive">
+              {item.code}
+            </span>
+          )}
+          <span className={item.severity === 'error' ? 'text-destructive' : undefined}>{item.message}</span>
         </li>
       ))}
     </ul>
