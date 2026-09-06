@@ -423,13 +423,4 @@ export function currentBusinessDate(now: Date = new Date()): string {
  * How stale is this snapshot? Used for the freshness banner. Returns minutes since the
  * snapshot's cutoff, which is when the data in it was actually read.
  */
-export function snapshotAgeMinutes(
-  snapshot: BriefingSnapshot,
-  now: Date = new Date(),
-): number | null {
-  const ts = snapshot.snapshot_cutoff ?? snapshot.published_ui_at;
-  if (!ts) return null;
-  const then = new Date(ts).getTime();
-  if (Number.isNaN(then)) return null;
-  return Math.max(0, Math.round((now.getTime() - then) / 60000));
-}
+export { snapshotAgeMinutes } from './briefing-age';

@@ -26,7 +26,7 @@ import type {
   BriefingSectionItem,
   SectionId,
 } from '@/lib/uhs/briefing';
-import { snapshotAgeMinutes } from '@/lib/uhs/briefing';
+import { snapshotAgeMinutes } from '@/lib/uhs/briefing-age';
 import type { SourceHealthRow } from '@/lib/data/source-health';
 import type { Task } from '@/lib/types';
 
