@@ -9,7 +9,7 @@ import {
   type CallerRole,
   type LayerId,
   type RetrievalScope,
-} from '../../../../../../src/knowledge/contract';
+} from '../_contract/contract';
 
 export const dynamic = 'force-dynamic';
 

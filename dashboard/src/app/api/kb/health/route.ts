@@ -9,7 +9,7 @@ import {
   resolvePermittedCollections,
   resolveStore,
   type CallerRole,
-} from '../../../../../../src/knowledge/contract';
+} from '../_contract/contract';
 import {
   defaultLedgerPath,
   lagging,
@@ -17,7 +17,7 @@ import {
   retryInbox,
   unverified,
   isAutoRetryable,
-} from '../../../../../../src/knowledge/ingestion';
+} from '../_contract/ingestion';
 
 export const dynamic = 'force-dynamic';
 
