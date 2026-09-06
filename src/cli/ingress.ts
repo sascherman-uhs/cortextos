@@ -181,23 +181,50 @@ ingressCommand
   });
 
 ingressCommand
-  .command('disable <bot>')
-  .description('Fenced revert: hand this bot back to its agent-owned poller')
+  .command('disable [bot]')
+  .description('Fenced revert: hand a bot (or --all of them) back to its agent-owned poller')
+  .option('--all', 'Revert every bot currently owned by ingress — the rollback pre-step')
   .option('--actor <who>', 'Who authorised the change')
   .option('--reason <why>', 'Why')
   .option('--json', 'Machine-readable output')
-  .action(async (bot: string, cmdOpts: { actor?: string; reason?: string; json?: boolean }) => {
+  .action(async (bot: string | undefined, cmdOpts: { all?: boolean; actor?: string; reason?: string; json?: boolean }) => {
     const opts = { ...ingressCommand.opts(), ...cmdOpts } as CommonOpts & { actor?: string; reason?: string };
-    const res = await runTransfer(bot, 'agent', opts);
-    out(cmdOpts.json, res, () => {
-      if (res.ok) {
-        console.log(
-          `${bot}: handed back to the agent-owned poller with the same checkpoint. ` +
-          `Restart the agent to bring its listener back up: cortextos restart ${bot}`,
-        );
-      } else {
-        console.error(`${bot}: revert did NOT complete — ${res.error}`);
+    const { paths, frameworkRoot, org } = ctxFrom(opts);
+
+    // `--all` is what a rollback runs first: the code cannot be removed while a
+    // fence still says `ingress`, or the bot would end up with no listener.
+    const targets = cmdOpts.all
+      ? enumerateBotIdentities(frameworkRoot, org)
+          .map((i) => i.id)
+          .filter((id) => readFence(paths, id).owner === 'ingress')
+      : bot
+        ? [bot]
+        : [];
+    if (targets.length === 0) {
+      const message = cmdOpts.all
+        ? 'No bot is owned by ingress — nothing to revert.'
+        : 'Name a bot, or pass --all.';
+      out(cmdOpts.json, { ok: cmdOpts.all === true, reverted: [], message }, () => console.log(message));
+      if (!cmdOpts.all) process.exitCode = 1;
+      return;
+    }
+
+    const results: Array<{ bot: string; ok: boolean; error?: string }> = [];
+    for (const target of targets) {
+      const res = await runTransfer(target, 'agent', opts);
+      results.push({ bot: target, ...res });
+      if (!res.ok) process.exitCode = 1;
+    }
+    out(cmdOpts.json, { ok: results.every((r) => r.ok), reverted: results }, () => {
+      for (const res of results) {
+        if (res.ok) {
+          console.log(
+            `${res.bot}: handed back to the agent-owned poller with the same checkpoint. ` +
+            `Restart the agent to bring its listener back up: cortextos restart ${res.bot}`,
+          );
+        } else {
+          console.error(`${res.bot}: revert did NOT complete — ${res.error}`);
+        }
       }
     });
-    if (!res.ok) process.exitCode = 1;
   });

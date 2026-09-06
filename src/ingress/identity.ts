@@ -83,12 +83,18 @@ export function enumerateBotIdentities(frameworkRoot: string, org: string): BotI
       const envFile = join(agentDir, '.env');
       if (!existsSync(envFile)) continue;
       const env = parseEnvFile(envFile);
+      // An agent with no BOT_TOKEN key at all has no bot. An agent whose
+      // BOT_TOKEN is present but EMPTY is listed as an unusable identity
+      // rather than dropped: seven UHS agents are in exactly that state, and
+      // "enumerate every configured identity" means an operator should see
+      // them in `ingress list`, not have them vanish.
+      if (!('BOT_TOKEN' in env)) continue;
       const token = env.BOT_TOKEN;
-      if (!token) continue;
       const allowed = parseAllowedUsers(env.ALLOWED_USER);
-      const tokenOk = BOT_TOKEN_PATTERN.test(token);
+      const tokenOk = Boolean(token) && BOT_TOKEN_PATTERN.test(token);
       let reason: string | undefined;
-      if (!tokenOk) reason = 'BOT_TOKEN is missing or malformed';
+      if (!token) reason = 'BOT_TOKEN is present but empty — this agent has no bot of its own';
+      else if (!tokenOk) reason = 'BOT_TOKEN is malformed';
       else if (!allowed.ok) reason = 'ALLOWED_USER is missing or malformed — fail closed, same rule as the per-agent poller';
       out.push({
         id: name,

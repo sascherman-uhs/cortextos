@@ -88,6 +88,31 @@ function ingressFor(map: Record<string, IngressTransport>): MultiplexedIngress {
 }
 
 describe('OS-07 multiplexed ingress', () => {
+  it('lists an agent whose BOT_TOKEN is present but empty, marked unusable', () => {
+    // Seven UHS agents are in exactly this state. They must be visible in
+    // `ingress list` rather than silently missing — an identity nobody can
+    // account for is how a listener gets retired by accident.
+    const dir = join(framework, 'orgs', 'uhs', 'agents', 'jarvis-mls');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.env'), 'BOT_TOKEN=\nCHAT_ID=\n');
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ agent_name: 'jarvis-mls', enabled: true }));
+
+    const found = identities().find((i) => i.id === 'jarvis-mls');
+    expect(found).toBeDefined();
+    expect(found!.usable).toBe(false);
+    expect(found!.reason).toMatch(/present but empty/);
+    // An unusable identity is never polled.
+    expect(ingressFor({}).ownedBots().map((b) => b.id)).not.toContain('jarvis-mls');
+  });
+
+  it('skips an agent with no BOT_TOKEN key at all', () => {
+    const dir = join(framework, 'orgs', 'uhs', 'agents', 'no-bot');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.env'), 'CHAT_ID=1\n');
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ agent_name: 'no-bot', enabled: true }));
+    expect(identities().map((i) => i.id)).not.toContain('no-bot');
+  });
+
   it('enumerates every configured identity by token env key, never by value', () => {
     const list = identities();
     expect(list.map((i) => i.id).sort()).toEqual(['jarvis-telegram', 'vera', 'vivienne']);
