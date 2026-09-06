@@ -85,6 +85,12 @@ function actionableMentions(ctxRoot: string, taskId: string): string[] {
     /^processed[\\/]/,
     new RegExp(`^orgs[\\\\/][^\\\\/]+[\\\\/]analytics[\\\\/]`),
     new RegExp(`^orgs[\\\\/][^\\\\/]+[\\\\/]deleted-tasks\\.jsonl$`),
+    // fix8 — `superseded/<agent>/` joins this list for the same reason
+    // `processed/` is on it: nothing reads it back as an instruction. A message
+    // lands there only after it has been rewritten into a notice and moved out
+    // of every queue `checkInbox`, `recoverStaleInflight` and `ackInbox` scan.
+    // It keeps the id on purpose — it is the record that the pointer was sent.
+    /^superseded[\\/]/,
   ];
   return walk(ctxRoot).filter((rel) => {
     if (historical.some((re) => re.test(rel))) return false;
@@ -117,7 +123,18 @@ describe('fix7 — delete-task leaves no actionable remnant', () => {
     const src = join(ctxRoot, 'deliverable.txt');
     writeFileSync(src, 'evidence');
     saveOutput(paths, { sourcePath: src, taskId: id });
+    expect(findMessagesReferencing(paths, id).length).toBe(2);
+
     completeTask(paths, id, 'done');
+
+    // fix8 changed WHEN these pointers exist, not whether delete sweeps them:
+    // reaching a terminal state supersedes the two that were already sitting
+    // in inboxes. Pointers sent AFTER the work ended — the dashboard's own
+    // completion notice is exactly this shape — are still there for the delete
+    // to sweep, which is what the rest of this test is about.
+    expect(findMessagesReferencing(paths, id).length).toBe(0);
+    sendMessage(paths, 'dashboard', 'bob', 'normal', `Task status updated to completed: [${id}] ZZTEST-fix7-1`);
+    sendMessage(paths, 'dashboard', 'alice', 'normal', `Human task completed by user: [${id}] ZZTEST-fix7-1`);
 
     // Pre-condition: the trail really is spread across the stores.
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
@@ -151,13 +168,16 @@ describe('fix7 — delete-task leaves no actionable remnant', () => {
   it('sweeps an unacked INFLIGHT message too — it is recovered into the inbox after five minutes', () => {
     const id = createTask(paths, 'alice', ORG, 'ZZTEST-fix7-2 inflight', { assignee: 'bob' });
     const bobPaths = makePaths(ctxRoot, 'bob');
-    sendMessage(paths, 'dashboard', 'bob', 'normal', `Task status updated to in_progress: [${id}]`);
+    completeTask(paths, id, 'done');
+
+    // The notice the dashboard sends AFTER the transition, which fix8's
+    // terminal-state sweep has already run past.
+    sendMessage(paths, 'dashboard', 'bob', 'normal', `Task status updated to completed: [${id}]`);
 
     // Bob reads his inbox: the message moves to inflight and is never acked.
     expect(checkInbox(bobPaths).length).toBe(1);
     expect(readdirSync(bobPaths.inflight).filter((f: string) => f.endsWith('.json')).length).toBe(1);
 
-    completeTask(paths, id, 'done');
     const report = deleteTask(paths, id, { actor: 'scott', reason: 'ZZTEST-fix7-2 cleanup' });
 
     expect(report.messages.map((m) => m.queue)).toEqual(['inflight']);
