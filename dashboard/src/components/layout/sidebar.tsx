@@ -8,6 +8,7 @@ import {
   IconRobot,
   IconListCheck,
   IconLayoutList,
+  IconLayoutKanban,
   IconSunrise,
   IconShieldCheck,
   IconActivity,
@@ -41,7 +42,12 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   // Core
-  { label: 'Overview', href: '/', icon: IconLayoutDashboard, section: 'core' },
+  // === OS-03 (2026-09-05): Today is the default home; Overview keeps every
+  // card it had, at /overview. Board is the accessible Kanban. ===
+  { label: 'Today', href: '/', icon: IconSunrise, section: 'core' },
+  { label: 'Board', href: '/board', icon: IconLayoutKanban, section: 'core' },
+  // === END OS-03 ===
+  { label: 'Overview', href: '/overview', icon: IconLayoutDashboard, section: 'core' },
   { label: 'Queue', href: '/queue', icon: IconLayoutList, section: 'core' },
   // === OS-04 (2026-09-05): the morning briefing snapshot ===
   { label: 'Briefing', href: '/briefing', icon: IconSunrise, section: 'core' },
