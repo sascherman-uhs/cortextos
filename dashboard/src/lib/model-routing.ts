@@ -90,8 +90,21 @@ export interface Resolution {
   };
   validation: { ok: boolean; errors: { code: string; message: string }[]; warnings: string[] };
   legacy_effective?: { model_id?: string; runtime?: string };
-  /** Observed (actually ran) model — contract §4. Absent when unknown. */
-  observed?: { model_id: string | null; source: string; confidence: ObservedConfidence; at?: string } | null;
+  /**
+   * Observed (actually ran) model — contract §4. Absent when unknown.
+   * `binding` / `attempt_id` are emitted by newer CLI builds only: every
+   * consumer must degrade gracefully when they are missing.
+   */
+  observed?: {
+    model_id: string | null;
+    source: string;
+    binding?: string | null;
+    confidence?: ObservedConfidence;
+    at?: string;
+    attempt_id?: string | null;
+  } | null;
+  /** The model id the registry expects this agent to run. Newer CLI builds only. */
+  expected_model_id?: string | null;
   /** OS-08 placeholder until evals exist. */
   eval_state?: string;
 }
@@ -107,6 +120,10 @@ export interface Receipt {
   registry_revision_before?: number;
   registry_revision_after?: number;
   state: ReceiptState;
+  /** Newer CLI builds only — absent means "unknown", never "false". */
+  restart_required?: boolean;
+  /** Pins this operation removed (e.g. a switch with --clear-pins). */
+  cleared_pins?: string[];
   restart_results?: { agent: string; ok: boolean; message?: string }[];
   created_at: string;
   applied_at?: string | null;
@@ -136,16 +153,51 @@ export type RoutingOperation =
   | { action: 'unpin'; agent: string; reason: string; actor?: string }
   | { action: 'revert'; operation_id: string; reason: string; actor?: string };
 
+/**
+ * One dispatch attempt as shown in the per-agent "Attempts" expander.
+ * Every field is nullable: older CLI builds emit a subset.
+ */
+export interface RoutingAttempt {
+  attempt_id: string | null;
+  at: string | null;
+  agent: string | null;
+  requested: string | null;
+  resolved: string | null;
+  observed: string | null;
+  confidence: ObservedConfidence | 'unknown';
+  binding: string | null;
+}
+
 export interface ModelRoutingAdapter {
   kind: 'service' | 'cli' | 'file' | 'unavailable';
   resolveAgent(agent: string): Promise<Resolution | RoutingError>;
   summary(): Promise<RegistrySummary | RoutingError>;
   events(limit?: number): Promise<{ events: unknown[]; attempts: unknown[] } | RoutingError>;
   apply(op: RoutingOperation): Promise<Receipt | RoutingError>;
+  /**
+   * Optional — `cortextos model attempts --agent X --json` exists only on newer
+   * CLI builds. An adapter without it is not an error; the UI says so.
+   */
+  attempts?(agent: string, limit?: number): Promise<{ attempts: unknown[] } | RoutingError>;
 }
 
 export function isRoutingError(v: unknown): v is RoutingError {
   return !!v && typeof v === 'object' && typeof (v as RoutingError).error === 'string';
+}
+
+/**
+ * Structural check — a Receipt is identified by its own fields, never by the
+ * absence of an `error`. A BLOCKED operation is a receipt that carries an error
+ * message, and it has to reach the operator as a receipt (with its reason and
+ * its disabled Revert), not as a bare 503 string.
+ */
+export function isReceipt(v: unknown): v is Receipt {
+  return (
+    !!v &&
+    typeof v === 'object' &&
+    typeof (v as Receipt).operation_id === 'string' &&
+    typeof (v as Receipt).state === 'string'
+  );
 }
 
 export const ROUTING_UNAVAILABLE: RoutingError = { error: 'routing service unavailable' };
@@ -200,6 +252,7 @@ interface CoreService {
   loadRegistry?: () => Promise<unknown> | unknown;
   applyOperation?: (op: unknown) => Promise<Receipt> | Receipt;
   listEvents?: (limit?: number) => Promise<unknown[]> | unknown[];
+  listAttempts?: (agent: string, limit?: number) => Promise<unknown[]> | unknown[];
 }
 
 /** CLI first, then read-only file — used whenever the core module cannot load. */
@@ -242,6 +295,14 @@ function serviceAdapter(modulePath: string): ModelRoutingAdapter {
       if (!m?.applyOperation) return fallbackAdapter().apply(op);
       try { return await m.applyOperation(op); } catch (e) { return { error: errText(e) }; }
     },
+    async attempts(agent, limit) {
+      const m = await load();
+      if (!m?.listAttempts) {
+        const fb = fallbackAdapter();
+        return fb.attempts ? fb.attempts(agent, limit) : { attempts: [] };
+      }
+      try { return { attempts: await m.listAttempts(agent, limit) }; } catch (e) { return { error: errText(e) }; }
+    },
   };
 }
 
@@ -249,20 +310,79 @@ function serviceAdapter(modulePath: string): ModelRoutingAdapter {
 // (b) CLI adapter — `cortextos model … --json`
 // ---------------------------------------------------------------------------
 
+/**
+ * A JSON document on stdout is the answer, whatever the exit code says.
+ *
+ * `cortextos model resolve --json` exits non-zero when the resolution FAILS
+ * VALIDATION (e.g. `pin_not_dispatchable`) — the document it printed carries
+ * the errors the operator has to act on. Discarding it and surfacing
+ * "cortextos model exited 2" hides the remediation item behind a shell detail.
+ * Only a run that produced no parseable JSON is treated as a transport failure.
+ */
+export function interpretCliOutput(
+  stdout: string | undefined,
+  stderr: string | undefined,
+  status: number | null,
+): unknown | RoutingError {
+  const parsed = safeJson((stdout ?? '').trim());
+
+  if (parsed !== undefined) {
+    // A bare `{ error }` envelope is still an error; a Resolution or Receipt
+    // that merely carries an `error` field is not.
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as RoutingError).error === 'string' &&
+      !('validation' in (parsed as object)) &&
+      !('operation_id' in (parsed as object)) &&
+      !('registry_revision' in (parsed as object))
+    ) {
+      return parsed as RoutingError;
+    }
+    return parsed;
+  }
+
+  const err = (stderr ?? '').trim();
+  if (status !== 0) {
+    return { error: err || `routing CLI failed (exit ${status}) and returned no JSON` };
+  }
+  return { error: err || 'routing CLI returned non-JSON output' };
+}
+
 function runCli(bin: string, args: string[]): unknown | RoutingError {
   const res = spawnSync(bin, args, { encoding: 'utf-8', timeout: 120000, env: process.env });
   if (res.error) return { error: errText(res.error) };
-  const stdout = (res.stdout ?? '').trim();
-  if (res.status !== 0) {
-    const stderr = (res.stderr ?? '').trim();
-    // Prefer a structured error body when the CLI emits one.
-    const parsed = safeJson(stdout);
-    if (parsed && typeof parsed === 'object' && 'error' in (parsed as object)) return parsed as RoutingError;
-    return { error: stderr || `cortextos model exited ${res.status}` };
-  }
-  const parsed = safeJson(stdout);
-  if (parsed === undefined) return { error: 'routing CLI returned non-JSON output' };
-  return parsed;
+  return interpretCliOutput(res.stdout, res.stderr, res.status);
+}
+
+/** Loose mapping of whatever the CLI/event files call these fields. */
+export function normalizeAttempts(raw: unknown): RoutingAttempt[] {
+  const list = Array.isArray(raw)
+    ? raw
+    : Array.isArray((raw as { attempts?: unknown[] })?.attempts)
+      ? (raw as { attempts: unknown[] }).attempts
+      : [];
+  const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
+  return list
+    .filter((a): a is Record<string, unknown> => !!a && typeof a === 'object')
+    .map((a) => {
+      const observed = (a.observed ?? {}) as Record<string, unknown>;
+      const confidence = str(a.confidence) ?? str(observed.confidence);
+      return {
+        attempt_id: str(a.attempt_id) ?? str(a.id),
+        at: str(a.at) ?? str(a.created_at) ?? str(a.timestamp),
+        agent: str(a.agent) ?? str(a.consumer),
+        requested: str(a.requested) ?? str(a.requested_model_id) ?? str(a.requested_entry_id),
+        resolved: str(a.resolved) ?? str(a.resolved_model_id) ?? str(a.expected_model_id) ?? str(a.model_id),
+        observed: str(a.observed_model_id) ?? str(observed.model_id),
+        confidence:
+          confidence === 'verified' || confidence === 'mismatch' || confidence === 'unconfirmed'
+            ? confidence
+            : 'unknown',
+        binding: str(a.binding) ?? str(observed.binding) ?? str(a.session_id),
+      };
+    });
 }
 
 function opToCliArgs(op: RoutingOperation): string[] {
@@ -307,7 +427,14 @@ function cliAdapter(bin?: string): ModelRoutingAdapter | null {
     },
     async apply(op) {
       const out = runCli(resolved, opToCliArgs(op));
-      return isRoutingError(out) ? out : (out as Receipt);
+      if (isReceipt(out)) return out;
+      if (isRoutingError(out)) return out;
+      return { error: 'routing CLI returned no recognisable receipt' };
+    },
+    async attempts(agent, limit) {
+      const out = runCli(resolved, ['model', 'attempts', '--agent', agent, '--limit', String(limit ?? 5), '--json']);
+      if (isRoutingError(out)) return out;
+      return { attempts: normalizeAttempts(out) };
     },
   };
 }
@@ -478,6 +605,12 @@ function fileAdapter(): ModelRoutingAdapter {
     async apply() {
       return ROUTING_UNAVAILABLE;
     },
+    async attempts(agent, limit) {
+      const p = findRegistryFile();
+      if (!p) return { attempts: [] };
+      const all = normalizeAttempts(readEventDir(join(p, '..', 'model-events', 'attempts'), 200));
+      return { attempts: all.filter((a) => !a.agent || a.agent === agent).slice(0, limit ?? 5) };
+    },
   };
 }
 
@@ -488,6 +621,7 @@ function unavailableAdapter(): ModelRoutingAdapter {
     async summary() { return ROUTING_UNAVAILABLE; },
     async events() { return ROUTING_UNAVAILABLE; },
     async apply() { return ROUTING_UNAVAILABLE; },
+    async attempts() { return ROUTING_UNAVAILABLE; },
   };
 }
 
@@ -531,6 +665,30 @@ export async function getRoutingEvents(limit = 25): Promise<{ events: unknown[];
 
 export async function applyRoutingOperation(op: RoutingOperation): Promise<Receipt | RoutingError> {
   return getModelRoutingAdapter().apply(op);
+}
+
+/**
+ * Last N dispatch attempts for one agent. An adapter that cannot report them
+ * answers `{ attempts: [], supported: false }` — an empty list is not evidence
+ * that nothing ran.
+ */
+export async function getAgentAttempts(
+  agent: string,
+  limit = 5,
+): Promise<{ attempts: RoutingAttempt[]; supported: boolean } | RoutingError> {
+  const adapter = getModelRoutingAdapter();
+  if (!adapter.attempts) return { attempts: [], supported: false };
+  const out = await adapter.attempts(agent, limit);
+  if (isRoutingError(out)) {
+    // `model attempts` only exists on newer CLI builds. An older binary answers
+    // with a commander "unknown command" error — that is "not supported here",
+    // not an outage, and it must not be shown as a failure.
+    if (/unknown command|unrecognized|unknown option|display help for command/i.test(out.error)) {
+      return { attempts: [], supported: false };
+    }
+    return out;
+  }
+  return { attempts: normalizeAttempts(out.attempts).slice(0, limit), supported: true };
 }
 
 // ---------------------------------------------------------------------------
