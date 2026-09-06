@@ -6,6 +6,8 @@ import { getTaskById } from '@/lib/data/tasks';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { syncAll } from '@/lib/sync';
 import { db } from '@/lib/db';
+import { transitionTask } from '@/lib/task-transition';
+import { sourceForTaskId, toCanonical } from '@/lib/data/transition-contract';
 
 export const dynamic = 'force-dynamic';
 
@@ -347,55 +349,78 @@ export async function PUT(
     }
   }
 
-  // Read and update the task JSON file directly
-  const fs = await import('fs/promises');
-  const path = await import('path');
-  const ctxRoot = getCTXRoot();
-  const taskDir = task.org
-    ? path.default.join(ctxRoot, 'orgs', task.org, 'tasks')
-    : path.default.join(ctxRoot, 'tasks');
-  const taskFile = path.default.join(taskDir, `${id}.json`);
+  // ---------------------------------------------------------------------------
+  // OS-02: field edits go through the same locked, versioned write path the bus
+  // uses. The previous implementation read the task JSON, mutated it in memory
+  // and renamed a temp file over it — no lock, no version, no journal entry.
+  // Any concurrent agent write in that window was lost, and nothing recorded
+  // that a human had edited the task at all. This was the writer that would
+  // have quietly defeated the whole contract.
+  // ---------------------------------------------------------------------------
+  const { editTaskFields } = await import('@/lib/task-edit');
+  const editResult = editTaskFields({
+    taskId: id,
+    org: task.org || '',
+    actor: 'dashboard',
+    expectedVersion: typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined,
+    fields: {
+      ...(title !== undefined ? { title: title.trim() } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(assignee !== undefined ? { assigned_to: assignee } : {}),
+      ...(priority !== undefined ? { priority } : {}),
+    },
+  });
 
-  try {
-    const raw = await fs.default.readFile(taskFile, 'utf-8');
-    const taskData = JSON.parse(raw);
-
-    const oldAssignee = taskData.assigned_to;
-    if (title !== undefined) taskData.title = title.trim();
-    if (description !== undefined) taskData.description = description;
-    if (assignee !== undefined) taskData.assigned_to = assignee;
-    if (priority !== undefined) taskData.priority = priority;
-    taskData.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-
-    const tmp = taskFile + '.tmp';
-    await fs.default.writeFile(tmp, JSON.stringify(taskData, null, 2) + '\n');
-    await fs.default.rename(tmp, taskFile);
-
-    // Notify new assignee if changed. assignee was validated against the
-    // agent-name whitelist above, and the message body is capped before it
-    // is passed as a positional arg to the bus script (which quotes "$3").
-    if (assignee && assignee !== oldAssignee && assignee !== 'human' && assignee !== 'user' && isValidAgentName(assignee)) {
-      try {
-        const notifyMsg = capText(`Task reassigned to you: [${id}] ${taskData.title}`);
-        spawnSync(
-          'bash',
-          [
-            path.join(getFrameworkRoot(), 'bus', 'send-message.sh'),
-            assignee,
-            'normal',
-            notifyMsg,
-          ],
-          { timeout: 5000, stdio: 'pipe', env: { ...process.env, CTX_FRAMEWORK_ROOT: getFrameworkRoot(), CTX_ROOT: getCTXRoot(), CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default', CTX_AGENT_NAME: 'dashboard', CTX_ORG: task?.org || '' } },
-        );
-      } catch { /* non-fatal */ }
+  if (!editResult.ok) {
+    if (editResult.status === 409) {
+      return Response.json(
+        {
+          error: 'version_conflict',
+          message:
+            'This task changed while you were editing it. The current record is shown below — review it and try again.',
+          current: editResult.current,
+          currentVersion: editResult.currentVersion,
+        },
+        { status: 409 },
+      );
     }
-
-    try { syncAll(); } catch { /* best-effort */ }
-    return Response.json({ success: true });
-  } catch (err) {
-    console.error('[api/tasks/[id]] PUT error:', err);
-    return Response.json({ error: 'Failed to update task' }, { status: 500 });
+    console.error('[api/tasks/[id]] PUT error:', editResult.error, editResult.detail ?? '');
+    return Response.json({ error: editResult.error, detail: editResult.detail }, { status: editResult.status });
   }
+
+  // Notify the new assignee if it changed. `assignee` was validated against the
+  // agent-name whitelist above, and the message body is capped before it is
+  // passed as a positional arg to the bus script (which quotes "$3").
+  if (
+    assignee &&
+    assignee !== editResult.previousAssignee &&
+    assignee !== 'human' &&
+    assignee !== 'user' &&
+    isValidAgentName(assignee)
+  ) {
+    try {
+      const notifyMsg = capText(`Task reassigned to you: [${id}] ${editResult.title}`);
+      spawnSync(
+        'bash',
+        [path.join(getFrameworkRoot(), 'bus', 'send-message.sh'), assignee, 'normal', notifyMsg],
+        {
+          timeout: 5000,
+          stdio: 'pipe',
+          env: {
+            ...process.env,
+            CTX_FRAMEWORK_ROOT: getFrameworkRoot(),
+            CTX_ROOT: getCTXRoot(),
+            CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default',
+            CTX_AGENT_NAME: 'dashboard',
+            CTX_ORG: task.org || '',
+          },
+        },
+      );
+    } catch { /* non-fatal — the assignment is already persisted */ }
+  }
+
+  try { syncAll(); } catch { /* best-effort */ }
+  return Response.json({ success: true, version: editResult.version });
 }
 
 // ---------------------------------------------------------------------------
@@ -448,66 +473,70 @@ export async function PATCH(
 
   // Look up task's org to pass CTX_ORG to bus script
   const task = getTaskById(id);
+  if (!task) {
+    return Response.json({ error: 'Task not found' }, { status: 404 });
+  }
 
   // ---------------------------------------------------------------------------
-  // Supabase-sourced tasks (id prefix "supa_") — bus scripts can't find these
-  // because they live only in SQLite, not in CortexOS JSON files. Handle them
-  // by calling Supabase REST directly and updating the local SQLite cache.
+  // OS-02: one transition service for both stores.
+  //
+  // The Supabase and native branches used to be separate state machines with
+  // separate conflict behavior — neither of which actually detected a conflict.
+  // Both now go through the same call, return the same shape, and answer a
+  // concurrent edit with a 409 carrying the current record so the board can
+  // show what happened and refresh instead of overwriting somebody's work.
   // ---------------------------------------------------------------------------
-  if (id.startsWith('supa_')) {
-    const supabaseId = id.slice(5); // strip "supa_" prefix → numeric string
-    const supaUrl = process.env.SUPABASE_URL;
-    const supaKey = process.env.SUPABASE_KEY;
+  const expectedVersion =
+    typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined;
+  const evidence =
+    body.evidence && typeof body.evidence === 'object'
+      ? (body.evidence as Record<string, unknown>)
+      : outputSummary
+        ? { result: capText(outputSummary) }
+        : undefined;
 
-    if (!supaUrl || !supaKey) {
+  const outcome = await transitionTask({
+    taskId: id,
+    to: status,
+    actor: typeof body.actor === 'string' && isValidAgentName(body.actor) ? body.actor : 'dashboard',
+    expectedVersion,
+    evidence,
+    reason: note ? capText(note) : undefined,
+    org: task.org || '',
+  });
+
+  if (!outcome.ok) {
+    if (outcome.status === 409) {
       return Response.json(
-        { error: 'SUPABASE_URL / SUPABASE_KEY not configured in .env.local' },
-        { status: 500 },
-      );
-    }
-
-    try {
-      const now = new Date().toISOString();
-      const patch: Record<string, string | null> = { status };
-      if (status === 'completed') patch.completed_at = now;
-      if (status === 'in_progress') patch.started_at = now;
-
-      const sbRes = await fetch(
-        `${supaUrl}/rest/v1/tasks?id=eq.${supabaseId}`,
         {
-          method: 'PATCH',
-          headers: {
-            apikey: supaKey,
-            Authorization: `Bearer ${supaKey}`,
-            'Content-Type': 'application/json',
-            Prefer: 'return=minimal',
-          },
-          body: JSON.stringify(patch),
+          error: 'version_conflict',
+          message:
+            'This task changed while you were looking at it. The current state is shown below — review it and try again.',
+          current: outcome.current,
+          currentVersion: outcome.currentVersion,
         },
+        { status: 409 },
       );
-
-      if (!sbRes.ok) {
-        const errText = await sbRes.text();
-        throw new Error(`Supabase PATCH failed ${sbRes.status}: ${errText}`);
-      }
-
-      // Mirror immediately in local SQLite so the UI updates before next sync
-      db.prepare(
-        `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?
-         WHERE id = ?`,
-      ).run(
-        status,
-        now,
-        status === 'completed' ? now : null,
-        id,
-      );
-
-      return Response.json({ success: true });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error('[api/tasks/[id]] supa_ PATCH error:', message);
-      return Response.json({ error: `Failed to update task: ${message}` }, { status: 500 });
     }
+    console.error('[api/tasks/[id]] PATCH transition failed:', outcome.error, outcome.detail ?? '');
+    return Response.json(
+      { error: outcome.error, detail: outcome.detail },
+      { status: outcome.status },
+    );
+  }
+
+  // Mirror the Supabase result into SQLite so the board reflects it before the
+  // next sync. SQLite is a projection; this is a cache refresh, not authority.
+  if (id.startsWith('supa_')) {
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ? WHERE id = ?`,
+    ).run(outcome.nativeStatus, now, outcome.nativeStatus === 'completed' ? now : null, id);
+    return Response.json({
+      success: true,
+      version: outcome.version,
+      canonicalState: outcome.canonicalState,
+    });
   }
 
   const frameworkRoot = getFrameworkRoot();
@@ -517,38 +546,10 @@ export async function PATCH(
     CTX_ROOT: getCTXRoot(),
     CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default',
     CTX_AGENT_NAME: 'dashboard',
-    CTX_ORG: task?.org || '',
+    CTX_ORG: task.org || '',
   };
 
   try {
-    let spawnResult;
-    if (status === 'completed') {
-      // Use complete-task.sh for completion (handles additional side effects).
-      // summaryArg is capped and passed as a positional arg; the bus script
-      // quotes "$2" and exec's node directly, so no shell interpolation occurs.
-      const summaryArg = capText(outputSummary);
-      spawnResult = spawnSync(
-        'bash',
-        [path.join(frameworkRoot, 'bus', 'complete-task.sh'), id, summaryArg],
-        { encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe' },
-      );
-    } else {
-      // Use update-task.sh for other status changes. All args are positional
-      // and bounded; blockedBy was validated above, id/status are whitelisted.
-      const args: string[] = [id, status];
-      if (note) args.push(capText(note));
-      if (blockedBy) args.push(String(blockedBy));
-
-      spawnResult = spawnSync(
-        'bash',
-        [path.join(frameworkRoot, 'bus', 'update-task.sh'), ...args],
-        { encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe' },
-      );
-    }
-    if (spawnResult.status !== 0) {
-      throw new Error(spawnResult.stderr || spawnResult.stdout || 'Script failed');
-    }
-
     // Notify the task creator when a task is completed or status changes significantly.
     // This is how agents find out their blocked tasks can be unblocked.
     if (task?.source_file) {
@@ -585,7 +586,11 @@ export async function PATCH(
       // Sync is best-effort
     }
 
-    return Response.json({ success: true });
+    return Response.json({
+      success: true,
+      version: outcome.version,
+      canonicalState: outcome.canonicalState,
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[api/tasks/[id]] PATCH error:', message);

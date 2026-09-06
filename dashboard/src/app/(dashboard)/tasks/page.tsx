@@ -58,6 +58,9 @@ export default function TasksPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
+  /** A move that did not take: a version conflict, or an outright failure.
+   *  Shown rather than swallowed — a silent failure looks exactly like success. */
+  const [conflict, setConflict] = useState<string | null>(null);
 
   // Derive unique values for filter dropdowns
   const allTasks = tasks;
@@ -125,20 +128,43 @@ export default function TasksPage() {
   }
 
   async function handleStatusChange(taskId: string, status: TaskStatus, note?: string) {
+    setConflict(null);
     try {
+      // OS-02: send the version this view was rendered from, so a change made
+      // while the board was open comes back as a conflict instead of silently
+      // overwriting whoever got there first.
+      const current = tasks.find((t) => t.id === taskId) as (Task & { version?: number }) | undefined;
       const res = await fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status, note }),
+        body: JSON.stringify({ status, note, expectedVersion: current?.version }),
       });
 
       if (res.ok) {
         setSheetOpen(false);
         setSelectedTask(null);
         fetchTasks();
+        return;
       }
+
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 409) {
+        // Show what actually happened and refresh, rather than leaving the
+        // person looking at a board that no longer matches reality.
+        setConflict(
+          data.message ??
+            'This task changed while you were looking at it. The board has been refreshed.',
+        );
+        setSheetOpen(false);
+        setSelectedTask(null);
+        fetchTasks();
+        return;
+      }
+      // A failed move used to fail silently, which is indistinguishable from a
+      // move that worked. Say so.
+      setConflict(data.error ? `Could not move this task: ${data.error}` : 'Could not move this task.');
     } catch {
-      // Silently fail
+      setConflict('Could not reach the server. This task was not moved.');
     }
   }
 
@@ -234,6 +260,26 @@ export default function TasksPage() {
             />
           </div>
         </div>
+
+        {/* A move that did not take. Dismissible, and announced to assistive
+            technology so it is not a purely visual signal. */}
+        {conflict && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="mx-4 mb-2 flex items-start justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
+          >
+            <span>{conflict}</span>
+            <button
+              type="button"
+              onClick={() => setConflict(null)}
+              className="shrink-0 underline underline-offset-2"
+              aria-label="Dismiss"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {/* One-time tasks tab */}
         <TabsContent value="tasks" className="mt-0 space-y-4">

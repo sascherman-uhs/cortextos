@@ -5,6 +5,16 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
 import { validatePriority, validateTaskId } from '../utils/validate.js';
 import { logEvent } from './event.js';
+import {
+  mutateTask,
+  acquireLease,
+  readMeta,
+  appendTaskEvent,
+  withTaskLock,
+  LeaseHeldError,
+  type TaskContractMeta,
+} from './task-store.js';
+import { toCanonical, toNative, guardTransition, checkTransition, enforcementMode, type CanonicalState, type Evidence } from './task-contract.js';
 
 /**
  * Create a new task. Identical JSON format to bash create-task.sh.
@@ -23,6 +33,19 @@ export function createTask(
     dueDate?: string;
     blockedBy?: string[];
     blocks?: string[];
+    /** OS-02 accountability. Every field is optional so no existing caller
+     *  breaks; a task created without them is non-dispatchable and surfaces in
+     *  the unassigned-recovery queue rather than being quietly routed. */
+    contract?: {
+      outcome?: string;
+      humanAccountableId?: string;
+      agentRoleId?: string;
+      acceptanceCriteria?: unknown[];
+      authorizationScope?: string;
+      attemptLimit?: number;
+      impactClass?: string;
+      workType?: string;
+    };
   } = {},
 ): string {
   const {
@@ -34,6 +57,7 @@ export function createTask(
     dueDate = '',
     blockedBy = [],
     blocks = [],
+    contract = {},
   } = options;
 
   validatePriority(priority);
@@ -82,8 +106,41 @@ export function createTask(
     ...(blocks.length ? { blocks: [...blocks] } : {}),
   };
 
+  // OS-02 accountability fields. Additive: a reader that predates the contract
+  // ignores them, and `readMeta` supplies these same defaults for a legacy file
+  // that never had them. `outcome` defaults to the title rather than being left
+  // empty, because "Ready requires a stated outcome" must be satisfiable by an
+  // ordinary create-task call rather than only by a contract-aware caller.
+  const contractFields: Record<string, unknown> = {
+    version: 1,
+    fence_token: 0,
+    lease_owner: null,
+    lease_expires_at: null,
+    canonical_state: toCanonical('cortexos_tasks', 'pending'),
+    source_ref: `cortexos_tasks:${taskId}`,
+    author: agentName,
+    outcome: contract.outcome ?? title,
+    human_accountable_id: contract.humanAccountableId ?? null,
+    agent_role_id: contract.agentRoleId ?? null,
+    acceptance_criteria: contract.acceptanceCriteria ?? [],
+    dependency_ids: [...blockedBy],
+    authorization_scope: contract.authorizationScope ?? null,
+    attempt_limit: contract.attemptLimit ?? null,
+    impact_class: contract.impactClass ?? null,
+    work_type: contract.workType ?? 'work',
+    evidence_recorded: false,
+  };
+  Object.assign(task as unknown as Record<string, unknown>, contractFields);
+
+  const taskFilePath = join(paths.taskDir, `${taskId}.json`);
   ensureDir(paths.taskDir);
-  atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
+  atomicWriteSync(taskFilePath, JSON.stringify(task));
+  appendTaskEvent(paths, taskFilePath, taskId, {
+    version: 1,
+    event: 'created',
+    actor: agentName,
+    payload: { title, assignee, priority, canonical_state: 'backlog' },
+  });
 
   // Cycle-safe now: validation already passed, so symmetric-edge
   // maintenance is just mutating peer JSONs.
@@ -264,27 +321,171 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  options: TransitionOptions = {},
 ): void {
+  transitionTask(paths, taskId, status, options);
+}
+
+/** Everything a contract-aware caller may bring to a transition. All optional,
+ *  so `updateTask(paths, id, status)` still works exactly as before. */
+export interface TransitionOptions {
+  /** Who is doing this. Defaults to the task's current assignee. */
+  actor?: string;
+  /** Proof. Required to leave `doing`, and to reach `done`. */
+  evidence?: Evidence;
+  /** Optimistic concurrency: refuse if the task has moved since you read it. */
+  expectedVersion?: number;
+  /** Lease proof, for a worker that claimed this task. */
+  fenceToken?: number;
+  reason?: string;
+  /** Ids of dependencies the caller knows are still open. */
+  unsatisfiedDependencies?: string[];
+  /** Suppress the legacy `tasks/audit/` line for a step that a higher-level
+   *  operation will log itself. The OS-02 event journal always records it; this
+   *  only keeps the old audit log reading exactly as it did before, so existing
+   *  consumers of `readTaskAudit` see no new entries. */
+  suppressLegacyAudit?: boolean;
+}
+
+/**
+ * The one native-task transition path. Validates against the OS-02 contract,
+ * then writes under a lock with a version bump and a journal entry.
+ *
+ * The status argument stays in the NATIVE vocabulary. Callers all over the
+ * codebase and the bus shell scripts pass 'completed' / 'blocked'; rewriting
+ * them to canonical words would be exactly the enum rewrite plan §3 forbids.
+ * The canonical state is derived and stored alongside, never instead.
+ */
+export function transitionTask(
+  paths: BusPaths,
+  taskId: string,
+  status: TaskStatus,
+  options: TransitionOptions = {},
+): { version: number; canonicalState: CanonicalState } {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
     throw new Error(
       `Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`,
     );
   }
-  let prevStatus: TaskStatus | undefined;
-  let assignee: string | undefined;
+
+  let produced!: { version: number; canonicalState: CanonicalState };
+  let previousStatus: TaskStatus | undefined;
+
+  const result = mutateTask(
+    paths,
+    filePath,
+    taskId,
+    {
+      actor: options.actor ?? 'unknown',
+      event: `status:${status}`,
+      expectedVersion: options.expectedVersion,
+      fenceToken: options.fenceToken,
+    },
+    (task, meta) => {
+      previousStatus = task.status as TaskStatus;
+      const from = meta.canonical_state ?? toCanonical('cortexos_tasks', previousStatus);
+      const to = toCanonical('cortexos_tasks', status);
+
+      // Validate against the contract. In shadow mode this logs and returns;
+      // in enforced mode it throws before anything is written.
+      guardTransition(
+        'cortexos_tasks',
+        from,
+        to,
+        contractItemFrom(task, meta),
+        options.evidence ?? {},
+        { unsatisfied_dependencies: options.unsatisfiedDependencies },
+      );
+
+      task.status = status;
+      if (options.evidence && Object.keys(options.evidence).length > 0) {
+        task.evidence = options.evidence;
+        task.evidence_recorded = true;
+      }
+      if (options.reason) task.transition_reason = options.reason;
+      if (to === 'done' || to === 'cancelled' || to === 'failed_terminal') {
+        // A terminal state releases the lease: nothing should still be holding
+        // a claim on work that is over.
+        task.lease_owner = null;
+        task.lease_expires_at = null;
+      }
+      produced = { version: meta.version + 1, canonicalState: to };
+    },
+  );
+
+  const task = result.task as unknown as Task;
+  if (options.suppressLegacyAudit) return produced;
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: options.actor ?? task.assigned_to ?? 'unknown',
+    from: previousStatus,
+    to: status,
+  });
+  return produced;
+}
+
+/** Record that a task has reached `verify`: it has an artifact, but has not yet
+ *  passed its acceptance checks or been signed off by an independent verifier. */
+function markVerify(
+  paths: BusPaths,
+  filePath: string,
+  taskId: string,
+  actor: string,
+  evidence: Evidence,
+  options: TransitionOptions,
+): void {
+  mutateTask(
+    paths,
+    filePath,
+    taskId,
+    {
+      actor,
+      event: 'status:verify',
+      fenceToken: options.fenceToken,
+      canonicalState: 'verify',
+      payload: { evidence },
+    },
+    (task) => {
+      task.status = 'in_progress';
+      task.evidence = evidence;
+      task.evidence_recorded = Object.keys(evidence).length > 0;
+    },
+  );
+}
+
+/** Build the contract's view of a task from the stored record. */
+function contractItemFrom(task: Record<string, unknown>, meta: TaskContractMeta) {
+  return {
+    outcome: (meta.outcome ?? (task.title as string)) || undefined,
+    type: (meta.work_type ?? 'work') as 'work' | 'obligation' | 'improvement',
+    impact_class: (meta.impact_class ?? undefined) as never,
+    author: meta.author ?? undefined,
+    agent_role_id: meta.agent_role_id ?? undefined,
+    human_accountable_id: meta.human_accountable_id ?? undefined,
+    acceptance_criteria: meta.acceptance_criteria ?? [],
+    dependency_ids: meta.dependency_ids ?? [],
+  };
+}
+
+/** Canonical state currently recorded for a task, for readers that want the
+ *  new vocabulary without re-deriving the mapping. */
+export function canonicalStateOf(paths: BusPaths, taskId: string): CanonicalState | null {
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) return null;
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
-    prevStatus = task.status;
-    assignee = task.assigned_to;
-    task.status = status;
-    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    atomicWriteSync(filePath, JSON.stringify(task));
-  } catch (err) {
-    throw new Error(`Task ${taskId} update failed: ${err}`);
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    return readMeta(task).canonical_state ?? toCanonical('cortexos_tasks', task.status as string);
+  } catch {
+    return null;
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+}
+
+/** Native status a store will accept for a canonical state. Exported so the
+ *  dashboard's Kanban can move a card by canonical lane without inventing the
+ *  mapping a second time. */
+export function nativeStatusFor(canonical: CanonicalState): string | undefined {
+  return toNative('cortexos_tasks', canonical);
 }
 
 /**
@@ -376,6 +577,7 @@ export function claimTask(
   paths: BusPaths,
   taskId: string,
   agent: string,
+  leaseSeconds = 900,
 ): Task {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -430,21 +632,43 @@ export function claimTask(
     throw new Error(`Task ${taskId} already claimed by ${owner}`);
   }
 
-  // Lock held — safe to mutate the task JSON.
-  const prevStatus = task.status;
-  task.status = 'in_progress';
-  task.assigned_to = agent;
-  task.updated_at = now;
+  // Lock held — take the accountability lease under the task lock. The claim
+  // file gives mutual exclusion between two simultaneous claimers; the lease
+  // gives EXPIRY and a fence token, which the claim file never had. Without the
+  // fence, a worker whose process hung past its lease could wake up and write
+  // over the worker that legitimately took over.
   try {
-    atomicWriteSync(filePath, JSON.stringify(task));
+    lastGrant = acquireLease(paths, filePath, taskId, agent, leaseSeconds, Date.now, 'in_progress');
   } catch (err) {
     // Roll back the claim so a retry can succeed; we never want a ghost
     // lock surviving a write failure on the task JSON itself.
     try { unlinkSync(claimPath); } catch { /* best-effort */ }
+    if (err instanceof LeaseHeldError) throw err;
     throw new Error(`Task ${taskId} claim commit failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'claim', agent, from: prevStatus, to: 'in_progress' });
-  return task;
+  appendTaskAudit(paths, taskId, { event: 'claim', agent, from: task.status, to: 'in_progress' });
+  return JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+}
+
+/**
+ * The lease grant from the most recent successful `claimTask` in this process.
+ *
+ * `claimTask` returns a `Task` and dozens of call sites depend on that shape,
+ * so the fence token is exposed here rather than by widening the return type.
+ * A worker that intends to report progress should prefer `claimTaskWithLease`,
+ * which hands back both.
+ */
+let lastGrant: { fenceToken: number; leaseExpiresAt: string; checkpoint: Record<string, unknown> } | null = null;
+
+export function claimTaskWithLease(
+  paths: BusPaths,
+  taskId: string,
+  agent: string,
+  leaseSeconds = 900,
+): { task: Task; fenceToken: number; leaseExpiresAt: string; checkpoint: Record<string, unknown> } {
+  const task = claimTask(paths, taskId, agent, leaseSeconds);
+  if (!lastGrant) throw new Error(`Task ${taskId} claimed without a lease grant`);
+  return { task, ...lastGrant };
 }
 
 /**
@@ -463,6 +687,7 @@ export function completeTask(
   paths: BusPaths,
   taskId: string,
   result?: string,
+  options: TransitionOptions = {},
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -479,16 +704,73 @@ export function completeTask(
     prevStatus = task.status;
     assignee = task.assigned_to;
     taskOrg = task.org || '';
-    task.status = 'completed';
-    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    task.completed_at = task.updated_at;
-    if (result) {
-      task.result = result;
-    }
-    atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} complete failed: ${err}`);
   }
+
+  // Completion is now a two-step contract move, not one write.
+  //
+  // doing -> verify costs an artifact; verify -> done costs recorded acceptance
+  // results and a verifier who is not the author. A caller with no evidence
+  // lands the task in VERIFY and stops there — visibly incomplete rather than
+  // falsely done. That is the entire point of the package: an agent asserting
+  // success is not the same event as the work being verified.
+  const evidence: Evidence = { ...(options.evidence ?? {}) };
+  if (result && evidence.result === undefined && evidence.artifact === undefined) {
+    evidence.result = result;
+  }
+
+  const actor = options.actor ?? assignee ?? 'unknown';
+  const current = canonicalStateOf(paths, taskId) ?? 'doing';
+
+  // Step 1: reach verify. Costs an artifact.
+  if (current !== 'verify' && current !== 'done') {
+    markVerify(paths, filePath, taskId, actor, evidence, options);
+  }
+
+  // Step 2: verify -> done. Costs recorded acceptance results and an
+  // independent verifier for code/external/high-impact work.
+  const snapshot = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+  const check = checkTransition(
+    'verify',
+    'done',
+    contractItemFrom(snapshot, readMeta(snapshot)),
+    evidence,
+  );
+
+  if (!check.ok) {
+    // Journalled so the gap is visible on the board and in the recovery queue
+    // instead of being swallowed by a cheerful "completed".
+    appendTaskEvent(paths, filePath, taskId, {
+      version: readMeta(snapshot).version,
+      event: 'verify:incomplete',
+      actor,
+      payload: { error: check.error, detail: check.detail, evidence },
+    });
+    if (enforcementMode('cortexos_tasks') === 'enforced') {
+      throw new Error(
+        `Task ${taskId} cannot be completed: ${check.error}${check.detail ? ` (${check.detail})` : ''}. ` +
+        `It remains in verify.`,
+      );
+    }
+    console.warn(
+      `[task-contract:shadow] cortexos_tasks: ${taskId} completed without proof (${check.error}). ` +
+      `Under enforcement this would stay in verify.`,
+    );
+  }
+
+  transitionTask(paths, taskId, 'completed', {
+    actor,
+    evidence,
+    fenceToken: options.fenceToken,
+    suppressLegacyAudit: true,
+  });
+  withTaskLock(filePath, () => {
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    if (result) task.result = result;
+    task.completed_at = task.updated_at;
+    atomicWriteSync(filePath, JSON.stringify(task));
+  });
   appendTaskAudit(paths, taskId, { event: 'complete', agent: assignee || 'unknown', from: prevStatus, to: 'completed', note: result });
 
   // Activity-feed event. Best-effort — the task is already persisted.
