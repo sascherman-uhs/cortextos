@@ -69,3 +69,48 @@ export function normalizeOrgName(frameworkRoot: string, org: string): string {
 
   return org;
 }
+
+/**
+ * The organizations that exist under a framework root, in on-disk casing.
+ *
+ * Used to turn "no org set" from a silent misfile into a message that names
+ * the orgs the caller could have used. Returns an empty list when the
+ * directory cannot be read — an empty list is "we could not tell you", and
+ * callers word it that way rather than claiming there are none.
+ */
+export function listOrgNames(frameworkRoot: string): string[] {
+  try {
+    return readdirSync(join(frameworkRoot, 'orgs'), { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The org a task write must name, or the message explaining why it cannot go
+ * ahead.
+ *
+ * `bus create-task` with no org resolved its paths to `<instance>/tasks/` —
+ * a directory nothing reads. Sync walks `<instance>/orgs/<org>/tasks/` and
+ * only that, so the CLI printed a task id, the caller believed the task
+ * existed, and it reached no board, no projection and no agent. Silent loss.
+ */
+export function requireOrgForTaskWrite(
+  org: string | undefined,
+  frameworkRoot: string,
+): { ok: true; org: string } | { ok: false; message: string } {
+  const name = (org ?? '').trim();
+  if (name) return { ok: true, org: name };
+  const available = listOrgNames(frameworkRoot);
+  return {
+    ok: false,
+    message:
+      'Refusing to create a task with no organization: it would be written outside every '
+      + 'org directory, where nothing reads it — not the board, not sync, not any agent.\n'
+      + 'Pass --org <name> or set CTX_ORG.'
+      + (available.length ? `\nOrganizations here: ${available.join(', ')}.` : ''),
+  };
+}

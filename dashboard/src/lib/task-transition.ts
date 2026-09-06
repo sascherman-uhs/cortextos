@@ -243,10 +243,12 @@ async function transitionSupabase(req: TransitionRequest): Promise<TransitionOut
     'Content-Type': 'application/json',
   };
 
-  // Read the current version. A caller that did not supply one gets whatever is
-  // current — that is a blind write and it is allowed only because the legacy
-  // UI has no version to send yet; the conflict path exists for callers that do.
-  let expected = req.expectedVersion;
+  // The version the caller read. There is deliberately NO fallback to the
+  // current version: substituting it turned every versionless call into a
+  // blind write over whoever got there first, which is precisely the failure
+  // optimistic concurrency exists to prevent. transitionTask() refuses a
+  // request without one before we ever get here.
+  const expected = req.expectedVersion;
   let current: Record<string, unknown> | null = null;
   try {
     const res = await fetch(
@@ -256,7 +258,6 @@ async function transitionSupabase(req: TransitionRequest): Promise<TransitionOut
     const rows = res.ok ? await res.json() : [];
     current = rows[0] ?? null;
     if (!current) return { ok: false, status: 404, error: 'task_not_found' };
-    if (expected === undefined) expected = Number(current.version ?? 1);
   } catch (err) {
     return { ok: false, status: 500, error: 'supabase_unreachable', detail: String(err) };
   }
@@ -449,6 +450,13 @@ function transitionNative(req: TransitionRequest): TransitionOutcome {
     ? [req.taskId, String(req.evidence?.result ?? req.reason ?? '')]
     : [req.taskId, target.native];
   if (target.native !== 'completed') args.push('--canonical', target.canonical, '--actor', req.actor);
+  // Optimistic concurrency reaches the core bus, which compares it under the
+  // task lock and throws a version conflict. Before this the dashboard read a
+  // version, sent it to this function, and dropped it on the floor at the CLI
+  // boundary — so native tasks were blind writes no matter what the UI sent.
+  if (req.expectedVersion !== undefined) {
+    args.push('--expected-version', String(req.expectedVersion));
+  }
   const legacyArgs = legacyPathArgs(req);
   args.push(...legacyArgs);
 
@@ -534,8 +542,15 @@ function transitionNativePath(
     const native = toNative('cortexos_tasks', hop);
     if (!native) return { ok: false, status: 400, error: 'unmappable_target_state', detail: hop };
     const args = [req.taskId, native, '--canonical', hop, '--origin', ORIGIN, '--actor', req.actor];
-    // The upgrade and the waiver belong to the leg that needed them.
-    if (index === 0) args.push(...legacyPathArgs(req));
+    // The upgrade and the waiver belong to the leg that needed them — and so
+    // does the version. Only the first leg is compared against what the caller
+    // read; later legs follow versions this walk has just created.
+    if (index === 0) {
+      args.push(...legacyPathArgs(req));
+      if (req.expectedVersion !== undefined) {
+        args.push('--expected-version', String(req.expectedVersion));
+      }
+    }
     const result = spawnSync('bash', [path.join(frameworkRoot, 'bus', 'update-task.sh'), ...args], {
       encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe',
     });
@@ -581,8 +596,23 @@ export function parseContractRefusal(
   }
 }
 
-/** The one entry point. Routes on which store owns the record. */
+/** The one entry point. Routes on which store owns the record.
+ *
+ *  A request with no expectedVersion is refused here rather than being given
+ *  the current version to write over. Both stores implement compare-and-set
+ *  correctly; the only way a concurrent change was ever lost was a caller that
+ *  did not say what it had read, so that case fails closed. */
 export async function transitionTask(req: TransitionRequest): Promise<TransitionOutcome> {
+  if (req.expectedVersion === undefined) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'expected_version_required',
+      detail:
+        'This move did not say which version of the task it was made against, so it was refused '
+        + 'rather than written over whatever changed since. Reload the task and try again.',
+    };
+  }
   const source = sourceForTaskId(req.taskId);
   return source === 'jarvis_tasks' ? transitionSupabase(req) : transitionNative(req);
 }

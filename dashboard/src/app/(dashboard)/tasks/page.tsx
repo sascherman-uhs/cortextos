@@ -7,7 +7,8 @@ import { Button } from '@/components/ui/button';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { IconLayoutKanban, IconList, IconChecklist, IconRepeat } from '@tabler/icons-react';
 import { TaskListTable } from '@/components/tasks/task-list-table';
-import { TaskDetailSheet } from '@/components/tasks/task-detail-sheet';
+import { TaskDetailSheet, type StatusChangeResult } from '@/components/tasks/task-detail-sheet';
+import { moveOutcome } from '@/lib/tasks/move-result';
 import { CreateTaskDialog } from '@/components/tasks/create-task-dialog';
 import { TaskFilters } from '@/components/tasks/task-filters';
 // UHS MOD #7 — recurring tasks tab (components/uhs/ never overwritten by upstream)
@@ -113,6 +114,15 @@ export default function TasksPage() {
     fetchTasks();
   }, [fetchTasks]);
 
+  // Keep the open sheet pointed at the row the last fetch returned. Without
+  // this the sheet keeps the snapshot it was opened with, so after a conflict
+  // refresh a retry would send the same stale version and conflict again.
+  useEffect(() => {
+    if (!selectedTask) return;
+    const fresh = [...tasks, ...completedToday].find((t) => t.id === selectedTask.id);
+    if (fresh && fresh !== selectedTask) setSelectedTask(fresh);
+  }, [tasks, completedToday, selectedTask]);
+
   function handleFilterChange(key: string, value: string) {
     setFilters((prev) => ({ ...prev, [key]: value }));
   }
@@ -127,48 +137,62 @@ export default function TasksPage() {
     setSheetOpen(true);
   }
 
-  async function handleStatusChange(taskId: string, status: TaskStatus, note?: string) {
+  async function handleStatusChange(
+    taskId: string,
+    status: TaskStatus,
+    note?: string,
+  ): Promise<StatusChangeResult> {
     setConflict(null);
     try {
       // OS-02: send the version this view was rendered from, so a change made
       // while the board was open comes back as a conflict instead of silently
       // overwriting whoever got there first.
-      const current = tasks.find((t) => t.id === taskId) as (Task & { version?: number }) | undefined;
+      const current = [...tasks, ...completedToday].find((t) => t.id === taskId) as
+        | (Task & { version?: number })
+        | undefined;
+      // Fail closed. A move with no version is a blind write — it would land on
+      // top of whatever changed since this list was fetched. Refresh and ask
+      // the person to try again rather than posting without the field.
+      if (typeof current?.version !== 'number') {
+        const message =
+          'This task was listed without a version, so the move was not sent — '
+          + 'sending it could overwrite a change made since this page loaded. '
+          + 'The list has been refreshed; try again.';
+        setConflict(message);
+        fetchTasks();
+        return { ok: false, message };
+      }
       const res = await fetch(`/api/tasks/${taskId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status, note, expectedVersion: current?.version }),
+        body: JSON.stringify({ status, note, expectedVersion: current.version }),
       });
 
       if (res.ok) {
         setSheetOpen(false);
         setSelectedTask(null);
         fetchTasks();
-        return;
+        return { ok: true };
       }
 
       const data = await res.json().catch(() => ({}));
-      if (res.status === 409) {
-        // Show what actually happened and refresh, rather than leaving the
-        // person looking at a board that no longer matches reality.
-        setConflict(
-          data.message ??
-            'This task changed while you were looking at it. The board has been refreshed.',
-        );
-        setSheetOpen(false);
-        setSelectedTask(null);
-        fetchTasks();
-        return;
-      }
       // A failed move used to fail silently, which is indistinguishable from a
       // move that worked. Say so — and when the work contract refused it (422),
       // show the sentence that names the legal moves rather than an error code.
-      setConflict(
-        data.message ??
-          (data.error ? `Could not move this task: ${data.error}` : 'Could not move this task.'),
-      );
+      const outcome = moveOutcome(res.status, data);
+      setConflict(outcome.message ?? null);
+      if (res.status === 409) {
+        // The record moved underneath this view. Re-read it, and leave the
+        // sheet OPEN carrying the message: closing it dropped the refusal into
+        // a banner behind the dialog, where nobody saw it, and left the person
+        // with no way to retry against the record that now exists.
+        fetchTasks();
+      }
+      return outcome;
     } catch {
-      setConflict('Could not reach the server. This task was not moved.');
+      const message = 'Could not reach the server. This task was not moved.';
+      setConflict(message);
+      return { ok: false, message };
     }
   }
 
@@ -271,7 +295,8 @@ export default function TasksPage() {
           <div
             role="alert"
             aria-live="assertive"
-            className="mx-4 mb-2 flex items-start justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-200"
+            data-testid="tasks-conflict-alert"
+            className="sticky top-2 z-40 mx-4 mb-2 flex items-start justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 shadow-sm backdrop-blur dark:text-amber-200"
           >
             <span>{conflict}</span>
             <button

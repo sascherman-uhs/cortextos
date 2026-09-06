@@ -186,14 +186,31 @@ export default function ApprovalsPage() {
                         setCompletingTaskId(task.id);
                         setTaskError(null);
                         try {
+                          // OS-02: this is a transition, so it carries the
+                          // version this list was rendered from. No version
+                          // means fail closed — completing a task blind can
+                          // overwrite whatever an agent recorded meanwhile.
+                          if (typeof task.version !== 'number') {
+                            setTaskError(
+                              'This task was listed without a version, so it was not completed — '
+                              + 'the list has been refreshed, try again.',
+                            );
+                            fetchApprovals();
+                            return;
+                          }
                           const res = await fetch(`/api/tasks/${task.id}`, {
                             method: 'PATCH',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ status: 'completed' }),
+                            body: JSON.stringify({
+                              status: 'completed',
+                              expectedVersion: task.version,
+                            }),
                           });
                           if (!res.ok) {
                             const data = await res.json().catch(() => ({}));
-                            setTaskError(data.error || `Failed to complete task ${task.id}`);
+                            setTaskError(
+                              data.message || data.error || `Failed to complete task ${task.id}`,
+                            );
                           } else {
                             fetchApprovals();
                           }

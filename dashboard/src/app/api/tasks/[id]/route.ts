@@ -8,7 +8,8 @@ import { syncAll } from '@/lib/sync';
 import { db } from '@/lib/db';
 import { auth } from '@/lib/auth';
 import { transitionTask } from '@/lib/task-transition';
-import { sourceForTaskId, toCanonical } from '@/lib/data/transition-contract';
+import { sourceForTaskId, toCanonical, type CanonicalState } from '@/lib/data/transition-contract';
+import { offeredActions } from '@/lib/tasks/offered-actions';
 
 export const dynamic = 'force-dynamic';
 
@@ -67,12 +68,23 @@ export async function GET(
       return Response.json({ error: 'Task not found' }, { status: 404 });
     }
 
+    // The canonical state the OWNING store holds, not the one the SQLite
+    // projection infers. They can disagree: a native record carrying
+    // canonical_state 'failed_terminal' has native status 'pending', which the
+    // projection reads as 'backlog'. The detail sheet derives its buttons from
+    // this, so guessing here is how it came to offer moves the contract
+    // refuses. Falls back to the projection only when the record states none.
+    let canonicalState: CanonicalState | null = null;
+
     // Enrich with outputs from the source JSON file (outputs are not synced to SQLite)
     if (task.source_file && fs.existsSync(task.source_file)) {
       try {
         const raw = JSON.parse(fs.readFileSync(task.source_file, 'utf-8'));
         if (Array.isArray(raw.outputs)) {
           task.outputs = raw.outputs;
+        }
+        if (typeof raw.canonical_state === 'string' && raw.canonical_state) {
+          canonicalState = raw.canonical_state as CanonicalState;
         }
       } catch { /* non-fatal — outputs are optional */ }
     }
@@ -91,7 +103,7 @@ export async function GET(
         try {
           // Fetch payload + result + error for full task context
           const payloadRes = await fetch(
-            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error,version`,
+            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error,version,canonical_state`,
             { headers: sbHeaders, cache: 'no-store' },
           );
           if (payloadRes.ok) {
@@ -102,6 +114,9 @@ export async function GET(
             // expectedVersion, so a stale number here is a blind write.
             if (Number.isFinite(Number(rows[0]?.version))) {
               Object.assign(task, { version: Number(rows[0].version) });
+            }
+            if (typeof rows[0]?.canonical_state === 'string' && rows[0].canonical_state) {
+              canonicalState = rows[0].canonical_state as CanonicalState;
             }
             const rtId = payload.recurring_task_id;
             // Pass result + error through to the task object
@@ -141,6 +156,16 @@ export async function GET(
         } catch { /* non-fatal — recurring info is optional */ }
       }
     }
+
+    // The moves this record may actually make, derived from the contract and
+    // filtered to what PATCH can express. The client renders these rather than
+    // keeping a second table of buttons that can drift out of agreement.
+    const source = sourceForTaskId(id);
+    const from = canonicalState ?? toCanonical(source, task.status);
+    Object.assign(task, {
+      canonicalState: from,
+      offeredActions: offeredActions(source, from),
+    });
 
     return Response.json(task);
   } catch (err) {

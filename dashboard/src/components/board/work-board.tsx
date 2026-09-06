@@ -14,6 +14,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Badge } from '@/components/ui/badge';
 import {
   BOARD_COLUMNS,
@@ -50,6 +51,7 @@ export function WorkBoard({
   degraded?: boolean;
   initialTaskId?: string | null;
 }) {
+  const router = useRouter();
   const [rows, setRows] = useState(tasks);
   const [waitingFilter, setWaitingFilter] = useState<WaitingSubtype | null>(null);
   const [search, setSearch] = useState('');
@@ -115,6 +117,22 @@ export function WorkBoard({
         return;
       }
 
+      // OS-02 optimistic concurrency. The board must echo back the version it
+      // rendered, so a change made underneath it comes back as a 409 instead of
+      // silently overwriting whoever got there first. A card whose version is
+      // unknown fails CLOSED: omitting the field is exactly the blind write
+      // this exists to prevent.
+      if (card.version === null) {
+        const message =
+          'This card was read without a version, so the move was not sent — '
+          + 'sending it could overwrite a change made since the board loaded. '
+          + 'Refresh the board and try again.';
+        setSave({ kind: 'error', taskId, message });
+        setAnnouncement(message);
+        router.refresh();
+        return;
+      }
+
       const previous = rows;
       // Optimistic: project the row onto the target lane locally, using the
       // native word the owning store would accept, so the board responds at
@@ -140,7 +158,8 @@ export function WorkBoard({
         const res = await fetch(`/api/tasks/${taskId}/transition`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ to, ...(submission ?? {}) }),
+          // expectedVersion goes LAST so no submission field can displace it.
+          body: JSON.stringify({ to, ...(submission ?? {}), expectedVersion: card.version }),
         });
         const data = await res.json().catch(() => ({}));
 
@@ -153,6 +172,10 @@ export function WorkBoard({
             current.map((t) =>
               t.id === taskId
                 ? { ...t, status: data.nativeStatus ?? t.status,
+                    // The version the store now holds. Without this the NEXT
+                    // move from this board would carry a stale number and be
+                    // refused as a conflict it did not cause.
+                    version: typeof data.version === 'number' ? data.version : t.version,
                     projection: { ...t.projection, status: data.nativeStatus ?? t.projection.status } }
                 : t,
             ),
@@ -190,6 +213,10 @@ export function WorkBoard({
         setLegacyPrompt(null);
         setSave({ kind: 'error', taskId, message });
         setAnnouncement(message);
+        // A conflict means the board is out of date. Pull the server's rows so
+        // the person is looking at what actually happened, not at the stale
+        // view that produced the conflict.
+        if (res.status === 409) router.refresh();
       } catch {
         setRows(previous);
         const message = 'Could not reach the server. This card was not moved.';
@@ -197,7 +224,7 @@ export function WorkBoard({
         setAnnouncement(message);
       }
     },
-    [cardById, rows],
+    [cardById, rows, router],
   );
 
   // -------------------------------------------------------------------------

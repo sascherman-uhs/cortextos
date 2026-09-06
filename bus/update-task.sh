@@ -2,6 +2,7 @@
 # update-task.sh — wrapper for Node.js CLI
 # Usage: update-task.sh <id> <status> [note] [blocked_by] [--origin interactive|writer]
 #                       [--canonical <state>] [--fields <json>] [--grandfather <json>]
+#                       [--expected-version <n>]
 #
 # --origin is forwarded to the CLI so a caller acting for a human at a UI can
 # say so: interactive transitions are contract-ENFORCED regardless of the
@@ -26,7 +27,7 @@ ID="${1:-}"
 STATUS="${2:-}"
 
 if [[ -z "$ID" || -z "$STATUS" ]]; then
-  echo "Usage: update-task.sh <id> <status> [note] [blocked_by] [--origin interactive|writer] [--canonical <state>] [--fields <json>] [--grandfather <json>]" >&2
+  echo "Usage: update-task.sh <id> <status> [note] [blocked_by] [--origin interactive|writer] [--canonical <state>] [--fields <json>] [--grandfather <json>] [--expected-version <n>]" >&2
   exit 1
 fi
 
@@ -38,12 +39,12 @@ FLAG_ARGS=()
 shift 2 || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --origin|--fields|--grandfather|--canonical|--actor)
+    --origin|--fields|--grandfather|--canonical|--actor|--expected-version)
       [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 1; }
       FLAG_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --origin=*|--fields=*|--grandfather=*|--canonical=*|--actor=*)
+    --origin=*|--fields=*|--grandfather=*|--canonical=*|--actor=*|--expected-version=*)
       FLAG_ARGS+=("${1%%=*}" "${1#*=}")
       shift
       ;;

@@ -33,45 +33,37 @@ import { DeliverablePreview } from '@/components/tasks/deliverable-preview';
 import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
 import { RecurringPanel } from '@/components/uhs/recurring-tasks-tab';
 import type { Task, TaskOutput, TaskStatus, TaskPriority } from '@/lib/types';
+import type { OfferedAction } from '@/lib/tasks/offered-actions';
+
+/** What the page reports back about a move it attempted on the sheet's behalf.
+ *  A refused move used to be swallowed by the page and rendered in a banner
+ *  BEHIND this sheet — inside the dialog's aria-hidden region, and off-screen
+ *  whenever the page was scrolled. The person clicked, nothing appeared to
+ *  happen, and the record had not moved. The refusal now comes back here and is
+ *  shown inside the sheet, where the click was. */
+export interface StatusChangeResult {
+  ok: boolean;
+  message?: string;
+}
 
 export interface TaskDetailSheetProps {
   task: Task | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onStatusChange: (taskId: string, status: TaskStatus, note?: string) => void;
+  onStatusChange: (
+    taskId: string,
+    status: TaskStatus,
+    note?: string,
+  ) => void | Promise<StatusChangeResult | void>;
   onDelete?: (taskId: string) => void;
   onEdit?: (taskId: string) => void;
 }
 
-const STATUS_TRANSITIONS: Record<TaskStatus, { label: string; status: TaskStatus; variant: 'default' | 'outline' | 'destructive' | 'secondary' }[]> = {
-  pending: [
-    { label: 'Start', status: 'in_progress', variant: 'default' },
-    { label: 'Complete', status: 'completed', variant: 'secondary' },
-    { label: 'Block', status: 'blocked', variant: 'destructive' },
-  ],
-  in_progress: [
-    { label: 'Complete', status: 'completed', variant: 'default' },
-    { label: 'Block', status: 'blocked', variant: 'destructive' },
-    { label: 'Back to Pending', status: 'pending', variant: 'outline' },
-  ],
-  blocked: [
-    { label: 'Unblock', status: 'in_progress', variant: 'default' },
-    { label: 'Back to Pending', status: 'pending', variant: 'outline' },
-  ],
-  completed: [
-    { label: 'Reopen', status: 'pending', variant: 'outline' },
-  ],
-  // OS-01 surfaced failed and cancelled work. Both were absent here, so a
-  // failed task offered no way forward at all. The server still validates
-  // every move against the work contract and explains any refusal.
-  failed: [
-    { label: 'Retry', status: 'pending', variant: 'default' },
-    { label: 'Cancel', status: 'cancelled', variant: 'outline' },
-  ],
-  cancelled: [
-    { label: 'Reopen', status: 'pending', variant: 'outline' },
-  ],
-};
+// The button table that used to live here is gone. It was keyed on native
+// status, drifted from the work contract, and for failed work every move it
+// offered was illegal while the one legal move was offered nowhere. The server
+// now derives the moves from the contract and the record's own canonical
+// state, and this component renders what it is given.
 
 function getOutputIcon(filePath: string) {
   const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
@@ -100,6 +92,11 @@ export function TaskDetailSheet({
   const [editAssignee, setEditAssignee] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** The moves the contract permits for THIS record, as the server derived
+   *  them. `null` until the record has been read — the sheet says so rather
+   *  than guessing, because a guess is what produced buttons that could not
+   *  work. */
+  const [actions, setActions] = useState<OfferedAction[] | null>(null);
 
   // Deliverables state
   const [outputs, setOutputs] = useState<TaskOutput[]>([]);
@@ -124,6 +121,7 @@ export function TaskDetailSheet({
       if (res.ok) {
         const data = await res.json();
         setOutputs(Array.isArray(data.outputs) ? data.outputs : []);
+        setActions(Array.isArray(data.offeredActions) ? data.offeredActions : []);
         // UHS MOD #7 — populate result/error if present
         setSupaResult(data.supaResult ?? null);
         setSupaError(data.supaError ?? null);
@@ -156,6 +154,7 @@ export function TaskDetailSheet({
       fetchTaskOutputs(task.id, task.org);
     } else {
       setOutputs([]);
+      setActions(null);
       setPreviewOutput(null);
       setRecurringInfo(null); // UHS MOD #7
       setSupaResult(null);    // UHS MOD #7
@@ -164,8 +163,6 @@ export function TaskDetailSheet({
   }, [open, task?.id, task?.org, fetchTaskOutputs, task]);
 
   if (!task) return null;
-
-  const transitions = STATUS_TRANSITIONS[task.status] ?? [];
 
   function startEditing() {
     setEditTitle(task!.title);
@@ -179,6 +176,16 @@ export function TaskDetailSheet({
   async function saveEdit() {
     if (!task || !editTitle.trim()) {
       setError('Title is required');
+      return;
+    }
+    // OS-02: an edit is a versioned write like any other. If the record
+    // reached this form without a version, refuse rather than post blind.
+    const editVersion = (task as unknown as { version?: number }).version;
+    if (typeof editVersion !== 'number') {
+      setError(
+        'This record was loaded without a version, so the edit was not sent — '
+        + 'saving it could overwrite a change made since it was opened. Close and reopen the task.',
+      );
       return;
     }
     setSaving(true);
@@ -195,7 +202,7 @@ export function TaskDetailSheet({
           // OS-02: the version this form was populated from. If an agent moved
           // the task while the drawer was open, the save is refused rather than
           // overwriting whatever the agent recorded.
-          expectedVersion: (task as unknown as { version?: number }).version,
+          expectedVersion: editVersion,
         }),
       });
       if (res.ok) {
@@ -221,7 +228,13 @@ export function TaskDetailSheet({
     setUpdating(true);
     setError(null);
     try {
-      await onStatusChange(task.id, newStatus, note.trim() || undefined);
+      const result = await onStatusChange(task.id, newStatus, note.trim() || undefined);
+      // A move the server refused is stated here, in the sheet the person is
+      // looking at. Only a move that actually took clears the note.
+      if (result && result.ok === false) {
+        setError(result.message ?? 'This move was refused. The task was not changed.');
+        return;
+      }
       setNote('');
     } catch {
       setError('Failed to update status');
@@ -258,10 +271,24 @@ export function TaskDetailSheet({
           </SheetDescription>
         </SheetHeader>
 
-        {/* Error banner */}
+        {/* Error banner. role=alert so a refusal is announced, not merely
+            coloured, and dismissible so it does not sit over the record. */}
         {error && (
-          <div className="mx-4 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {error}
+          <div
+            role="alert"
+            aria-live="assertive"
+            data-testid="task-sheet-error"
+            className="mx-4 flex items-start justify-between gap-3 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          >
+            <span>{error}</span>
+            <button
+              type="button"
+              onClick={() => setError(null)}
+              className="shrink-0 underline underline-offset-2"
+              aria-label="Dismiss"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
@@ -510,17 +537,28 @@ export function TaskDetailSheet({
         {!editing && (
           <SheetFooter>
             <div className="flex flex-wrap items-center gap-2 w-full">
-              {transitions.map((t) => (
-                <Button
-                  key={t.status}
-                  variant={t.variant}
-                  size="sm"
-                  disabled={updating || deleting}
-                  onClick={() => handleStatusChange(t.status)}
-                >
-                  {t.label}
-                </Button>
-              ))}
+              {actions === null ? (
+                <span className="text-xs text-muted-foreground" data-testid="task-actions-loading">
+                  Reading the moves this task allows…
+                </span>
+              ) : actions.length === 0 ? (
+                <span className="text-xs text-muted-foreground" data-testid="task-actions-none">
+                  Nothing moves out of this state — it is a final outcome.
+                </span>
+              ) : (
+                actions.map((a) => (
+                  <Button
+                    key={a.to}
+                    variant={a.variant}
+                    size="sm"
+                    title={a.meaning}
+                    disabled={updating || deleting}
+                    onClick={() => handleStatusChange(a.status as TaskStatus)}
+                  >
+                    {a.label}
+                  </Button>
+                ))
+              )}
               <div className="ml-auto">
                 {confirmDelete ? (
                   <div className="flex items-center gap-1">
