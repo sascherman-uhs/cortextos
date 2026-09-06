@@ -106,16 +106,77 @@ describe('the task itself', () => {
     expect(transitionTask).not.toHaveBeenCalled();
   });
 
-  it('refuses an illegal transition and names the legal ones', async () => {
-    // pending projects onto backlog; backlog cannot go straight to doing.
+  it('sends Start on a backlog card through, to be answered by the Ready gate', async () => {
+    // fix5: this used to be refused here with "backlog → doing is not a
+    // permitted transition", which is what a person saw when they clicked Start
+    // on a real task. Start is a request to go THROUGH Ready; the route routes
+    // it and the owning store answers with what the record is actually missing.
     getTaskById.mockReturnValue(cachedTask('pending'));
+    transitionTask.mockResolvedValue({ ok: true, canonicalState: 'doing', nativeStatus: 'in_progress' });
     const res = await POST(req({ to: 'doing' }), ctx());
+    expect(res.status).toBe(200);
+    expect(transitionTask).toHaveBeenCalledWith(expect.objectContaining({ to: 'doing', fromNativeStatus: 'pending' }));
+  });
+
+  it('still refuses a move with no route at all, and names the legal ones', async () => {
+    getTaskById.mockReturnValue(cachedTask('pending'));
+    const res = await POST(req({ to: 'verify' }), ctx());
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toBe('illegal_transition');
-    expect(body.reason).toContain('backlog → doing is not a permitted transition');
     expect(body.allowed).toContain('ready');
     expect(transitionTask).not.toHaveBeenCalled();
+  });
+
+  describe('the legacy path', () => {
+    it('passes the fields a person supplied inline to the owning store', async () => {
+      getTaskById.mockReturnValue(cachedTask('pending'));
+      transitionTask.mockResolvedValue({ ok: true, canonicalState: 'doing', nativeStatus: 'in_progress' });
+      await POST(
+        req({
+          to: 'doing',
+          fields: { outcome: 'Contract renewed', acceptanceCriteria: ['signed PDF filed', '  '] },
+        }),
+        ctx(),
+      );
+      expect(transitionTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fields: expect.objectContaining({
+            outcome: 'Contract renewed',
+            acceptanceCriteria: ['signed PDF filed'],
+          }),
+        }),
+      );
+    });
+
+    it('refuses to record a waiver when it cannot name the person', async () => {
+      // No session in this environment, so the actor would be 'dashboard' — a
+      // program, not a person. A waiver signed by a program is not a decision.
+      getTaskById.mockReturnValue(cachedTask('pending'));
+      const res = await POST(req({ to: 'doing', grandfather: { reason: 'legacy row' } }), ctx());
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('grandfather_needs_a_person');
+      expect(transitionTask).not.toHaveBeenCalled();
+    });
+
+    it('relays a refusal with what is missing so the board can offer the form', async () => {
+      getTaskById.mockReturnValue(cachedTask('pending'));
+      transitionTask.mockResolvedValue({
+        ok: false, status: 422, error: 'contract_violation',
+        message: 'This task is missing acceptance_criteria.',
+        violation: 'missing_acceptance_criteria',
+        legalTransitions: ['ready'],
+        missing: ['acceptance_criteria'],
+        legacy: true, waivable: true,
+        remedies: ['supply_fields', 'grandfather'],
+      });
+      const res = await POST(req({ to: 'doing' }), ctx());
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(body.missing).toEqual(['acceptance_criteria']);
+      expect(body.waivable).toBe(true);
+      expect(body.remedies).toEqual(['supply_fields', 'grandfather']);
+    });
   });
 
   it('refuses to move out of a terminal state', async () => {

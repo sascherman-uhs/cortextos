@@ -21,7 +21,7 @@
 import { NextRequest } from 'next/server';
 import { getTaskById } from '@/lib/data/tasks';
 import { transitionTask } from '@/lib/task-transition';
-import { auth } from '@/lib/auth';
+import { signedInActor } from '@/lib/actor';
 import {
   loadTransitionContract,
   resolveInteractivePath,
@@ -46,14 +46,6 @@ const BOARD_FORBIDDEN: Partial<Record<CanonicalState, string>> = {
 
 function isValidId(id: string): boolean {
   return /^[a-zA-Z0-9_-]+$/.test(id);
-}
-
-/** A person's name reduced to something safe to record as an actor. Returns
- *  undefined when there is nothing usable, so the caller can refuse. */
-function sanitizeActor(name: unknown): string | undefined {
-  if (typeof name !== 'string') return undefined;
-  const cleaned = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
-  return cleaned.length > 0 ? cleaned.slice(0, 64) : undefined;
 }
 
 const MAX_CRITERIA = 20;
@@ -166,8 +158,7 @@ export async function POST(
 
   // Who is doing this. A waiver has to name a person, and 'dashboard' names a
   // program. Never taken from the request body.
-  const session = await auth().catch(() => null);
-  const actor = sanitizeActor(session?.user?.name) ?? 'dashboard';
+  const actor = (await signedInActor()) ?? 'dashboard';
 
   const fields = parseFields(body.fields);
   const grandfather = parseGrandfather(body.grandfather, actor);

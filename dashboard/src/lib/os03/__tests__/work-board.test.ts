@@ -180,8 +180,25 @@ describe('moves', () => {
     expect(moveTargets({ state: 'verify', source: 'jarvis_tasks' })).not.toContain('done');
   });
 
-  it('refuses an illegal transition and says which moves ARE legal', () => {
+  it('lets Start on a backlog card through, and names the gate it must pass', () => {
+    // fix5: this used to be refused outright, which is how enforcement made the
+    // board worse than the bug it replaced — a person clicking Start on real
+    // work was told only that the move was not in the contract. Start is a
+    // request to go THROUGH Ready, the way Complete goes through Verify, so it
+    // is sent and the Ready gate answers it with what is actually missing.
     const check = checkMove(backlog, 'doing');
+    expect(check.allowed).toBe(true);
+    expect(check.serverWillCheck.join(' ')).toContain('acceptance_criteria');
+  });
+
+  it('still refuses a transition with no route at all, and says which moves ARE legal', () => {
+    const check = checkMove(backlog, 'done');
+    expect(check.allowed).toBe(false);
+    expect(check.reason).toContain('cannot be dragged to Done');
+  });
+
+  it('refuses a move whose route does not exist in the state graph', () => {
+    const check = checkMove(backlog, 'verify');
     expect(check.allowed).toBe(false);
     expect(check.reason).toContain('not a permitted transition');
     expect(check.reason).toContain('Ready');
