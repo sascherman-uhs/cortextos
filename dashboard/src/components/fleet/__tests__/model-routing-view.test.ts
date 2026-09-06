@@ -13,6 +13,10 @@ import {
   describeActivation,
   describeCostChange,
   describeDesiredVsRunning,
+  describeOperationChange,
+  describeRevertControl,
+  describeRevertability,
+  summarizeOperations,
   describeEffectiveSource,
   describeReceipt,
   describeReceiptOutcome,
@@ -407,5 +411,233 @@ describe('legacy pins in the switch preview', () => {
   it('flags a single-agent pin preview when that agent carries a legacy pin', () => {
     expect(previewAgentPin(summary, 'vera', 'haiku').legacyPinnedAgents).toEqual(['vera']);
     expect(previewAgentPin(summary, 'jarvis-heartbeat', 'haiku').legacyPinnedAgents).toEqual([]);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Defect K — a durable operation history that survives a reload
+// ---------------------------------------------------------------------------
+
+/** The journal exactly as the core writes it: one file per state of one
+ *  operation, newest file first out of listEvents(). */
+function switchEvents(id = 'op_1', at = '2026-09-05T10:00') {
+  return [
+    {
+      operation_id: id, state: 'applied', kind: 'switch', actor: 'scott',
+      reason: 'move dispatcher to premium', at: `${at}:04Z`, registry_revision: 5,
+      detail: {
+        restart_results: [
+          { agent: 'jarvis-orchestrator', ok: true },
+          { agent: 'jarvis-heartbeat', ok: false, detail: 'restart timed out' },
+        ],
+      },
+    },
+    {
+      operation_id: id, state: 'desired_written', kind: 'switch', actor: 'scott',
+      reason: 'move dispatcher to premium', at: `${at}:02Z`, registry_revision: 5,
+      detail: {
+        from: { role: 'dispatcher', tier: 'standard', cleared_pins: [] },
+        to: { role: 'dispatcher', tier: 'premium', cleared_pins: [] },
+      },
+    },
+    {
+      operation_id: id, state: 'validated', kind: 'switch', actor: 'scott',
+      reason: 'move dispatcher to premium', at: `${at}:01Z`, registry_revision: 4,
+      detail: { affected_consumers: ['jarvis-orchestrator', 'jarvis-heartbeat'] },
+    },
+    {
+      operation_id: id, state: 'requested', kind: 'switch', actor: 'scott',
+      reason: 'move dispatcher to premium', at: `${at}:00Z`, registry_revision: 4,
+      detail: { op: { kind: 'switch', role: 'dispatcher', tier: 'premium' } },
+    },
+  ];
+}
+
+describe('operation history', () => {
+  it('rebuilds a finished operation from the journal, with its id and Revert', () => {
+    // The defect: after a reload the operator saw zero receipts, zero operation
+    // ids and no way back except `cortextos model revert` in a terminal. The
+    // events were already on the wire and were being thrown away.
+    const { operations, total } = summarizeOperations(switchEvents());
+    expect(total).toBe(1);
+
+    const [op] = operations;
+    expect(op.operationId).toBe('op_1');
+    expect(op.kind).toBe('switch');
+    expect(op.actor).toBe('scott');
+    expect(op.reason).toBe('move dispatcher to premium');
+    expect(op.at).toBe('2026-09-05T10:00:04Z');
+    expect(op.state).toBe('applied');
+    expect(op.registryRevision).toBe(5);
+    expect(op.change).toBe('role dispatcher: tier standard → premium');
+    expect(op.affectedAgents).toEqual(['jarvis-orchestrator', 'jarvis-heartbeat']);
+    expect(op.restarts).toEqual([
+      { agent: 'jarvis-orchestrator', ok: true },
+      { agent: 'jarvis-heartbeat', ok: false, message: 'restart timed out' },
+    ]);
+    expect(op.revertible).toBe(true);
+    expect(op.revertBlockedReason).toBeNull();
+  });
+
+  it('groups many events into operations, newest first', () => {
+    const events = [
+      ...switchEvents('op_2', '2026-09-05T12:00'),
+      ...switchEvents('op_1', '2026-09-05T10:00'),
+    ];
+    const { operations, total } = summarizeOperations(events);
+    expect(total).toBe(2);
+    expect(operations.map((o) => o.operationId)).toEqual(['op_2', 'op_1']);
+  });
+
+  it('reports the final state, not whichever event came first in the list', () => {
+    const events = [...switchEvents()].reverse();
+    expect(summarizeOperations(events).operations[0].state).toBe('applied');
+  });
+
+  it('caps what it renders and says how much it is not showing', () => {
+    const events = Array.from({ length: 12 }, (_, i) =>
+      switchEvents(`op_${i}`, `2026-09-05T${String(10 + i).padStart(2, '0')}:00`),
+    ).flat();
+    const { operations, total } = summarizeOperations(events, 8);
+    expect(total).toBe(12);
+    expect(operations).toHaveLength(8);
+    // The newest eight, not an arbitrary eight.
+    expect(operations[0].operationId).toBe('op_11');
+  });
+
+  it('offers no Revert on an operation that never changed the registry', () => {
+    const failed = [
+      {
+        operation_id: 'op_x', state: 'failed', kind: 'switch', actor: 'scott',
+        reason: 'bad tier', at: '2026-09-05T10:00:01Z', registry_revision: 4,
+        detail: { error: 'Tier "empty" is empty' },
+      },
+    ];
+    const [op] = summarizeOperations(failed).operations;
+    expect(op.revertible).toBe(false);
+    expect(op.revertBlockedReason).toMatch(/stopped before the registry changed/);
+  });
+
+  it('marks an operation that a later revert already undid', () => {
+    const events = [
+      {
+        operation_id: 'op_2', state: 'applied', kind: 'revert', actor: 'scott',
+        reason: 'put it back', at: '2026-09-05T11:00:02Z', registry_revision: 6,
+        detail: { restart_results: [] },
+      },
+      {
+        operation_id: 'op_2', state: 'desired_written', kind: 'revert', actor: 'scott',
+        reason: 'put it back', at: '2026-09-05T11:00:01Z', registry_revision: 6,
+        detail: {
+          from: { role: 'dispatcher', tier: 'premium' },
+          to: { role: 'dispatcher', tier: 'standard' },
+        },
+      },
+      {
+        operation_id: 'op_2', state: 'requested', kind: 'revert', actor: 'scott',
+        reason: 'put it back', at: '2026-09-05T11:00:00Z', registry_revision: 5,
+        detail: { op: { kind: 'revert', operation_id: 'op_1' } },
+      },
+      ...switchEvents('op_1'),
+    ];
+    const { operations } = summarizeOperations(events);
+    const original = operations.find((o) => o.operationId === 'op_1')!;
+    const revert = operations.find((o) => o.operationId === 'op_2')!;
+
+    // Offering Revert on an already-reverted operation would re-apply the
+    // change under a label that says the opposite.
+    expect(original.revertible).toBe(false);
+    expect(original.revertBlockedReason).toBe('Already reverted by op_2.');
+    expect(original.revertedBy).toBe('op_2');
+    expect(revert.revertOf).toBe('op_1');
+  });
+
+  it('survives a journal with junk, missing fields and unknown states', () => {
+    const { operations, total } = summarizeOperations([
+      null,
+      'not an event',
+      { state: 'applied' }, // no operation_id — cannot be addressed, so dropped
+      { operation_id: 'op_9', state: 'weird', at: '2026-09-05T09:00:00Z' },
+    ]);
+    expect(total).toBe(1);
+    expect(operations[0].operationId).toBe('op_9');
+    expect(operations[0].state).toBe('requested');
+    expect(operations[0].actor).toBe('unknown');
+    expect(operations[0].change).toBeNull();
+  });
+
+  it('handles an empty or absent journal without inventing history', () => {
+    expect(summarizeOperations([])).toEqual({ operations: [], total: 0 });
+    expect(summarizeOperations(null)).toEqual({ operations: [], total: 0 });
+    expect(summarizeOperations(undefined)).toEqual({ operations: [], total: 0 });
+  });
+
+  it('describes pin, unpin and activation changes in the operator\'s words', () => {
+    expect(describeOperationChange(
+      { target_agent: 'vera', pin: null },
+      { target_agent: 'vera', pin: { entry_id: 'opus' } },
+    )).toBe('vera: pin no pin → opus');
+    expect(describeOperationChange(
+      { target_agent: 'vera', pin: { entry_id: 'opus' } },
+      { target_agent: 'vera', pin: null },
+    )).toBe('vera: pin opus → no pin');
+    expect(describeOperationChange({ org_default: 'shadow' }, { org_default: 'enforced' }))
+      .toBe('org activation shadow → enforced');
+    expect(describeOperationChange({ consumer: 'vera', mode: 'shadow' }, { consumer: 'vera', mode: 'enforced' }))
+      .toBe('vera: activation shadow → enforced');
+    expect(describeOperationChange(null, null)).toBeNull();
+  });
+
+  it('counts the pins a switch cleared, because that is what moved those agents', () => {
+    expect(describeOperationChange(
+      { role: 'builder', tier: 'economy', cleared_pins: [{ agent: 'trillion-coder', pin: { entry_id: 'sonnet' } }] },
+      { role: 'builder', tier: 'standard', cleared_pins: ['trillion-coder'] },
+    )).toBe('role builder: tier economy → standard (cleared 1 pin)');
+  });
+
+  it('refuses to offer Revert on a pin recorded before target_agent existed', () => {
+    // The core throws for exactly this shape; the UI must not offer a button
+    // that is guaranteed to fail.
+    const out = describeRevertability('applied', { entry_id: 'opus' }, true);
+    expect(out.revertible).toBe(false);
+    expect(out.reason).toMatch(/predates target_agent/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect L — the post-operation refresh is not the operation
+// ---------------------------------------------------------------------------
+
+describe('the Revert control during the post-operation refresh', () => {
+  const base = { canRevert: true, submitting: false, refreshing: false, mutable: true, reason: 'undo it' };
+
+  it('is live as soon as the receipt is final, even while the panel refreshes', () => {
+    // The defect: `submitting` stayed true across the ~3s refresh, so Revert
+    // sat disabled with nothing explaining why and a verifier called it broken.
+    const out = describeRevertControl({ ...base, refreshing: true });
+    expect(out.disabled).toBe(false);
+    expect(out.note).toMatch(/already finished/);
+  });
+
+  it('says nothing when there is nothing to say', () => {
+    expect(describeRevertControl(base)).toEqual({ disabled: false, note: null });
+  });
+
+  it('still refuses while another routing operation is actually in flight', () => {
+    const out = describeRevertControl({ ...base, submitting: true });
+    expect(out.disabled).toBe(true);
+    expect(out.note).toMatch(/still running/);
+  });
+
+  it('refuses without a reason, and on a read-only backend', () => {
+    expect(describeRevertControl({ ...base, reason: '   ' }).disabled).toBe(true);
+    expect(describeRevertControl({ ...base, mutable: false })).toEqual({
+      disabled: true, note: 'This routing backend is read-only.',
+    });
+  });
+
+  it('refuses on a receipt that never reached the registry', () => {
+    expect(describeRevertControl({ ...base, canRevert: false }).disabled).toBe(true);
   });
 });

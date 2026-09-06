@@ -34,9 +34,12 @@ import {
   describeDesiredVsRunning,
   describeReceipt,
   describeReceiptOutcome,
+  describeRevertControl,
   humanizeRoutingError,
   isLegacyPin,
+  summarizeOperations,
   RECEIPT_STATE_ORDER,
+  type OperationSummary,
 } from './model-routing-view';
 import type { Receipt, RegistrySummary, Resolution, RoutingAttempt } from '@/lib/model-routing';
 
@@ -68,6 +71,18 @@ interface RoutingIndex {
 }
 
 const ATTEMPT_LIMIT = 5;
+/** Journal entries pulled per load. An operation writes 3–6 of them, so this is
+ *  roughly the last 20 operations. The route caps the parameter at 200. */
+const EVENT_LIMIT = 100;
+/** Operations rendered before "Show all". A history nobody can read is not a
+ *  history — this is a list of receipts, not a dump of the journal. */
+const HISTORY_PAGE = 8;
+
+function formatWhen(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
 
 export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
   const [index, setIndex] = useState<RoutingIndex>({
@@ -85,11 +100,23 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const [receiptError, setReceiptError] = useState<string | null>(null);
   const [revertReason, setRevertReason] = useState('');
+  // Defect L: the post-operation refresh is not the operation. Holding
+  // `submitting` true across it left Revert disabled for ~3s with nothing on
+  // screen saying why, and a verifier read that as a broken button.
+  const [refreshing, setRefreshing] = useState(false);
+  // Defect K: the journal the page already fetches, kept instead of discarded.
+  const [events, setEvents] = useState<unknown[]>([]);
+  // Open by default: the point of the fix is that the way back is VISIBLE after
+  // a reload, not one click away behind a collapsed panel.
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [showAllHistory, setShowAllHistory] = useState(false);
+  /** The past operation whose revert reason is being edited, and its text. */
+  const [historyRevert, setHistoryRevert] = useState<{ operationId: string; reason: string } | null>(null);
 
   const loadIndex = useCallback(async () => {
     setIndex((p) => ({ ...p, loading: true }));
     try {
-      const res = await fetch('/api/model-routing', { cache: 'no-store' });
+      const res = await fetch(`/api/model-routing?limit=${EVENT_LIMIT}`, { cache: 'no-store' });
       const body = await res.json();
       if (!res.ok) {
         setIndex({
@@ -101,6 +128,9 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
         });
         return;
       }
+      // The operation journal comes back on this same request. Dropping it is
+      // what made every past change un-undoable after a reload.
+      setEvents(Array.isArray(body.events) ? body.events : []);
       setIndex({ summary: body.registry, mutable: !!body.mutable, backend: body.backend, error: null, loading: false });
     } catch (e) {
       setIndex({ summary: null, mutable: false, backend: 'unknown', error: e instanceof Error ? e.message : 'request failed', loading: false });
@@ -236,7 +266,16 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
           setReceiptError(msg);
           return false;
         }
-        await refreshAll();
+        // The operation is over the moment its receipt is final. The refresh
+        // that follows is a read, and it must not keep the receipt's own
+        // controls disabled — it is reported separately instead (defect L).
+        setSubmitting(false);
+        setRefreshing(true);
+        try {
+          await refreshAll();
+        } finally {
+          setRefreshing(false);
+        }
         if (body.success === false) {
           // Blocked or failed: a real receipt, but not a change the operator
           // asked for. The panel above shows its state and reason.
@@ -282,6 +321,38 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
   const receiptDisplay = describeReceipt(receipt);
   const outcome = describeReceiptOutcome(receipt);
   const dialogRow = dialogAgent ? rows[dialogAgent] : undefined;
+  const busy = submitting || refreshing;
+  const revertControl = describeRevertControl({
+    canRevert: receiptDisplay?.canRevert === true,
+    submitting,
+    refreshing,
+    mutable: index.mutable,
+    reason: revertReason,
+  });
+
+  // Defect K: the durable history. Derived from the journal the page already
+  // fetches, so it survives a reload — which is the whole point.
+  const history = useMemo(
+    () => summarizeOperations(events, showAllHistory ? Number.MAX_SAFE_INTEGER : HISTORY_PAGE),
+    [events, showAllHistory],
+  );
+
+  const revertFromHistory = useCallback(
+    async (op: OperationSummary, reason: string) => {
+      // The same validated path the in-session receipt uses. A revert is an
+      // operation: it is validated, it writes a receipt, and it restarts what
+      // it moves. Nothing here reaches around the routing service.
+      const target = op.affectedAgents[0] ?? rowAgents[0];
+      if (!target) return;
+      const ok = await patchRouting(target, {
+        action: 'revert',
+        operation_id: op.operationId,
+        reason,
+      });
+      if (ok) setHistoryRevert(null);
+    },
+    [patchRouting, rowAgents],
+  );
 
   // Prefill the revert reason from whichever receipt is on screen, and let the
   // operator replace it — a revert is an operator decision that gets recorded.
@@ -302,8 +373,8 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
             {index.mutable ? '' : ' · read-only'}
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={() => void refreshAll()} disabled={index.loading}>
-          {index.loading ? 'Refreshing…' : 'Refresh'}
+        <Button variant="outline" size="sm" onClick={() => void refreshAll()} disabled={index.loading || refreshing}>
+          {index.loading || refreshing ? 'Refreshing…' : 'Refresh'}
         </Button>
       </div>
 
@@ -361,11 +432,11 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
             </div>
           )}
 
-          <div className="mt-2 flex gap-2">
+          <div className="mt-2 flex flex-wrap items-center gap-2">
             <Button
               size="xs"
               variant="outline"
-              disabled={!receiptDisplay.canRevert || submitting || !index.mutable || revertReason.trim().length === 0}
+              disabled={revertControl.disabled}
               onClick={() =>
                 void patchRouting(receipt.affected_consumers?.[0] ?? rowAgents[0], {
                   action: 'revert',
@@ -379,6 +450,11 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
             <Button size="xs" variant="ghost" onClick={() => setReceipt(null)}>
               Dismiss
             </Button>
+            {revertControl.note && (
+              <span className="text-muted-foreground" aria-live="polite">
+                {revertControl.note}
+              </span>
+            )}
           </div>
           {receiptError && <p className="mt-1 text-destructive">{receiptError}</p>}
         </div>
@@ -471,7 +547,7 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
                           <Button
                             size="xs"
                             variant="ghost"
-                            disabled={submitting || !index.mutable}
+                            disabled={busy || !index.mutable}
                             onClick={() =>
                               void patchRouting(agent, {
                                 action: 'unpin',
@@ -542,6 +618,157 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
         </table>
       </div>
 
+      {/* Operation history — durable, so a reload does not erase the way back.
+          Everything here comes from the routing journal, not from memory. */}
+      <section aria-labelledby="routing-history-heading" className="rounded-lg border border-border">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+          <h3 id="routing-history-heading" className="text-sm font-medium">
+            Operation history
+            <span className="ml-2 text-xs font-normal text-muted-foreground">
+              {history.total === 0
+                ? 'no routing operations recorded yet'
+                : `${history.total} operation${history.total === 1 ? '' : 's'} recorded`}
+            </span>
+          </h3>
+          <Button
+            size="xs"
+            variant="ghost"
+            aria-expanded={historyOpen}
+            aria-controls="routing-history-body"
+            onClick={() => setHistoryOpen((o) => !o)}
+          >
+            {historyOpen ? 'Hide history' : 'Show history'}
+          </Button>
+        </div>
+
+        {historyOpen && (
+          <div id="routing-history-body" className="border-t border-border px-3 py-2">
+            {history.operations.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                {index.error
+                  ? 'The routing journal could not be read while the service is unavailable.'
+                  : 'No routing operations have been recorded for this registry yet.'}
+              </p>
+            )}
+
+            <ol className="space-y-2">
+              {history.operations.map((op) => {
+                const editing = historyRevert?.operationId === op.operationId;
+                const failedRestarts = op.restarts.filter((r) => !r.ok);
+                return (
+                  <li key={op.operationId} className="rounded-lg border border-border/60 p-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge
+                        variant={
+                          op.display.applied ? 'default' : op.display.terminalFailure ? 'destructive' : 'outline'
+                        }
+                      >
+                        {op.display.label}
+                      </Badge>
+                      <span className="font-medium">{op.kind}</span>
+                      <span className="text-muted-foreground">{formatWhen(op.at)}</span>
+                      <span className="text-muted-foreground">by {op.actor}</span>
+                      {op.registryRevision !== null && (
+                        <span className="text-muted-foreground">rev {op.registryRevision}</span>
+                      )}
+                      <span className="font-mono text-[11px] text-muted-foreground">{op.operationId}</span>
+                    </div>
+
+                    {op.change && <p className="mt-1">{op.change}</p>}
+                    {op.reason && <p className="mt-1 text-muted-foreground">Reason: {op.reason}</p>}
+                    {op.revertOf && (
+                      <p className="mt-1 text-muted-foreground">
+                        Reverted <span className="font-mono">{op.revertOf}</span>.
+                      </p>
+                    )}
+                    {op.affectedAgents.length > 0 && (
+                      <p className="mt-1 text-muted-foreground">Affected: {op.affectedAgents.join(', ')}</p>
+                    )}
+                    {op.restarts.length > 0 && (
+                      <p className="mt-1 text-muted-foreground">
+                        Restarted {op.restarts.filter((r) => r.ok).length} of {op.restarts.length}
+                        {failedRestarts.length > 0 && (
+                          <span className="text-destructive">
+                            {' '}
+                            — failed: {failedRestarts.map((r) => r.agent).join(', ')}
+                          </span>
+                        )}
+                      </p>
+                    )}
+
+                    {editing ? (
+                      <div className="mt-2 space-y-1">
+                        <label htmlFor={`revert-reason-${op.operationId}`} className="block font-medium">
+                          Reason for reverting <span className="text-destructive">*</span>
+                        </label>
+                        <input
+                          id={`revert-reason-${op.operationId}`}
+                          value={historyRevert.reason}
+                          onChange={(e) =>
+                            setHistoryRevert({ operationId: op.operationId, reason: e.target.value })
+                          }
+                          className="w-full rounded-lg border border-border bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                          placeholder="Why is this being reverted? Recorded on the revert receipt."
+                        />
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            disabled={submitting || !index.mutable || historyRevert.reason.trim().length === 0}
+                            onClick={() => void revertFromHistory(op, historyRevert.reason.trim())}
+                          >
+                            Confirm revert
+                          </Button>
+                          <Button size="xs" variant="ghost" onClick={() => setHistoryRevert(null)}>
+                            Cancel
+                          </Button>
+                          {refreshing && (
+                            <span className="text-muted-foreground" aria-live="polite">
+                              Refreshing the registry…
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ) : op.revertible ? (
+                      <div className="mt-2">
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          disabled={submitting || !index.mutable}
+                          onClick={() =>
+                            setHistoryRevert({
+                              operationId: op.operationId,
+                              reason: `Revert of ${op.operationId} from the Fleet page`,
+                            })
+                          }
+                        >
+                          Revert
+                        </Button>
+                      </div>
+                    ) : (
+                      op.revertBlockedReason && (
+                        <p className="mt-2 text-muted-foreground">{op.revertBlockedReason}</p>
+                      )
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+
+            {history.total > history.operations.length && (
+              <Button size="xs" variant="ghost" className="mt-2" onClick={() => setShowAllHistory(true)}>
+                Show all {history.total} operations
+              </Button>
+            )}
+            {!index.mutable && history.operations.length > 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                This backend can only read the registry, so nothing here can be reverted from the dashboard.
+              </p>
+            )}
+          </div>
+        )}
+      </section>
+
       {unconfiguredAgents.length > 0 && (
         <p className="rounded-lg border border-dashed border-border px-2 py-1.5 text-xs text-muted-foreground">
           <span className="font-medium">Configuration missing:</span>{' '}
@@ -561,7 +788,7 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
           resolution={dialogRow?.resolution ?? null}
           summary={index.summary}
           mutable={index.mutable}
-          submitting={submitting}
+          submitting={busy}
           error={dialogError}
           onSubmit={(payload) => void onSubmitChange(dialogAgent, payload)}
         />
