@@ -62,7 +62,12 @@ function initializeSchema(db: Database.Database): void {
       updated_at TEXT,
       completed_at TEXT,
       notes TEXT,
-      source_file TEXT
+      source_file TEXT,
+      -- OS-02 optimistic concurrency, projected from the owning store's record
+      -- (the task JSON version field, or Supabase tasks.version). The board sends
+      -- it back as expectedVersion; without it every move is a blind write and
+      -- the 409 conflict path can never fire.
+      version INTEGER NOT NULL DEFAULT 1
     );
 
     -- OS-01 additive migration: per-source freshness for the degraded banner.
@@ -192,6 +197,30 @@ function initializeSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_org ON messages(org);
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
   `);
+
+  addMissingColumns(db);
+}
+
+/**
+ * Additive column migrations for databases created before a column existed.
+ * CREATE TABLE IF NOT EXISTS does nothing to an existing table, so a live
+ * dashboard would otherwise never gain `tasks.version` — and a missing version
+ * is exactly the silent failure this migration exists to end.
+ */
+function addMissingColumns(db: Database.Database): void {
+  const wanted: { table: string; column: string; ddl: string }[] = [
+    { table: 'tasks', column: 'version', ddl: 'ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 1' },
+  ];
+  for (const { table, column, ddl } of wanted) {
+    try {
+      const cols = db.pragma(`table_info(${table})`) as { name: string }[];
+      if (cols.some((c) => c.name === column)) continue;
+      db.exec(ddl);
+    } catch (err) {
+      // A concurrent process may have added it between the check and the ALTER.
+      if (!/duplicate column name/i.test(String(err))) throw err;
+    }
+  }
 }
 
 // globalThis singleton survives Next.js hot reload

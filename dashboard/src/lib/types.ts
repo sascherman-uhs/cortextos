@@ -85,6 +85,13 @@ export interface Task {
   notes?: string;
   source_file?: string;
   outputs?: TaskOutput[];
+  /** OS-02 optimistic concurrency. Echo it back as `expectedVersion` on a
+   *  write; a mismatch is a 409 carrying the current record, never a silent
+   *  overwrite. */
+  version?: number;
+  /** Which store owns this record — the canonical source identity the contract
+   *  and the transition service route on. */
+  source?: 'cortexos_tasks' | 'jarvis_tasks';
 }
 
 // -- Approval Types --
