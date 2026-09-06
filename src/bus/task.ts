@@ -14,7 +14,7 @@ import {
   LeaseHeldError,
   type TaskContractMeta,
 } from './task-store.js';
-import { toCanonical, toNative, guardTransition, checkTransition, effectiveMode, ContractViolation, type CanonicalState, type Evidence, type TransitionOrigin } from './task-contract.js';
+import { toCanonical, toNative, guardTransition, checkTransition, effectiveMode, ContractViolation, loadContract, missingContractFields, isLegacyItem, type CanonicalState, type Evidence, type GrandfatherRequest, type TransitionOrigin } from './task-contract.js';
 
 /**
  * Create a new task. Identical JSON format to bash create-task.sh.
@@ -113,6 +113,10 @@ export function createTask(
   // ordinary create-task call rather than only by a contract-aware caller.
   const contractFields: Record<string, unknown> = {
     version: 1,
+    // The marker that says this record was created UNDER the contract, so its
+    // required fields are enforced with no legacy path available. Structural,
+    // not chronological (see isLegacyItem in task-contract.ts).
+    contract_version: loadContract().contract_version,
     fence_token: 0,
     lease_owner: null,
     lease_expires_at: null,
@@ -356,6 +360,36 @@ export interface TransitionOptions {
    * origin fails closed rather than silently inheriting the writer's window.
    */
   origin?: TransitionOrigin;
+  /**
+   * Contract fields a human supplied at the boundary for a record that never
+   * had them. This is the UPGRADE path: the task stops being legacy, and every
+   * later transition is judged on the merits like any other. Written under the
+   * same lock as the transition and recorded as its own journal event.
+   */
+  fields?: {
+    outcome?: string;
+    acceptanceCriteria?: unknown[];
+    humanAccountableId?: string;
+    agentRoleId?: string;
+  };
+  /**
+   * A named human's explicit waiver of the fields a legacy record is missing.
+   * The FALLBACK path, used when the information genuinely is not available.
+   * Marks the task, so its completion gate can never read an empty acceptance
+   * list as "nothing to check".
+   */
+  grandfather?: GrandfatherRequest;
+  /**
+   * The canonical state this transition is really aiming at.
+   *
+   * Needed because the native vocabulary is coarser than the canonical one:
+   * `backlog` and `ready` are both `pending`, and `doing` and `verify` are both
+   * `in_progress`. Deriving the target from the native word alone would judge a
+   * backlog -> ready move as a no-op and skip the Ready gate entirely. Refused
+   * if it does not map back to the native status being written, so it can never
+   * be used to claim a state the store is not actually in.
+   */
+  canonicalState?: CanonicalState;
   /** Suppress the legacy `tasks/audit/` line for a step that a higher-level
    *  operation will log itself. The OS-02 event journal always records it; this
    *  only keeps the old audit log reading exactly as it did before, so existing
@@ -387,6 +421,10 @@ export function transitionTask(
 
   let produced!: { version: number; canonicalState: CanonicalState };
   let previousStatus: TaskStatus | undefined;
+  // Journal entries this transition earns beyond the status change itself.
+  // Filled inside the mutation and written under the same lock and version.
+  const journal: { event: string; payload?: Record<string, unknown> }[] = [];
+  let beforeMissing: string[] = [];
 
   const result = mutateTask(
     paths,
@@ -394,26 +432,76 @@ export function transitionTask(
     taskId,
     {
       actor: options.actor ?? 'unknown',
-      event: `status:${status}`,
+      event: options.canonicalState ? `status:${options.canonicalState}` : `status:${status}`,
       expectedVersion: options.expectedVersion,
       fenceToken: options.fenceToken,
+      canonicalState: options.canonicalState,
+      extraEvents: journal,
     },
     (task, meta) => {
       previousStatus = task.status as TaskStatus;
       const from = meta.canonical_state ?? toCanonical('cortexos_tasks', previousStatus);
-      const to = toCanonical('cortexos_tasks', status);
+      const to = options.canonicalState ?? toCanonical('cortexos_tasks', status);
+      if (options.canonicalState && toNative('cortexos_tasks', options.canonicalState) !== status) {
+        throw new Error(
+          `canonicalState ${options.canonicalState} does not map to native status '${status}'`,
+        );
+      }
+
+      // The upgrade path. Fields a human just supplied are applied BEFORE the
+      // contract is consulted, so the transition is judged on the record as it
+      // now stands rather than on the gap the person just closed. Stamping
+      // contract_version is what stops this task ever taking the legacy path
+      // again — the point of the upgrade path is that the system improves one
+      // touched task at a time.
+      beforeMissing = missingContractFields(contractItemFrom(task, meta));
+      const wasLegacy = isLegacyItem(contractItemFrom(task, meta));
+      const supplied = applyContractFields(task, options.fields);
+      if (supplied.length) {
+        task.contract_version = loadContract().contract_version;
+        journal.push({
+          event: 'legacy_upgraded',
+          payload: {
+            actor: options.actor ?? 'unknown',
+            supplied,
+            was_missing: beforeMissing,
+            was_legacy: wasLegacy,
+            from,
+            to,
+          },
+        });
+      }
 
       // Validate against the contract. In shadow mode this logs and returns;
       // in enforced mode it throws before anything is written.
-      guardTransition(
+      const result = guardTransition(
         'cortexos_tasks',
         from,
         to,
-        contractItemFrom(task, meta),
+        contractItemFrom(task, readMeta(task)),
         options.evidence ?? {},
-        { unsatisfied_dependencies: options.unsatisfiedDependencies },
+        {
+          unsatisfied_dependencies: options.unsatisfiedDependencies,
+          grandfather: options.grandfather,
+        },
         { origin: options.origin ?? 'writer' },
       );
+
+      // The fallback path. The waiver is a fact about this record from now on,
+      // not a one-off exemption that evaporates with the request.
+      if (result.grandfathered) {
+        task.legacy_grandfathered = true;
+        task.legacy_grandfather = {
+          actor: options.grandfather?.actor ?? options.actor ?? 'unknown',
+          reason: options.grandfather?.reason ?? '',
+          waived: result.waived ?? [],
+          was_missing: beforeMissing,
+          at: new Date().toISOString(),
+          from,
+          to,
+        };
+        journal.push({ event: 'legacy_grandfathered', payload: task.legacy_grandfather as Record<string, unknown> });
+      }
 
       task.status = status;
       if (options.evidence && Object.keys(options.evidence).length > 0) {
@@ -489,6 +577,49 @@ function markVerify(
   );
 }
 
+/**
+ * Write contract fields a human supplied onto the stored record.
+ *
+ * Only the fields the contract actually requires, and only ones with a value:
+ * this is the inline "fill in what is missing" form, not a general task editor,
+ * and it must not become a second way to rewrite a task's ownership by accident.
+ * Returns the names of what it wrote, for the journal.
+ */
+function applyContractFields(
+  task: Record<string, unknown>,
+  fields: {
+    outcome?: string;
+    acceptanceCriteria?: unknown[];
+    humanAccountableId?: string;
+    agentRoleId?: string;
+  } | undefined,
+): string[] {
+  if (!fields) return [];
+  const written: string[] = [];
+  if (typeof fields.outcome === 'string' && fields.outcome.trim()) {
+    task.outcome = fields.outcome.trim();
+    written.push('outcome');
+  }
+  if (Array.isArray(fields.acceptanceCriteria)) {
+    const criteria = fields.acceptanceCriteria
+      .map((c) => (typeof c === 'string' ? c.trim() : c))
+      .filter((c) => (typeof c === 'string' ? c.length > 0 : c != null));
+    if (criteria.length) {
+      task.acceptance_criteria = criteria;
+      written.push('acceptance_criteria');
+    }
+  }
+  if (typeof fields.humanAccountableId === 'string' && fields.humanAccountableId.trim()) {
+    task.human_accountable_id = fields.humanAccountableId.trim();
+    written.push('human_accountable_id');
+  }
+  if (typeof fields.agentRoleId === 'string' && fields.agentRoleId.trim()) {
+    task.agent_role_id = fields.agentRoleId.trim();
+    written.push('agent_role_id');
+  }
+  return written;
+}
+
 /** Build the contract's view of a task from the stored record. */
 function contractItemFrom(task: Record<string, unknown>, meta: TaskContractMeta) {
   return {
@@ -500,6 +631,10 @@ function contractItemFrom(task: Record<string, unknown>, meta: TaskContractMeta)
     human_accountable_id: meta.human_accountable_id ?? undefined,
     acceptance_criteria: meta.acceptance_criteria ?? [],
     dependency_ids: meta.dependency_ids ?? [],
+    // Absence of contract_version is what makes a record legacy; carrying it
+    // through is what lets the contract tell old work from new.
+    contract_version: meta.contract_version ?? null,
+    legacy_grandfathered: meta.legacy_grandfathered === true,
   };
 }
 

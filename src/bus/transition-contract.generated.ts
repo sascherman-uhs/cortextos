@@ -185,5 +185,53 @@ export const TRANSITION_CONTRACT = {
       "failed_terminal": "failed"
     }
   },
-  "legacy_completion_label": "historical, evidence not recorded"
+  "legacy_completion_label": "historical, evidence not recorded",
+  "interactive_paths": {
+    "backlog": {
+      "doing": [
+        "ready",
+        "doing"
+      ]
+    },
+    "doing": {
+      "done": [
+        "verify",
+        "done"
+      ]
+    },
+    "waiting": {
+      "done": [
+        "verify",
+        "done"
+      ]
+    }
+  },
+  "legacy_grandfather": {
+    "description": "Plan section 4 migration: 'enable required fields for new work first' and give legacy work a documented, audited path forward. A record that predates the contract carries none of its required fields, so the Ready gate would strand it forever. It may be advanced by a named human who either supplies the missing fields (the upgrade path, preferred) or waives them explicitly (the fallback path). Neither is silent: both append an event to the journal naming the actor, the reason and the fields that were missing.",
+    "waivable_violations": [
+      "missing_outcome",
+      "missing_owner",
+      "missing_acceptance_criteria"
+    ],
+    "never_waivable": [
+      "illegal_transition",
+      "unsatisfied_dependencies",
+      "missing_evidence",
+      "acceptance_checks_incomplete",
+      "acceptance_check_failed",
+      "missing_verifier",
+      "verifier_is_author",
+      "obligation_cannot_fail_terminal",
+      "missing_reason",
+      "missing_actor",
+      "missing_disposition"
+    ],
+    "fields": [
+      "actor",
+      "reason"
+    ],
+    "eligible_when": "The item was NOT created under the contract (no contract_version) AND is missing at least one field the contract requires. A contract-era item is never eligible, however incomplete it is.",
+    "done_requires_evidence_without_criteria": true,
+    "reason": "Plan section 12 hard invariant: no verified Done without proof. Grandfathering buys entry into the working states, never the proof gate at completion. An item with no acceptance criteria must still produce an artifact and a named verifier to reach done, so an empty criteria list can never be read as 'nothing to check'."
+  }
 } as unknown as TransitionContract;
