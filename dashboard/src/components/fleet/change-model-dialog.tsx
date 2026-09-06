@@ -82,9 +82,12 @@ export function ChangeModelDialog({
   const [reason, setReason] = useState('');
   const [clearPins, setClearPins] = useState(false);
 
+  // The clear-pins checkbox is part of the operation, so the preview is computed
+  // WITH it: an agent whose pin this clears follows the new tier and restarts.
+  // (`clearablePins` does not depend on the checkbox, so there is no cycle.)
   const preview =
     mode === 'role_tier'
-      ? previewRoleSwitch(summary, role, tier, resolution?.selected)
+      ? previewRoleSwitch(summary, role, tier, resolution?.selected, { clearPins })
       : previewAgentPin(summary, agent, entryId, resolution?.selected);
 
   // Legacy pins survive a role-tier switch unless explicitly cleared, so the
