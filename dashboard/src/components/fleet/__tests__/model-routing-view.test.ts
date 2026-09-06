@@ -373,6 +373,37 @@ describe('legacy pins in the switch preview', () => {
     expect(previewRoleSwitch(null, 'dispatcher', 'premium').clearablePins).toEqual([]);
   });
 
+  it('predicts the restarts that clearing the pins actually causes', () => {
+    // The defect: with "Also clear N legacy pin(s)" checked the preview still
+    // said "No agents will be restarted by this change", and then the agent
+    // restarted. Clearing a pin is what makes that agent follow the role tier.
+    const withoutClear = previewRoleSwitch(summary, 'builder', 'economy', undefined, { clearPins: false });
+    expect(withoutClear.restartWarning).toContain('No agents will be restarted');
+    expect(withoutClear.restartedByPinClear).toEqual([]);
+
+    const withClear = previewRoleSwitch(summary, 'builder', 'economy', undefined, { clearPins: true });
+    expect(withClear.restartWarning).toContain('trillion-coder');
+    expect(withClear.restartWarning).not.toContain('No agents will be restarted');
+    expect(withClear.restartWarning).toMatch(/1 legacy pin \(trillion-coder\) will be cleared/);
+    expect(withClear.restartedByPinClear).toEqual(['trillion-coder']);
+    // Nothing keeps a pin any more, so nothing is described as unaffected.
+    expect(withClear.restartWarning).not.toContain('keep their pin');
+  });
+
+  it('keeps unrelated pinned agents out of the restart list when pins are cleared', () => {
+    // dispatcher: two unpinned agents plus vera's legacy pin.
+    const withClear = previewRoleSwitch(summary, 'dispatcher', 'premium', undefined, { clearPins: true });
+    expect(withClear.restartWarning).toContain('jarvis-heartbeat, jarvis-orchestrator, vera');
+    expect(withClear.restartedByPinClear).toEqual(['vera']);
+    expect(withClear.restartWarning).not.toContain('keep their pin');
+  });
+
+  it('defaults to not clearing, matching a dialog opened with the box unchecked', () => {
+    const p = previewRoleSwitch(summary, 'dispatcher', 'premium');
+    expect(p.restartWarning).toContain('1 pinned agent (vera)');
+    expect(p.restartedByPinClear).toEqual([]);
+  });
+
   it('flags a single-agent pin preview when that agent carries a legacy pin', () => {
     expect(previewAgentPin(summary, 'vera', 'haiku').legacyPinnedAgents).toEqual(['vera']);
     expect(previewAgentPin(summary, 'jarvis-heartbeat', 'haiku').legacyPinnedAgents).toEqual([]);

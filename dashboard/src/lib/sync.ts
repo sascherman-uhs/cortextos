@@ -61,9 +61,9 @@ export function syncTasks(org: string): number {
 
   const upsert = db.prepare(`
     INSERT OR REPLACE INTO tasks
-      (id, title, description, status, priority, assignee, org, project, needs_approval, created_at, updated_at, completed_at, notes, source_file)
+      (id, title, description, status, priority, assignee, org, project, needs_approval, created_at, updated_at, completed_at, notes, source_file, version)
     VALUES
-      (@id, @title, @description, @status, @priority, @assignee, @org, @project, @needs_approval, @created_at, @updated_at, @completed_at, @notes, @source_file)
+      (@id, @title, @description, @status, @priority, @assignee, @org, @project, @needs_approval, @created_at, @updated_at, @completed_at, @notes, @source_file, @version)
   `);
 
   const files = fs.readdirSync(taskDir).filter((f) => f.endsWith('.json'));
@@ -95,6 +95,9 @@ export function syncTasks(org: string): number {
           completed_at: task.completed_at ?? null,
           notes: task.notes ?? null,
           source_file: filePath,
+          // OS-02: carry the record's version through to the cache so the board
+          // can send expectedVersion and get a 409 instead of a blind write.
+          version: Number.isFinite(Number(task.version)) ? Number(task.version) : 1,
         });
         markSynced(filePath);
         synced++;

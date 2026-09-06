@@ -309,14 +309,26 @@ export interface SwitchPreview {
   legacyPinnedAgents: string[];
   /** What "also clear legacy pins" would remove, for the dialog preview. */
   clearablePins: { agent: string; entry_id: string; kind: string }[];
+  /** Agents that will restart specifically because this operation clears their
+   *  pin. Empty unless the clear-pins option is actually on. */
+  restartedByPinClear?: string[];
 }
 
-/** Which agents a role-tier switch touches, and what it will do to them. */
+/**
+ * Which agents a role-tier switch touches, and what it will do to them.
+ *
+ * `clearPins` is the dialog's "also clear N legacy pin(s)" checkbox. It is part
+ * of the operation, so it has to be part of the prediction: an agent whose pin
+ * this change removes DOES move to the new tier and DOES get restarted. Without
+ * it the preview said "No agents will be restarted by this change" and then the
+ * agent restarted — the one thing a preview must never do.
+ */
 export function previewRoleSwitch(
   summary: RegistrySummary | null | undefined,
   role: string,
   tier: string,
   currentSelected?: { cost_class?: number; billing_mode?: string } | null,
+  opts: { clearPins?: boolean } = {},
 ): SwitchPreview {
   if (!summary) {
     return {
@@ -337,14 +349,6 @@ export function previewRoleSwitch(
   const targetEntryId = candidates[0] ?? null;
   const target = summary.entries.find((e) => e.entry_id === targetEntryId) ?? null;
   const pinned = affectedAgents.filter((a) => summary.agents[a]?.pin);
-  const willRestart = affectedAgents.filter((a) => !pinned.includes(a));
-
-  const restartWarning = willRestart.length
-    ? `${willRestart.length} agent${willRestart.length === 1 ? '' : 's'} will be restarted one at a time to pick this up: ${willRestart.join(', ')}.`
-    : 'No agents will be restarted by this change.';
-
-  const blocked =
-    candidates.length === 0 ? `Tier "${tier}" has no candidate entries — nothing to switch to.` : null;
 
   const clearablePins = affectedAgents
     .map((a) => ({ agent: a, pin: summary.agents[a]?.pin }))
@@ -352,17 +356,39 @@ export function previewRoleSwitch(
     .filter((x) => x.pin.kind === 'legacy-migration' || x.pin.kind === 'proposed-invalid')
     .map((x) => ({ agent: x.agent, entry_id: x.pin.entry_id, kind: x.pin.kind }));
 
+  // Clearing a pin is what makes that agent follow the role tier — and what
+  // restarts it. Predict the operation as it will actually be submitted.
+  const willClear = opts.clearPins === true && clearablePins.length > 0;
+  const cleared = new Set(willClear ? clearablePins.map((c) => c.agent) : []);
+  const keepsPin = pinned.filter((a) => !cleared.has(a));
+  const willRestart = affectedAgents.filter((a) => !keepsPin.includes(a));
+
+  const restartWarning = willRestart.length
+    ? `${willRestart.length} agent${willRestart.length === 1 ? '' : 's'} will be restarted one at a time to pick this up: ${willRestart.join(', ')}.`
+    : 'No agents will be restarted by this change.';
+
+  const clearedSentence = willClear
+    ? ` ${cleared.size} legacy pin${cleared.size === 1 ? '' : 's'} (${[...cleared].join(', ')}) will be cleared by this change, which is why ${cleared.size === 1 ? 'that agent is' : 'those agents are'} in the restart list.`
+    : '';
+
+  const blocked =
+    candidates.length === 0 ? `Tier "${tier}" has no candidate entries — nothing to switch to.` : null;
+
   return {
     affectedAgents,
     targetEntryId,
     costSentence: describeCostChange(currentSelected ?? null, target),
     restartWarning:
-      pinned.length > 0
-        ? `${restartWarning} ${pinned.length} pinned agent${pinned.length === 1 ? '' : 's'} (${pinned.join(', ')}) keep their pin and are unaffected unless you clear it below.`
-        : restartWarning,
+      restartWarning +
+      clearedSentence +
+      (keepsPin.length > 0
+        ? ` ${keepsPin.length} pinned agent${keepsPin.length === 1 ? '' : 's'} (${keepsPin.join(', ')}) keep their pin and are unaffected unless you clear it below.`
+        : ''),
     blocked,
     legacyPinnedAgents: clearablePins.map((c) => c.agent),
     clearablePins,
+    /** Restarted BECAUSE their pin is being cleared. Empty unless clearPins. */
+    restartedByPinClear: [...cleared],
   };
 }
 

@@ -75,3 +75,12 @@ export function isAllowedMove(
   if (from === to) return true;
   return (contract.allowed_transitions[from] ?? []).includes(to);
 }
+
+/** Legal next states from `from`. Used to tell a person what they CAN do when a
+ *  move is refused, instead of only naming what they cannot. */
+export function legalTransitionsFrom(
+  from: CanonicalState,
+  contract = loadTransitionContract(),
+): CanonicalState[] {
+  return contract.allowed_transitions[from] ?? [];
+}

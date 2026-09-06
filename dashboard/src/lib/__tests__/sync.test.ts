@@ -93,6 +93,58 @@ describe('syncTasks', () => {
     expect(row.org).toBe('testorg');
   });
 
+  it('carries the record version through to the cache', () => {
+    // Without this the board's expectedVersion is always undefined, every move
+    // is a blind write, and the 409 conflict path can never fire.
+    writeJSON('orgs/versionorg/tasks/task-v.json', {
+      id: 'task-v',
+      title: 'Versioned',
+      status: 'in_progress',
+      priority: 'normal',
+      created_at: '2025-01-01T00:00:00Z',
+      version: 5,
+    });
+
+    expect(syncTasks('versionorg')).toBe(1);
+    const row = db.prepare('SELECT version FROM tasks WHERE id = ?').get('task-v') as { version: number };
+    expect(row.version).toBe(5);
+  });
+
+  it('exposes version and the owning store on what the API returns', async () => {
+    // GET /api/tasks returns exactly these rows. The board reads `version` and
+    // sends it back as expectedVersion; `source` is the canonical identity of
+    // the store that owns the record.
+    writeJSON('orgs/apiorg/tasks/task-api.json', {
+      id: 'task-api',
+      title: 'Rendered from a version',
+      status: 'in_progress',
+      priority: 'normal',
+      created_at: '2025-01-01T00:00:00Z',
+      version: 3,
+    });
+    expect(syncTasks('apiorg')).toBe(1);
+
+    const { getTasks } = await import('../data/tasks');
+    const task = getTasks({ org: 'apiorg' }).find((t) => t.id === 'task-api');
+    expect(task).toBeTruthy();
+    expect(task!.version).toBe(3);
+    expect(task!.source).toBe('cortexos_tasks');
+  });
+
+  it('defaults a version-less legacy task to 1 rather than null', () => {
+    writeJSON('orgs/versionorg2/tasks/task-legacy.json', {
+      id: 'task-legacy',
+      title: 'Pre-contract',
+      status: 'pending',
+      priority: 'normal',
+      created_at: '2025-01-01T00:00:00Z',
+    });
+
+    expect(syncTasks('versionorg2')).toBe(1);
+    const row = db.prepare('SELECT version FROM tasks WHERE id = ?').get('task-legacy') as { version: number };
+    expect(row.version).toBe(1);
+  });
+
   it('skips unchanged files on re-sync (mtime check)', () => {
     writeJSON('orgs/testorg2/tasks/task-2.json', {
       id: 'task-2',

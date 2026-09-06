@@ -14,6 +14,7 @@ import {
   unavailable,
   type SourceEnvelope,
 } from './source-health';
+import { sourceForTaskId } from './transition-contract';
 
 const TASKS_SOURCE = 'sqlite://tasks';
 
@@ -136,7 +137,7 @@ export function getTasksEnvelope(filters?: TaskFilters): SourceEnvelope<Task[]> 
     const rows = db
       .prepare(
         `SELECT id, title, description, status, priority, assignee, org, project,
-                needs_approval, created_at, updated_at, completed_at, notes, source_file
+                needs_approval, created_at, updated_at, completed_at, notes, source_file, version
          FROM tasks ${where}
          ORDER BY created_at DESC`
       )
@@ -183,7 +184,7 @@ export function getTaskById(id: string): Task | null {
     const row = db
       .prepare(
         `SELECT id, title, description, status, priority, assignee, org, project,
-                needs_approval, created_at, updated_at, completed_at, notes, source_file
+                needs_approval, created_at, updated_at, completed_at, notes, source_file, version
          FROM tasks WHERE id = ?`
       )
       .get(id) as Record<string, unknown> | undefined;
@@ -237,7 +238,7 @@ export function getTasksCompletedTodayEnvelope(org?: string): SourceEnvelope<Tas
     const rows = db
       .prepare(
         `SELECT id, title, description, status, priority, assignee, org, project,
-                needs_approval, created_at, updated_at, completed_at, notes, source_file
+                needs_approval, created_at, updated_at, completed_at, notes, source_file, version
          FROM tasks ${where}
          ORDER BY completed_at DESC`
       )
@@ -310,6 +311,12 @@ function rowToTask(row: Record<string, unknown>): Task {
     completed_at: (row.completed_at as string) ?? undefined,
     notes: (row.notes as string) ?? undefined,
     source_file: (row.source_file as string) ?? undefined,
+    // OS-02: the version the caller must echo back as expectedVersion, and the
+    // store that actually owns the record. Without these two the board's
+    // conflict path was unreachable — expectedVersion was always undefined, so
+    // every move was a blind write over whatever had changed underneath.
+    version: Number.isFinite(Number(row.version)) ? Number(row.version) : 1,
+    source: sourceForTaskId(row.id as string),
   };
 }
 
