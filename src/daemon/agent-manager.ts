@@ -16,6 +16,14 @@ import { collectTelegramCommands, registerTelegramCommands } from '../bus/metric
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { stripBom } from '../utils/strip-bom.js';
+import { prepareAgentPrompt } from '../utils/secret-refs.js';
+import { resolveIngressPaths } from '../ingress/state.js';
+import { agentPollerSuppressed, enableMultiplexed, revertToAgent, legacyOffsetPath, type TransferResult } from '../ingress/cutover.js';
+import type { IngressPaths } from '../ingress/state.js';
+import { MultiplexedIngress } from '../ingress/service.js';
+import { enumerateBotIdentities, loadToken, type BotIdentity } from '../ingress/identity.js';
+import { drainOutbox } from '../ingress/outbox.js';
+import { reconcileOnRestart } from '../ingress/dispatch.js';
 
 type LogFn = (msg: string) => void;
 
@@ -43,6 +51,10 @@ export class AgentManager {
   // see overlapping registry state). Cleared after discoverAndStart()
   // finishes so the next clean restart starts from a known-good baseline.
   private daemonJustCrashed: boolean = false;
+
+  /** OS-07: the daemon-hosted multiplexed Telegram ingress, when any bot uses it. */
+  private ingress?: MultiplexedIngress;
+  private ingressDrain?: NodeJS.Timeout;
 
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
@@ -144,6 +156,99 @@ export class AgentManager {
     // are normal operation and should fire the real BUG-011 alarm if a
     // race ever does leak through PR #11's protection.
     this.clearDaemonCrashMarkers();
+
+    // OS-07: bring up the multiplexed ingress for any bot whose fence has
+    // been transferred to it. With no bot enabled this reconciles the (empty)
+    // dispatch queue and starts nothing.
+    this.startIngress();
+  }
+
+  // -------------------------------------------------------------------------
+  // OS-07 — multiplexed ingress hosting
+  // -------------------------------------------------------------------------
+
+  /**
+   * Start the multiplexed ingress service and its outbox drain.
+   *
+   * This is the piece that makes a persona answer while its worker restarts:
+   * the listener lives in the daemon, not in the agent process, so a model
+   * switch or a crash of Vera's worker no longer takes Vera's bot offline.
+   *
+   * Restart reconciliation runs first — any dispatch row still leased by a
+   * worker that died goes back to pending before the first new update lands.
+   */
+  startIngress(): void {
+    const paths = this.ingressPaths();
+    try {
+      const { requeued, failed } = reconcileOnRestart(paths);
+      if (requeued.length || failed.length) {
+        console.log(
+          `[ingress] restart reconciliation: ${requeued.length} requeued, ` +
+          `${failed.length} moved to failed (attempt limit reached).`,
+        );
+      }
+    } catch (err) {
+      console.error('[ingress] restart reconciliation failed (non-fatal):', err);
+    }
+
+    let identities: BotIdentity[] = [];
+    try {
+      identities = enumerateBotIdentities(this.frameworkRoot, this.org);
+    } catch (err) {
+      console.error('[ingress] identity enumeration failed — ingress not started:', err);
+      return;
+    }
+
+    this.ingress = new MultiplexedIngress({
+      paths,
+      identities,
+      // A token is read at connect time and handed straight to TelegramAPI.
+      // It is never stored on the identity, logged, or serialised.
+      transportFactory: (identity) => {
+        const token = loadToken(identity);
+        if (!token) return undefined;
+        const api = new TelegramAPI(token);
+        return {
+          getUpdates: (offset, timeout) => api.getUpdates(offset, timeout),
+          sendMessage: (chatId, text) => api.sendMessage(chatId, text),
+        };
+      },
+      log: (msg) => console.log(msg),
+    });
+    const owned = this.ingress.ownedBots();
+    if (owned.length === 0) {
+      console.log('[ingress] no bot is multiplexed yet — every agent keeps its own poller (cortextos ingress status).');
+      return;
+    }
+    this.ingress.start();
+    console.log(`[ingress] multiplexed listener started for: ${owned.map((b) => b.id).join(', ')}`);
+
+    // Durable outbox drain: a reply persisted before a crash still goes out,
+    // and it goes out through the bot it was recorded against.
+    const identityById = new Map(identities.map((i) => [i.id, i]));
+    this.ingressDrain = setInterval(() => {
+      drainOutbox(paths, async (bot, chatId, text) => {
+        const identity = identityById.get(bot);
+        if (!identity) throw new Error(`No configured identity for bot ${bot} — refusing to reply through another bot.`);
+        const token = loadToken(identity);
+        if (!token) throw new Error(`Token for ${bot} (key ${identity.tokenEnvKey}) is unreadable.`);
+        const res = await new TelegramAPI(token).sendMessage(chatId, text);
+        return res?.result?.message_id as number | undefined;
+      }).catch((err) => console.error('[ingress] outbox drain error:', err));
+    }, 5000);
+    this.ingressDrain.unref?.();
+  }
+
+  /** Stop the ingress service and its outbox drain. */
+  async stopIngress(): Promise<void> {
+    if (this.ingressDrain) {
+      clearInterval(this.ingressDrain);
+      this.ingressDrain = undefined;
+    }
+    if (this.ingress) {
+      await this.ingress.stop();
+      this.ingress = undefined;
+    }
   }
 
   /**
@@ -448,7 +553,28 @@ export class AgentManager {
     // Start Telegram poller if credentials are available and not explicitly disabled.
     // Set telegram_polling: false in config.json to prevent a specialist agent from
     // running its own poller (only the designated orchestrator agent should poll).
-    if (telegramApi && chatId && config.telegram_polling !== false) {
+    // OS-07: multiplexed ingress may own this bot's listener. When the
+    // ownership fence says `ingress` — or a cutover is mid-flight — the
+    // per-agent poller stands down so the two never poll the same bot at
+    // once. Default is OFF for every bot: with no flag and no fence file the
+    // fence reads `owner: 'agent'` and this branch behaves exactly as before.
+    const ingressOwnsBot = (() => {
+      try {
+        return agentPollerSuppressed(
+          resolveIngressPaths({ ctxRoot: this.ctxRoot, org: resolvedOrg }),
+          name,
+        );
+      } catch (err) {
+        // A malformed fence must never take an agent's Telegram offline.
+        console.warn(`[agent-manager] ${name}: ingress fence unreadable (${String(err)}) — keeping the agent-owned poller.`);
+        return false;
+      }
+    })();
+    if (ingressOwnsBot) {
+      log('Telegram poller NOT started — multiplexed ingress owns this bot (cortextos ingress status).');
+    }
+
+    if (telegramApi && chatId && config.telegram_polling !== false && !ingressOwnsBot) {
       const stateDir = join(this.ctxRoot, 'state', name);
       const poller = new TelegramPoller(telegramApi, stateDir);
 
@@ -835,6 +961,73 @@ export class AgentManager {
     log(`Activity-channel poller started (chat ${activityChatId}, with Conflict-restart wrapper)`);
   }
 
+  // -------------------------------------------------------------------------
+  // OS-07 — fenced bot cutover
+  // -------------------------------------------------------------------------
+
+  /** Ingress state paths for this daemon's runtime root and org. */
+  private ingressPaths(): IngressPaths {
+    return resolveIngressPaths({ ctxRoot: this.ctxRoot, org: this.org });
+  }
+
+  /**
+   * Stop ONLY the Telegram listener for one agent, leaving the agent process,
+   * its fast checker and its crons running.
+   *
+   * This is the "disable the old poller" step of a cutover. Stopping the whole
+   * agent would be the outage the package exists to remove.
+   */
+  stopTelegramPoller(name: string): boolean {
+    const entry = this.agents.get(name);
+    if (!entry?.poller) return false;
+    entry.poller.stop();
+    entry.poller = undefined;
+    console.log(`[agent-manager] ${name}: agent-owned Telegram poller stopped (ingress cutover).`);
+    return true;
+  }
+
+  /**
+   * Move one bot from its agent-owned poller to multiplexed ingress.
+   *
+   * The fenced sequence itself lives in `src/ingress/cutover.ts`; the daemon
+   * supplies the one thing only it can — actually stopping the in-process
+   * poller, between "persist the checkpoint" and "move the fence", so the two
+   * listeners never overlap.
+   */
+  async transferBotToIngress(name: string, actor?: string, reason?: string): Promise<TransferResult> {
+    const paths = this.ingressPaths();
+    return enableMultiplexed(
+      paths,
+      name,
+      {
+        legacyOffsetFile: legacyOffsetPath(paths, name),
+        stopOldPoller: () => { this.stopTelegramPoller(name); },
+        ...(actor ? { actor } : {}),
+        ...(reason ? { reason } : {}),
+      },
+    );
+  }
+
+  /**
+   * Hand a bot back to its agent-owned poller, carrying the same checkpoint.
+   *
+   * The agent's listener is restored by restarting the agent, which re-reads
+   * the fence and finds itself the owner again. Callers that want the listener
+   * back immediately restart the agent after this resolves.
+   */
+  async revertBotToAgentPoller(name: string, actor?: string, reason?: string): Promise<TransferResult> {
+    const paths = this.ingressPaths();
+    return revertToAgent(
+      paths,
+      name,
+      {
+        legacyOffsetFile: legacyOffsetPath(paths, name),
+        ...(actor ? { actor } : {}),
+        ...(reason ? { reason } : {}),
+      },
+    );
+  }
+
   /**
    * Stop a specific agent.
    */
@@ -914,6 +1107,7 @@ export class AgentManager {
    * time `pty.kill()` runs, every agent already has its marker on disk.
    */
   async stopAll(): Promise<void> {
+    await this.stopIngress();
     const names = [...this.agents.keys()];
 
     for (const name of names) {
@@ -1167,7 +1361,23 @@ export class AgentManager {
         }
       }
 
-      const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
+      const rawPrompt = cron.prompt ?? `[cron] ${cron.name} fired`;
+      // OS-07 credential cleanup: expand `${env:KEY}` secret references into
+      // shell expansions so a cron can use a credential without the literal
+      // ever living in config.json, the daemon log, or the injected string.
+      // The agent PTY already carries the agent .env (src/pty/agent-pty.ts),
+      // so `"$BOT_TOKEN"` resolves inside the agent's own shell.
+      const prepared = prepareAgentPrompt(rawPrompt);
+      const prompt = prepared.text;
+      for (const warning of prepared.inlineTokenWarnings) {
+        console.warn(`[daemon] [cron "${cron.name}" / ${agentName}] ${warning}`);
+      }
+      if (prepared.referencedKeys.length > 0) {
+        console.log(
+          `[daemon] [cron "${cron.name}" / ${agentName}] resolved secret reference(s) by key name: ` +
+          `${prepared.referencedKeys.join(', ')}`,
+        );
+      }
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
       // injects) does not reject identical cron prompts on subsequent fires.
       // Without the salt, every recurring cron after its first fire would be

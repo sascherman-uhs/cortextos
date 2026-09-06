@@ -654,7 +654,8 @@ export type IPCCommandType =
   | 'add-cron'
   | 'update-cron'
   | 'remove-cron'
-  | 'fleet-health';
+  | 'fleet-health'
+  | 'ingress-transfer';
 
 // ---------------------------------------------------------------------------
 // Execution log pagination response — Subtask 4.3
