@@ -170,6 +170,29 @@ test.describe('C/D. Mobile Cosmos UI', () => {
   test('micless voice loop: synth send posts to bus and advances state + turn id', async ({ browser }) => {
     const ctx = await browser.newContext({ viewport: IPHONE, isMobile: true, hasTouch: true });
     const page = await ctx.newPage();
+
+    // === JARVIS MOD #107 ROUND 3: stop writing to the REAL message bus. ======
+    // This test has driven /api/messages/send for real since MOD #36, which put
+    // genuine `[Cosmos] Test ping…` turns on Scott's jarvis-telegram inbox and
+    // left the fast lane's replies ("PWA regression ping logged. Standing by.")
+    // permanently in the production outbound log — nine such lines had to be
+    // removed by hand in round 3, and one of them was replayed by backfill and
+    // broke an unrelated test.
+    //
+    // Every assertion below is about CLIENT behaviour — the POST fires and
+    // returns 200, the state machine leaves idle, the turn id increments — and
+    // a stub satisfies all three identically. Nothing real is lost; the bus
+    // traffic was never what was being verified.
+    let sends = 0;
+    await page.route('**/api/messages/send', async (route) => {
+      sends += 1;
+      await route.fulfill({
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ success: true, messageId: `stub-${sends}`, escalated: true }),
+      });
+    });
+
     await uiLogin(page);
     await page.waitForFunction(() => (window as any).__cosmosStats, null, { timeout: 20_000 });
 

@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { NextRequest } from 'next/server';
-import { getVaultRoot, PARA_DIRS } from '@/lib/vault';
+import { getVaultRoot, isDeniedDir, listVaultTopDirs } from '@/lib/vault';
 
 export const dynamic = 'force-dynamic';
 
@@ -28,8 +28,10 @@ export async function GET(req: NextRequest) {
     return Response.json({ error: `Vault not found for org "${org}"` }, { status: 404 });
   }
 
+  // MOD #106: top-level dirs are discovered from the vault, not from a
+  // hand-maintained whitelist that had drifted 21 directories behind reality.
   const root: TreeNode[] = [];
-  for (const dir of PARA_DIRS) {
+  for (const dir of listVaultTopDirs(vaultRoot)) {
     const abs = path.join(vaultRoot, dir);
     if (!fs.existsSync(abs)) continue;
     if (!fs.statSync(abs).isDirectory()) continue;
@@ -38,7 +40,7 @@ export async function GET(req: NextRequest) {
       kind: 'dir',
       name: dir,
       relPath: dir,
-      children: walkDir(abs, vaultRoot, /* sortByMtime */ dir === '00-inbox'),
+      children: walkDir(abs, vaultRoot, /* sortByMtime */ dir === '00-inbox' || dir === 'inbox'),
     });
   }
 
@@ -56,6 +58,7 @@ function walkDir(
 
   for (const entry of entries) {
     if (entry.name.startsWith('.')) continue;
+    if (entry.isDirectory() && isDeniedDir(entry.name)) continue;
     const childAbs = path.join(abs, entry.name);
     const relPath = path.relative(vaultRoot, childAbs);
 

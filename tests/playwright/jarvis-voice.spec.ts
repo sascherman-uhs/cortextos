@@ -10,7 +10,20 @@
  *   F4. natural goodbye → signoff decision, NO bus send
  *   F5. goodbye veto (question after thanks) → still sends
  *
- * Run:  DASHBOARD_URL=http://localhost:3000 npx playwright test tests/playwright/jarvis-voice.spec.ts
+ * === JARVIS MOD #107 (2026-08-09): THIS SPEC IS LEGACY-LANE ONLY. ===
+ * Everything below asserts on `__cosmosStats.wakeGate`, which only the legacy
+ * open-mic engine (use-voice) ever writes — the Realtime lanes have no wake
+ * gate at all, because server VAD does the turn-taking.
+ *
+ * Until MOD #107 both hooks were mounted LIVE at once, so these tests passed on
+ * every lane — but on the Realtime lanes they were driving a hook whose log is
+ * never rendered and whose sends were a duplicate shadow conversation. They were
+ * green against something the user never sees. Phase −1 killed the second
+ * engine, which correctly makes these unrunnable on any lane but 'legacy'; they
+ * now self-skip rather than fail, and the coverage is real wherever it runs.
+ *
+ * Run:  # in dashboard/.env.local set NEXT_PUBLIC_CTX_VOICE_ENGINE=legacy, then
+ *       DASHBOARD_URL=http://localhost:3000 npx playwright test tests/playwright/jarvis-voice.spec.ts
  */
 import { test, expect, type Page } from '@playwright/test';
 
@@ -33,6 +46,15 @@ async function uiLogin(page: Page) {
   await page.waitForFunction(() => (window as any).__cosmosVoiceTest, null, {
     timeout: 20_000,
   });
+  // === MOD #107: lane guard. The mic-debug line is the one place the running
+  // engine is readable from the DOM ("v107 · <engine> · …"). Skipping is the
+  // honest outcome on a non-legacy lane — the wake gate is not merely failing
+  // there, it does not exist there.
+  const debug = (await page.getByTestId('mic-debug').textContent()) ?? '';
+  test.skip(
+    !/·\s*legacy\s*·/.test(debug),
+    `wake-gate spec requires NEXT_PUBLIC_CTX_VOICE_ENGINE=legacy (running: ${debug.trim() || 'unknown'})`,
+  );
 }
 
 /** Counts /api/messages/send POSTs for the page's lifetime. */

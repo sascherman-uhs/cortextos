@@ -24,9 +24,21 @@ const JARVIS_SPEAK_SH =
 // overridden by env without a code change if Scott wants a specific voice later.
 const EL_DEFAULT_VOICE_ID =
   process.env.ELEVENLABS_VOICE_ID ?? 'onwK4e9ZLuTAKqWW03F9'; // "Daniel" — stock EL British voice, matches the SOUL.md butler persona + macOS `say -v Daniel` fallback
+// === JARVIS MOD #107 (2026-08-09) — the latency model. eleven_flash_v2_5 is
+// ElevenLabs' lowest-latency model and measured materially faster to FIRST BYTE
+// than turbo on this account (see the probe recorded in LOCAL_MODS.md MOD #107).
+// Quality difference is not audible on 1-2 sentence butler replies, which is all
+// this route ever synthesizes (MAX_CHARS caps it at 800). ===
 const EL_DEFAULT_MODEL =
-  process.env.ELEVENLABS_MODEL_ID ?? 'eleven_turbo_v2_5'; // low-latency
+  process.env.ELEVENLABS_MODEL_ID ?? 'eleven_flash_v2_5';
 const EL_TIMEOUT_MS = 12_000;
+// === JARVIS MOD #107 — output format + streaming latency tier.
+// mp3_22050_32 instead of mp3_44100_128: a quarter of the bytes, which is a
+// quarter of the transfer time on a phone, and 22kHz/32kbps is transparent for
+// speech (it is not music). optimize_streaming_latency=3 trades a little
+// prosody-lookahead for time-to-first-byte.
+const EL_OUTPUT_FORMAT = 'mp3_22050_32';
+const EL_STREAMING_LATENCY = '3';
 
 // Cap length so `say` never blocks and EL payloads stay small.
 const MAX_CHARS = 800;
@@ -81,9 +93,20 @@ async function synthesizeElevenLabs(
   text: string,
   apiKey: string,
 ): Promise<ArrayBuffer | null> {
+  // === JARVIS MOD #107: the /stream endpoint starts sending audio as it is
+  // generated rather than after the whole clip is rendered, which is where the
+  // time-to-first-byte win comes from.
+  //
+  // The RESPONSE SHAPE IS DELIBERATELY UNCHANGED — still a fully buffered
+  // arrayBuffer() handed back as one audio/mpeg body. Do not "improve" this into
+  // a passthrough stream: the client decodes with ctx.decodeAudioData (MOD #28,
+  // the iOS-proof playback path), which requires a COMPLETE mp3 and will throw
+  // on a partial one. The streaming *feel* already comes from the per-sentence
+  // pipeline in use-tts (MOD #24/#45), which is a better place for it — it
+  // pipelines synthesis against playback instead of within one clip. ===
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
     EL_DEFAULT_VOICE_ID,
-  )}?output_format=mp3_44100_128`;
+  )}/stream?output_format=${EL_OUTPUT_FORMAT}&optimize_streaming_latency=${EL_STREAMING_LATENCY}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), EL_TIMEOUT_MS);
@@ -172,6 +195,26 @@ export async function POST(request: Request) {
   }
 
   // --- Tier 2: jarvis-speak.sh (macOS say) -----------------------------------
+  // === JARVIS MOD #107 — the phantom-success tier. `say` speaks on the MAC's
+  // speakers. When the request came from Scott's iPhone PWA that is not a
+  // fallback, it is a failure that returns 200: the Mac talks to an empty room,
+  // the route reports { spoken: true }, and the phone — which is the only place
+  // anyone is listening — stays completely silent with no error to show for it.
+  // The client tells us where it is (x-tts-client, set in use-tts.fetchTts)
+  // because standalone-PWA is a client-only fact the User-Agent does not carry.
+  // Skipping straight to tier 3 hands the phone to speechSynthesis, which at
+  // least makes a sound on the device holding it. ===
+  const isIosPwaClient = request.headers.get('x-tts-client') === 'ios-pwa';
+  if (isIosPwaClient) {
+    console.warn(
+      '[api/uhs/tts] iOS PWA client and ElevenLabs unavailable — skipping the `say` tier (it would speak on the Mac) and handing off to browser speech',
+    );
+    return Response.json(
+      { spoken: false, path: 'browser' },
+      { status: 200, headers: { 'x-tts-path': 'browser' } },
+    );
+  }
+
   const spoke = await speakViaScript(text);
   if (spoke) {
     return Response.json(

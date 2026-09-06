@@ -7,6 +7,7 @@ import { UsersTab } from '@/components/settings/users-tab';
 import { AllowedRootsTab } from '@/components/settings/allowed-roots-tab';
 import { AppearanceTab } from '@/components/settings/appearance-tab';
 import { OrganizationTab } from '@/components/settings/organization-tab';
+import { EmailTriageTab } from '@/components/settings/email-triage-tab';
 
 export default function SettingsPage() {
   return (
@@ -26,6 +27,7 @@ export default function SettingsPage() {
           <TabsTrigger value="users">Users</TabsTrigger>
           <TabsTrigger value="allowed-roots">Allowed Roots</TabsTrigger>
           <TabsTrigger value="appearance">Appearance</TabsTrigger>
+          <TabsTrigger value="email-triage">Email Triage</TabsTrigger>
         </TabsList>
 
         <TabsContent value="organization">
@@ -61,6 +63,12 @@ export default function SettingsPage() {
         <TabsContent value="appearance">
           <div className="mt-4 max-w-2xl">
             <AppearanceTab />
+          </div>
+        </TabsContent>
+
+        <TabsContent value="email-triage">
+          <div className="mt-4 max-w-4xl">
+            <EmailTriageTab />
           </div>
         </TabsContent>
       </Tabs>

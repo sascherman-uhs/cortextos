@@ -1,0 +1,13 @@
+{
+  "updated_at": "2026-07-25T12:32:23.471Z",
+  "crons": [
+    {
+      "name": "aieo-daily",
+      "prompt": "[OUTPUT CONTRACT: EXACTLY 1 Telegram output — 1 short plain-text sendMessage OR 1 HTML sendDocument. Zero extra messages.] Advance the AIEO/GEO task list at vault/business/aieo-geo-task-list.md. Read it, pick the next unchecked item(s) you can move WITHOUT Scott or a vendor, and do that work now: draft Outlook emails (draft only, NEVER send), generate schema/FAQ markup or page content, create llms.txt / Wikidata / comparison-page drafts, run checks. Mark an item done only when fully complete; otherwise leave it unchecked with a '→ NEEDS SCOTT' or '→ NEEDS KAMA' note and the ready-to-use artifact. Update the matching cortexos goal (goal-a0..goal-a4) progress to reflect real completion. Respect all rules: never send external comms or publish, draft only; query owned data before asking. Report ONE concise Telegram note: what you advanced today + what now needs Scott.",
+      "schedule": "30 8 * * *",
+      "enabled": true,
+      "created_at": "2026-07-25T12:32:23.470Z",
+      "description": "Daily: work the AIEO/GEO 5-wave task list, draft-only, report progress"
+    }
+  ]
+}

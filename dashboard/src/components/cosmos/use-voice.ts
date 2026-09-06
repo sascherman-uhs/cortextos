@@ -100,7 +100,14 @@ export type VoiceState =
   | 'listening'
   | 'processing'
   | 'responding'
-  | 'speaking';
+  | 'speaking'
+  // === JARVIS MOD #107 (2026-08-09): there was NO vocabulary for failure. A
+  // dead session, a denied microphone and a deliberately-off mic all rendered as
+  // 'dormant' ("Mic off") — the one state a user reads as "this is fine, I
+  // turned it off". Failure now has its own state, its own label, and its own
+  // red-shifted orb (scene.tsx), because a silent JARVIS that LOOKS healthy is
+  // the single worst failure mode this surface has. ===
+  | 'error';
 // === END MOD #36 ===
 
 const AGENT = 'jarvis-telegram';
@@ -157,6 +164,12 @@ export interface TtsBridge {
   /** Mark a reply id as already spoken so voice-panel's log effect skips it. */
   markSpoken?: (id: string) => void;
   // === END MOD #45 ===
+  // === JARVIS MOD #107: which lane is being measured. useTts owns the
+  // first-audible clock (recordFirstAudible), and it hard-coded path:'fastpath'
+  // — so once the Daniel lane started routing Realtime replies through the same
+  // ElevenLabs pipeline, every Realtime turn was filed under the fast path and
+  // the two engines became indistinguishable in the metrics file. ===
+  setLatencyPath?: (path: import('@/lib/voice/latency').VoicePath) => void;
 }
 // === END MOD #36 ===
 
@@ -199,7 +212,49 @@ export interface UseVoiceResult {
   // the same reply is never spoken twice. ===
   fastReplyIdsRef: React.MutableRefObject<Set<string>>;
   // === END MOD #38 ===
+  // === JARVIS MOD #104: pending-lookup ledger + late-answer delivery =========
+  // OPTIONAL — only the Realtime lane implements them. The 2026-08-04 demo
+  // (IMG_5108) proved the failure: an ask_jarvis that outlived its 35s tool
+  // budget was never delivered, because the SSE late reply was (a) gated out by
+  // sentTurns in voice-only sessions and (b) never fed back into the live
+  // OpenAI conversation, so JARVIS never spoke it. Scott re-asked twice and
+  // gave up. These two members close the loop.
+  /** Questions dispatched to ask_jarvis that have not been answered yet. */
+  pendingLookups?: PendingLookup[];
+  /**
+   * Offer a late-arriving agent reply to the lane. Returns true if the lane
+   * consumed it (injected into the live conversation to be SPOKEN); false means
+   * the caller should surface it itself (legacy path / no session).
+   */
+  // MOD #107 ROUND 2: `replyId` is the outbound line's id. The lane registers it
+  // in its fast-reply dedupe set when it consumes the reply, so the same text
+  // can never also be surfaced raw by a later backfill sweep.
+  deliverLateReply?: (text: string, replyId?: string) => boolean;
+  // === END MOD #104 ===
+  // === JARVIS MOD #107: manual recovery from the 'error' state (permission
+  // fixed, network back). OPTIONAL — only the Realtime lane can fail in a way
+  // that leaves a retryable session behind. ===
+  retry?: () => void;
+  // === END MOD #107 ===
+  // === JARVIS MOD #107 ROUND 3: offer an outbound line that has already passed
+  // the dedupe gate. TRUE means this lane has taken responsibility for it —
+  // delivered, held for tool reconciliation, or deliberately dropped as the echo
+  // of an answer the model is already speaking. FALSE means the caller must fall
+  // back to its own path, which is what the legacy lane (no reconciler) gets. ===
+  offerOutboundReply?: (id: string, text: string) => boolean;
+  // === END MOD #107 ROUND 3 ===
 }
+
+// === JARVIS MOD #104: one outstanding slow lookup, as the UI + late-reply
+// router see it. `escalated` = the one-time "this is genuinely stuck" line has
+// been spoken, so we never stall-poet twice about the same question. ===
+export interface PendingLookup {
+  id: string;
+  question: string;
+  ts: number;
+  escalated: boolean;
+}
+// === END MOD #104 ===
 
 // === JARVIS MOD #27 addendum — iOS PWA standalone detection ===
 // On iOS, webkitSpeechRecognition is present in window but silently fails in
@@ -236,7 +291,26 @@ function nextAck(): string {
 }
 // === END MOD #38 ===
 
-export function useVoice(): UseVoiceResult {
+// === JARVIS MOD #107 — PHASE −1: the dual-engine mic fix (2026-08-09) ========
+// voice-panel mounts BOTH this hook and useRealtimeVoice — it has to, because
+// rules of hooks forbid calling either conditionally. Before this flag they were
+// both LIVE: both called getUserMedia on the same device, and this lane ran a
+// full shadow conversation (handleUtterance → sendText → POST /api/messages/send
+// with a `[Cosmos]` prefix), so every spoken turn hit the agent twice. On iOS,
+// two concurrent captures of one microphone means the OS silently mutes one of
+// them, and which one is nondeterministic — the exact shape of "sometimes JARVIS
+// just doesn't hear me". When `enabled` is false this hook still MOUNTS (so the
+// hook order never changes) but starts no engine, opens no stream, sends nothing.
+export interface UseVoiceOptions {
+  enabled?: boolean;
+}
+
+export function useVoice(options: UseVoiceOptions = {}): UseVoiceResult {
+  const enabled = options.enabled ?? true;
+  const enabledRef = useRef(enabled);
+  useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
   const [state, setState] = useState<VoiceState>('idle');
   const [supported, setSupported] = useState(false);
   const [amplitude, setAmplitude] = useState(0);
@@ -454,6 +528,8 @@ export function useVoice(): UseVoiceResult {
   }, [restState]);
 
   const sendText = useCallback((text: string) => {
+    // === MOD #107 PHASE −1: a disabled lane is not a second conversation. ===
+    if (!enabledRef.current) return;
     const trimmed = text.trim();
     if (!trimmed) return;
     // === JARVIS MOD #33 (2026-07-06): the sent-turn counter lives HERE, the one
@@ -1098,6 +1174,11 @@ export function useVoice(): UseVoiceResult {
   }, [supported]);
 
   useEffect(() => {
+    // === MOD #107 PHASE −1: no engine, no getUserMedia, no shadow turns. ===
+    if (!enabled) {
+      stopOpenMicEngine();
+      return;
+    }
     openMicRef.current = openMic;
     localStorage.setItem(OPEN_MIC_KEY, openMic ? '1' : '0');
     mergeStats({ openMic });
@@ -1110,11 +1191,12 @@ export function useVoice(): UseVoiceResult {
         s === 'wakeListening' || s === 'listening' || s === 'dormant' ? 'idle' : s,
       );
     }
-  }, [openMic, supported, startOpenMicEngine, stopOpenMicEngine]);
+  }, [openMic, supported, startOpenMicEngine, stopOpenMicEngine, enabled]);
 
   // iOS suspends the PWA (and kills the stream) on background — restart the
   // engine when the app returns. Mirrors the MOD #30 SSE resume pattern.
   useEffect(() => {
+    if (!enabled) return; // === MOD #107 PHASE −1 ===
     const onVisible = () => {
       if (document.visibilityState !== 'visible') return;
       if (openMicRef.current && !engineRunningRef.current) {
@@ -1123,7 +1205,7 @@ export function useVoice(): UseVoiceResult {
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [startOpenMicEngine]);
+  }, [startOpenMicEngine, enabled]);
 
   const toggleOpenMic = useCallback(() => setOpenMic((v) => !v), []);
 
@@ -1332,7 +1414,13 @@ export function useVoice(): UseVoiceResult {
   // === JARVIS MOD #36: micless test seam — drives the WAKE-GATE path directly
   // (Playwright can't speak into a real mic; MOD #21 lore). Merge-safe: its own
   // window key, assigned once. ===
+  // === MOD #107: gated on `enabled` so exactly ONE lane ever owns the seam.
+  // With both hooks mounted, an ungated assignment meant the disabled lane could
+  // win the race and Playwright would drive a hook whose log is never rendered —
+  // a test that passes against nothing. useRealtimeVoice claims the same seam
+  // when it is the enabled lane. ===
   useEffect(() => {
+    if (!enabled) return;
     window.__cosmosVoiceTest = {
       utterance: (text: string) => handleUtterance(text),
       agentReply: (text: string) =>
@@ -1341,7 +1429,7 @@ export function useVoice(): UseVoiceResult {
     return () => {
       delete window.__cosmosVoiceTest;
     };
-  }, [handleUtterance, pushAgentReply]);
+  }, [handleUtterance, pushAgentReply, enabled]);
   // === END MOD #36 ===
 
   useEffect(() => {

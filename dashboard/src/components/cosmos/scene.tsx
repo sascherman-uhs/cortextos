@@ -36,8 +36,15 @@ const LOW_PARTICLES = 1000;
 
 // === JARVIS MOD #29: state → orb color/rim/brightness (Trillion palette).
 // idle dim teal, listening bright cyan, processing teal→purple drift + helix,
-// responding bright teal. NOTE: the voice hook currently emits only these four
-// states; an 'error' red-shift would slot in here if use-voice ever emits it. ===
+// responding bright teal.
+// === JARVIS MOD #107 (2026-08-09): the 'error' red-shift the MOD #29 note left
+// as a hypothetical is now real, because the state is now real. The scene had NO
+// visual vocabulary for failure — a dead voice engine rendered as the same calm
+// teal as a healthy idle one, which is how a mute JARVIS on a phone looked
+// perfectly fine for minutes at a time. Red is used NOWHERE else in this scene,
+// so it cannot be confused with any working state. ===
+const ERROR_CORE = '#E05A4A';
+const ERROR_RIM = '#F2A99C';
 // === JARVIS MOD #56 (2026-08-03): warm/cool inversion. The scene is cool at
 // every state EXCEPT `listening`, which is the one warm moment — UHS gold. The
 // orb, its glow pool, and the mic chrome all shift warm together, and nothing
@@ -52,6 +59,7 @@ const STATE_CORE: Record<VoiceState, string> = {
   processing: AQUA,
   responding: TEAL,
   speaking: CYAN,
+  error: ERROR_CORE, // MOD #107
 };
 const STATE_RIM: Record<VoiceState, string> = {
   dormant: MINT,
@@ -61,6 +69,7 @@ const STATE_RIM: Record<VoiceState, string> = {
   processing: PURPLE,
   responding: MINT,
   speaking: MINT,
+  error: ERROR_RIM, // MOD #107
 };
 // === END JARVIS MOD #56 ===
 const STATE_BRIGHT: Record<VoiceState, number> = {
@@ -71,6 +80,9 @@ const STATE_BRIGHT: Record<VoiceState, number> = {
   processing: 0.95,
   responding: 1.18,
   speaking: 1.25,
+  // MOD #107: dimmer than every working state — failure should read as the
+  // system having gone out, not as another kind of activity.
+  error: 0.5,
   // === END MOD #36 ===
 };
 // Idle breathing amplitude; live mic amplitude scales above this while speaking.
@@ -138,6 +150,23 @@ declare global {
       // === JARVIS MOD #70: reduced-motion seam (verification asserts on it) ===
       reducedMotion?: boolean;
       // === END JARVIS MOD #70 ===
+      // === JARVIS MOD #107: the Realtime lanes' vitals, rendered by
+      // voice-panel's MicDebugLine. These were already being WRITTEN by
+      // use-realtime-voice (through a cast that bypassed this declaration) but
+      // never declared, so nothing type-checked and the debug line could not
+      // read them without inventing its own local shape. On a phone with no
+      // console these four fields are the entire difference between
+      // "connecting", "connected but silent", and "dead". ===
+      voicePath?: 'legacy' | 'realtime' | 'realtime-el' | 'fastpath';
+      rtcState?: string;
+      dcState?: string;
+      iceState?: string;
+      rtcError?: string | null;
+      reconnects?: number;
+      /** Shared (gesture-unlocked) AudioContext state — MOD #25's singleton. */
+      ctxState?: string;
+      lastTurnLatency?: { path: string; firstAudioMs: number; transcriptMs?: number };
+      // === END JARVIS MOD #107 ===
     };
     // === END JARVIS MOD #21 ===
     // === JARVIS MOD #36: micless wake-gate test seam (Playwright drives the

@@ -110,13 +110,17 @@ describe('spokenDate — a stored date is spoken as that date', () => {
 });
 
 describe('spokenTitle — calendar titles are written to be read, not spoken', () => {
+  // MOD #106b UPDATED both expectations. They asserted that em-dashes and the
+  // "(III/—)" room-count code survived into speech; a critic listening to the
+  // real output ruled that wrong — an em-dash is a visual pause and a room code
+  // read aloud is noise. The emoji and pipe rules below are unchanged.
   it('drops emoji status markers', () => {
-    expect(spokenTitle('✅ Blog Published — Week 31')).toBe('Blog Published — Week 31');
+    expect(spokenTitle('✅ Blog Published — Week 31')).toBe('Blog Published Week 31');
     expect(spokenTitle('📧 Newsletter Prep: Issue #15')).toBe('Newsletter Prep: Issue #15');
   });
-  it('turns pipe delimiters into pauses', () => {
+  it('turns pipe delimiters into pauses and drops the room-count code', () => {
     expect(spokenTitle('CS (III/—) - Boca Raton Dr 7748 | Kim Pedersen')).toBe(
-      'CS (III/—) - Boca Raton Dr 7748, Kim Pedersen',
+      'CS, Boca Raton Dr 7748, Kim Pedersen',
     );
   });
   it('never returns an empty string', () => {

@@ -12,4 +12,13 @@ eval "$(grep -E '^ADMIN_(USERNAME|PASSWORD)=' dashboard/.env.local | sed 's/^/ex
 export DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:3000}"
 
 # MOD #36: jarvis-voice.spec.ts joins the suite (open-mic wake gate / sign-off)
-npx playwright test tests/playwright/jarvis-pwa.spec.ts tests/playwright/jarvis-voice.spec.ts "$@"
+# MOD #107: jarvis-bargein.spec.ts (MODs #85-#89) had been written but never
+#   added here, so the barge-in contract had ZERO coverage in the actual suite —
+#   a spec that exists and is never run is worse than no spec, because it reads
+#   as coverage. jarvis-realtime-el.spec.ts covers the Daniel lane.
+npx playwright test \
+  tests/playwright/jarvis-pwa.spec.ts \
+  tests/playwright/jarvis-voice.spec.ts \
+  tests/playwright/jarvis-bargein.spec.ts \
+  tests/playwright/jarvis-realtime-el.spec.ts \
+  "$@"

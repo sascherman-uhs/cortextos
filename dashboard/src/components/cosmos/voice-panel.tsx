@@ -17,13 +17,17 @@ import { GOLD, GOLD_RGB, COOL_TEXT, COOL_DIM, COOL_LINE, CYAN, PURPLE } from './
 // MOD #76: the stop-reply border — cool, brighter than idle chrome so the
 // control reads as actionable without borrowing the reserved gold accent.
 const STOP_LINE = 'rgba(148,214,216,0.6)';
+// === JARVIS MOD #107: the failure accent. Deliberately NOT gold (reserved for
+// listening, MOD #56) and not the cool chrome — a broken voice engine has to be
+// distinguishable at a glance from a deliberately-off one. ===
+const ERROR_LINE = 'rgba(224,90,74,0.85)';
 import { EASE, DUR_BASE } from './motion';
 // === JARVIS MOD #77: think-time stop-control decision (testable, no DOM) ===
 import { micControl } from './stop-control';
 // === END MOD #77 ===
 // === END JARVIS MOD #56/#55 ===
 // === JARVIS MOD #50 — OpenAI Realtime voice hook (feature-flagged) ===
-import { useRealtimeVoice } from './use-realtime-voice';
+import { useRealtimeVoice, type VoiceEngine, type RealtimeEngine } from './use-realtime-voice';
 import { useVoice, type VoiceState } from './use-voice';
 // === JARVIS MOD #21 — Cosmos TTS playback ===
 import { useTts } from './use-tts';
@@ -34,10 +38,39 @@ import { unlockSharedAudio } from './audio-unlock';
 // === JARVIS MOD #38 — single decision point for SSE/backfill reply surfacing ===
 import { shouldSurfaceReply } from './reply-dedupe';
 // === END JARVIS MOD #38 ===
+// === JARVIS MOD #107 ROUND 3 — the agent is a parameter now, so the E2E suite
+// can be pointed at a throwaway log instead of Scott's real one. ===
+import { resolveVoiceAgent } from './voice-agent';
 
-// === JARVIS MOD #50: feature flag — off by default; flip NEXT_PUBLIC_CTX_REALTIME_VOICE=1 to enable ===
-const USE_REALTIME = process.env.NEXT_PUBLIC_CTX_REALTIME_VOICE === '1';
-// === END MOD #50 ===
+// === JARVIS MOD #107 — 3-way engine select (2026-08-09) =====================
+// MOD #50's boolean could only express "OpenAI voice or browser STT", which is
+// two of the three lanes that now exist. NEXT_PUBLIC_CTX_VOICE_ENGINE is the
+// real selector:
+//   'legacy'      — browser STT + the fast-path agent + ElevenLabs (pre-MOD-#50).
+//   'realtime'    — OpenAI Realtime, OpenAI's voice over the WebRTC audio track.
+//   'realtime-el' — OpenAI Realtime for the brain, text-only session, replies
+//                   streamed sentence-by-sentence into ElevenLabs "Daniel".
+// Back-compat is deliberate and load-bearing: NEXT_PUBLIC_CTX_REALTIME_VOICE=1
+// lives in shared config (~/.cortextos/default/dashboard.env) and other surfaces
+// read it, so it still maps to 'realtime' whenever the new var is unset.
+function resolveEngine(): VoiceEngine {
+  const raw = process.env.NEXT_PUBLIC_CTX_VOICE_ENGINE;
+  if (raw === 'legacy' || raw === 'realtime' || raw === 'realtime-el') return raw;
+  return process.env.NEXT_PUBLIC_CTX_REALTIME_VOICE === '1' ? 'realtime' : 'legacy';
+}
+const ENGINE: VoiceEngine = resolveEngine();
+const USE_REALTIME = ENGINE !== 'legacy';
+/**
+ * Does the shared ElevenLabs/`say` engine own the spoken voice on this lane?
+ * On 'realtime' it must NOT: OpenAI already speaks the reply over the audio
+ * track, and firing the local engine on the same text is the double-voice bug
+ * MOD #50 fixed. On 'realtime-el' it MUST: the session is text-only, so the
+ * local engine is the ONLY thing that can speak — which is precisely why the
+ * blanket `if (USE_REALTIME) return` had to become a per-engine question.
+ */
+const LOCAL_TTS_OWNS_VOICE = ENGINE === 'legacy' || ENGINE === 'realtime-el';
+
+// === END MOD #107 / MOD #50 ===
 
 interface VoicePanelProps {
   /** Lets the parent Scene mirror voice state → orb color, amplitude → breathing. */
@@ -58,6 +91,8 @@ const STATE_LABEL: Record<VoiceState, string> = {
   responding: 'JARVIS is thinking…',
   speaking: 'JARVIS is speaking…',
   // === END MOD #36 ===
+  // === JARVIS MOD #107: failure says so, and says what to do about it. ===
+  error: 'Voice unavailable — tap to retry',
 };
 
 export function VoicePanel({
@@ -65,11 +100,24 @@ export function VoicePanel({
   onAmplitudeChange,
   onTtsAmplitudeChange,
 }: VoicePanelProps) {
-  // === JARVIS MOD #50: both hooks called unconditionally (React rules of hooks) ===
-  const voiceLegacy = useVoice();
-  const voiceRealtime = useRealtimeVoice();
+  // === JARVIS MOD #50 / #107: both hooks are still called unconditionally
+  // (rules of hooks), but only ONE is now live. Before MOD #107 both opened
+  // getUserMedia and the legacy lane ran a full shadow conversation against
+  // /api/messages/send — doubling agent traffic, and on iOS causing the OS to
+  // silently mute one of two concurrent captures of the same microphone. The
+  // `enabled` flag makes the unselected hook completely inert. ===
+  // MOD #107 ROUND 3: resolved once per mount rather than at module load, so a
+  // client-side navigation that changes the override is honoured and a cached
+  // module can never pin a stale agent.
+  const VOICE_AGENT = useMemo(() => resolveVoiceAgent(), []);
+
+  const voiceLegacy = useVoice({ enabled: ENGINE === 'legacy' });
+  const voiceRealtime = useRealtimeVoice({
+    enabled: USE_REALTIME,
+    engine: (USE_REALTIME ? ENGINE : 'realtime') as RealtimeEngine,
+  });
   const voice = USE_REALTIME ? voiceRealtime : voiceLegacy;
-  // === END MOD #50 ===
+  // === END MOD #50 / #107 ===
   const {
     state,
     supported,
@@ -96,11 +144,22 @@ export function VoicePanel({
     // === JARVIS MOD #38: ids already delivered via the synchronous fast lane ===
     fastReplyIdsRef,
     // === END MOD #38 ===
+    // === JARVIS MOD #104: pending-lookup ledger (chips) + late-answer delivery.
+    // Both OPTIONAL — only the Realtime lane implements them. ===
+    pendingLookups,
+    deliverLateReply,
+    // === END MOD #104 ===
+    // === JARVIS MOD #107: manual recovery from a failed session ===
+    retry,
+    // === END MOD #107 ===
+    // === JARVIS MOD #107 ROUND 3: single entry point for outbound lines ===
+    offerOutboundReply,
+    // === END MOD #107 ROUND 3 ===
   } = voice;
 
   // === JARVIS MOD #21: TTS — speak new agent replies through the three-tier route ===
   // === JARVIS MOD #24: also pull interrupt() for barge-in (mic press / new turn) ===
-  const { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError, beginStreamReply } = useTts();
+  const { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError, beginStreamReply, setLatencyPath } = useTts();
 
   // === JARVIS MOD #36: wire the TTS bridge into the open-mic engine —
   // wake-word barge-in needs interrupt()+isSpeaking(); wake-ack/sign-off lines
@@ -119,8 +178,10 @@ export function VoicePanel({
       beginStreamReply,
       markSpoken: (id: string) => spokenIdsRef.current.add(id),
       // === END MOD #45 ===
+      // === JARVIS MOD #107: the lane tags its own turns in the metrics file. ===
+      setLatencyPath,
     });
-  }, [bindTts, interrupt, speak, beginStreamReply]);
+  }, [bindTts, interrupt, speak, beginStreamReply, setLatencyPath]);
   // Effective state for the orb + label: TTS playback overrides the machine.
   const displayState: VoiceState = speaking ? 'speaking' : state;
   // === END MOD #36 ===
@@ -140,12 +201,18 @@ export function VoicePanel({
     onTtsAmplitudeChange?.(ttsAmplitude);
   }, [ttsAmplitude, onTtsAmplitudeChange]);
   useEffect(() => {
-    // === JARVIS MOD #50 fix: Realtime already speaks its own replies natively
-    // over the WebRTC audio track. Also firing the shared ElevenLabs/say engine
-    // on the same log entry (its finalized transcript) caused every Realtime
-    // reply to be spoken twice — OpenAI's voice, then ElevenLabs a beat later.
-    if (USE_REALTIME) return;
-    // === END MOD #50 fix ===
+    // === JARVIS MOD #50 fix / MOD #107 rewire: on 'realtime' OpenAI already
+    // speaks its own replies over the WebRTC audio track, and firing the shared
+    // ElevenLabs/say engine on the same finalized transcript spoke every reply
+    // twice. On 'realtime-el' the opposite is true — the session is text-only,
+    // so this effect is the ONLY thing that can voice a reply that arrived
+    // outside the streaming path (critics' 3c: an unconsumed LATE reply reaches
+    // pushAgentReply and, under the old blanket return, was silently swallowed —
+    // logged, never spoken). Replies already streamed sentence-by-sentence are
+    // markSpoken()'d by the lane before pushAgentReply, so they are skipped here
+    // and never double-spoken.
+    if (!LOCAL_TTS_OWNS_VOICE) return;
+    // === END MOD #50 fix / MOD #107 ===
     // Speak only the most recent, not-yet-spoken agent line. Speaking is a no-op
     // while muted (and no /api/uhs/tts call fires) — enforced inside useTts.
     for (let i = log.length - 1; i >= 0; i--) {
@@ -196,7 +263,7 @@ export function VoicePanel({
   const backfill = useCallback(async (): Promise<number> => {
     let surfaced = 0;
     try {
-      const res = await fetch('/api/messages/history/jarvis-telegram?limit=20', {
+      const res = await fetch(`/api/messages/history/${VOICE_AGENT}?limit=20`, {
         credentials: 'same-origin',
         cache: 'no-store',
       });
@@ -219,7 +286,21 @@ export function VoicePanel({
             sentTurns: sentTurnsRef.current,
           })
         ) {
-          pushAgentReply(it.text as string, it.id as string);
+          // === JARVIS MOD #104: if a slow lookup is owed an answer, hand the
+          // reply to the live Realtime conversation so JARVIS SPEAKS it
+          // unprompted (the spoken transcript lands in the log via the data
+          // channel). Only when no lookup is pending — or no live session —
+          // does the raw text surface here directly. ===
+          // === MOD #107 ROUND 3: ONE entry point. The lane decides whether to
+          // deliver now, hold the line while a tool dispatch reconciles, or drop
+          // it as the echo of an answer the model is already speaking. Only a
+          // lane with no reconciler (legacy) falls through to the old path. ===
+          if (!offerOutboundReply?.(it.id as string, it.text as string)) {
+            if (!deliverLateReply?.(it.text as string, it.id as string)) {
+              pushAgentReply(it.text as string, it.id as string);
+            }
+          }
+          // === END MOD #104 ===
           surfaced += 1;
         }
         // === END MOD #38 ===
@@ -228,7 +309,7 @@ export function VoicePanel({
       /* transient — next reconnect/backfill will retry */
     }
     return surfaced;
-  }, [pushAgentReply]);
+  }, [pushAgentReply, deliverLateReply, offerOutboundReply, VOICE_AGENT]);
   // === END JARVIS MOD #30 ===
 
   // --- Outbound SSE lifecycle ------------------------------------------------
@@ -245,7 +326,7 @@ export function VoicePanel({
       if (closedRef.current) return;
 
       const es = new EventSource(
-        `/api/messages/stream/jarvis-telegram?token=${encodeURIComponent(token)}`,
+        `/api/messages/stream/${VOICE_AGENT}?token=${encodeURIComponent(token)}`,
       );
       esRef.current = es;
 
@@ -273,7 +354,14 @@ export function VoicePanel({
             sentTurns: sentTurnsRef.current,
           })
         ) {
-          pushAgentReply(parsed.text as string, id);
+          // === JARVIS MOD #104: pending lookup → inject and speak (see backfill) ===
+          // === MOD #107 ROUND 3: see the backfill path above. ===
+          if (!offerOutboundReply?.(id, parsed.text as string)) {
+            if (!deliverLateReply?.(parsed.text as string, id)) {
+              pushAgentReply(parsed.text as string, id);
+            }
+          }
+          // === END MOD #104 ===
         }
         // === END MOD #38 ===
       };
@@ -290,7 +378,7 @@ export function VoicePanel({
     } catch {
       if (!closedRef.current) setTimeout(() => openStream(), 3000);
     }
-  }, [pushAgentReply]);
+  }, [pushAgentReply, deliverLateReply, offerOutboundReply, backfill, VOICE_AGENT]);
 
   useEffect(() => {
     closedRef.current = false;
@@ -392,6 +480,27 @@ export function VoicePanel({
   }, []);
   // === END MOD #47 ===
 
+  // === JARVIS MOD #104 — living transcript: auto-scroll ======================
+  // The 2026-08-04 demo (IMG_5108) showed the log frozen on the first three
+  // messages for four and a half minutes: no auto-scroll existed anywhere, and
+  // at max-h-28 everything after message three rendered below the fold. The
+  // container now follows the conversation — unless the user has deliberately
+  // scrolled up to read history, in which case we leave them alone until they
+  // return to (near) the bottom.
+  const logScrollRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const handleLogScroll = useCallback(() => {
+    const el = logScrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  }, []);
+  useEffect(() => {
+    const el = logScrollRef.current;
+    if (!el || !stickToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [log, interim, pendingLookups]);
+  // === END MOD #104 ===
+
   // === JARVIS MOD #60 — ONE mic-state source of truth (2026-08-03) ===
   // The status line read `openMic` (the wake-word toggle) and printed it as
   // "mic off", while the mic BUTTON read `state === 'listening'` — two
@@ -429,8 +538,12 @@ export function VoicePanel({
     displayState,
     supported,
     canCancelReply: typeof interruptReply === 'function',
+    // === MOD #107: capability detection — only the Realtime lane can fail into
+    // a state a retry can repair. ===
+    canRetry: typeof retry === 'function',
   });
   const stopThinking = control.mode === 'stop-reply';
+  const retryMode = control.mode === 'retry';
 
   const handleStopThinking = useCallback(() => {
     // Three parts, and all three are required:
@@ -449,14 +562,27 @@ export function VoicePanel({
     stopListening();
   }, [interruptReply, interrupt, stopListening]);
   // === END JARVIS MOD #76 ===
+
+  // === JARVIS MOD #107: recover from a failed session. The tap is also a user
+  // gesture, so it re-runs the iOS audio/media unlock on the way through — a
+  // session that died with the screen locked is exactly the case where the
+  // AudioContext has drifted to `suspended` too. ===
+  const handleRetry = useCallback(() => {
+    unlockSharedAudio();
+    retry?.();
+  }, [retry]);
+
   // Status dot: gold only while listening; cool everywhere else (MOD #56).
+  // MOD #107: failure is the one other place the palette breaks cool — red.
   const dotColor = micStatus.listening
     ? GOLD
-    : displayState === 'processing' || displayState === 'responding'
-      ? PURPLE
-      : displayState === 'speaking'
-        ? CYAN
-        : COOL_DIM;
+    : displayState === 'error'
+      ? ERROR_LINE
+      : displayState === 'processing' || displayState === 'responding'
+        ? PURPLE
+        : displayState === 'speaking'
+          ? CYAN
+          : COOL_DIM;
   // === END JARVIS MOD #60 ===
 
   return (
@@ -478,9 +604,12 @@ export function VoicePanel({
           color: COOL_TEXT,
         }}
       >
-        {/* Conversation log */}
+        {/* Conversation log — MOD #104: taller (it is the centerpiece of a demo,
+            112px hid everything past message three) + auto-scroll (ref above). */}
         <div
-          className="mb-3 max-h-28 space-y-2 overflow-y-auto pr-1 md:max-h-48"
+          ref={logScrollRef}
+          onScroll={handleLogScroll}
+          className="mb-3 max-h-56 space-y-2 overflow-y-auto pr-1 md:max-h-96"
           data-testid="cosmos-log"
         >
           {log.length === 0 && (
@@ -511,6 +640,14 @@ export function VoicePanel({
               </span>
             </div>
           ))}
+          {/* === JARVIS MOD #104: outstanding slow lookups, visible. Parallel
+              question-juggling only reads as competence if you can SEE the
+              balls in the air; each chip resolves into a spoken answer when
+              the late reply lands (deliverLateReply). === */}
+          {(pendingLookups ?? []).map((p) => (
+            <PendingChip key={p.id} question={p.question} ts={p.ts} escalated={p.escalated} />
+          ))}
+          {/* === END MOD #104 === */}
         </div>
 
         {/* Live interim transcript */}
@@ -528,7 +665,7 @@ export function VoicePanel({
               gold appears — gold border + fill + stop-square glyph + 24px gold
               glow + the 1.4s expanding pulse ring (cosmos-pulse-ring). === */}
           <button
-            onClick={stopThinking ? handleStopThinking : handleMicPress}
+            onClick={retryMode ? handleRetry : stopThinking ? handleStopThinking : handleMicPress}
             disabled={control.disabled}
             aria-label={control.ariaLabel}
             data-testid="cosmos-mic"
@@ -544,18 +681,22 @@ export function VoicePanel({
               // MOD #76: the stop-reply state is COOL. Gold stays reserved for
               // listening — a cancel affordance is not the warm accent, and
               // spending gold here would undo the point of MOD #56.
-              borderColor: micActive ? GOLD : stopThinking ? STOP_LINE : COOL_LINE,
+              borderColor: micActive ? GOLD : retryMode ? ERROR_LINE : stopThinking ? STOP_LINE : COOL_LINE,
               background: micActive
                 ? `rgba(${GOLD_RGB}, 0.14)`
-                : stopThinking
-                  ? 'rgba(148,214,216,0.12)'
-                  : 'rgba(16,26,34,0.6)',
-              color: micActive ? GOLD : stopThinking ? COOL_TEXT : COOL_DIM,
+                : retryMode
+                  ? 'rgba(224,90,74,0.14)'
+                  : stopThinking
+                    ? 'rgba(148,214,216,0.12)'
+                    : 'rgba(16,26,34,0.6)',
+              color: micActive ? GOLD : retryMode ? '#F2A99C' : stopThinking ? COOL_TEXT : COOL_DIM,
               boxShadow: micActive
                 ? `0 0 24px rgba(${GOLD_RGB}, 0.5)`
-                : stopThinking
-                  ? '0 0 18px rgba(148,214,216,0.22)'
-                  : 'none',
+                : retryMode
+                  ? '0 0 18px rgba(224,90,74,0.28)'
+                  : stopThinking
+                    ? '0 0 18px rgba(148,214,216,0.22)'
+                    : 'none',
               transition: `border-color ${DUR_BASE}ms ${EASE}, background-color ${DUR_BASE}ms ${EASE}, color ${DUR_BASE}ms ${EASE}, box-shadow ${DUR_BASE}ms ${EASE}`,
             }}
           >
@@ -567,7 +708,13 @@ export function VoicePanel({
                 style={{ borderColor: `rgba(${GOLD_RGB}, 0.55)` }}
               />
             )}
-            {micActive || stopThinking ? (
+            {retryMode ? (
+              // MOD #107: retry glyph — a failed session's only useful action.
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <polyline points="21 3 21 9 15 9" />
+              </svg>
+            ) : micActive || stopThinking ? (
               // Stop square — listening, and (MOD #76) cancelling a reply
               <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <rect x="5" y="5" width="14" height="14" rx="2.5" />
@@ -630,7 +777,11 @@ export function VoicePanel({
               OpenAI session owns ALL speech on this surface (Scott's one-voice
               rule, 2026-07-26); firing the ElevenLabs/say engine here would be
               a second voice. === */}
-          {!USE_REALTIME && (
+          {/* === MOD #107: the check belongs to whoever owns the voice, not to
+              "is this the realtime lane". On 'realtime-el' the ElevenLabs
+              pipeline IS the voice, so the one-tap audio check is exactly as
+              diagnostic there as it is on legacy. === */}
+          {LOCAL_TTS_OWNS_VOICE && (
           <button
             onClick={handleVoiceTest}
             aria-label="Test JARVIS voice"
@@ -735,7 +886,7 @@ export function VoicePanel({
         {/* === JARVIS MOD #39: mic-debug line — the mic pipeline's live state,
             always visible (dim). A suspended AudioContext + dead VAD was
             indistinguishable from "working" on 2026-07-08; never again. === */}
-        <MicDebugLine status={micStatus} />
+        <MicDebugLine status={micStatus} engine={ENGINE} />
         {/* === END JARVIS MOD #39 === */}
 
         {/* Hidden Playwright test hooks — feed the EXACT same send path as voice.
@@ -766,6 +917,42 @@ export function VoicePanel({
 }
 // === END JARVIS MOD #20 ===
 
+// === JARVIS MOD #104 — pending-lookup chip ==================================
+// One dim, left-aligned line per outstanding ask_jarvis question: what's being
+// chased and for how long. Ticks once a second (local state — the ledger array
+// itself only changes on dispatch/resolve/escalate). Escalated = the "genuinely
+// stuck" line has been spoken; the chip dims further rather than nagging.
+function PendingChip({ question, ts, escalated }: { question: string; ts: number; escalated: boolean }) {
+  const [elapsed, setElapsed] = useState(() => Math.max(0, Math.round((Date.now() - ts) / 1000)));
+  useEffect(() => {
+    const t = setInterval(() => {
+      setElapsed(Math.max(0, Math.round((Date.now() - ts) / 1000)));
+    }, 1000);
+    return () => clearInterval(t);
+  }, [ts]);
+  const short = question.length > 60 ? `${question.slice(0, 57)}…` : question;
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const clock = mins > 0 ? `${mins}m ${secs.toString().padStart(2, '0')}s` : `${secs}s`;
+  return (
+    <div className="text-left text-xs" data-testid="cosmos-pending">
+      <span
+        className={[
+          'inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5',
+          escalated
+            ? 'border-amber-300/25 bg-amber-300/5 text-amber-200/50'
+            : 'border-white/10 bg-white/5 text-[#EDE8DF]/55',
+        ].join(' ')}
+      >
+        <span className="cosmos-dot-pulse inline-block h-1.5 w-1.5 rounded-full bg-current opacity-70" aria-hidden="true" />
+        <span className="italic">still chasing: {short}</span>
+        <span className="tabular-nums opacity-70">· {clock}</span>
+      </span>
+    </div>
+  );
+}
+// === END MOD #104 ===
+
 // === JARVIS MOD #39 — on-phone mic diagnostics (2026-07-08) ===
 // Polls window.__cosmosStats (the existing seam) at 2Hz and renders one dim
 // line: mic on/off · audio-context state · live VAD energy vs threshold ·
@@ -775,6 +962,14 @@ export function VoicePanel({
 // the status dot render from, so the debug line can no longer contradict the
 // control next to it. "mic" now means capture state (hot/armed/off) and the
 // wake-word toggle is reported separately as `wake`. ===
+// === JARVIS MOD #107: engine-aware. The line reported micCtxState / vadEnergy /
+// wakeGate — every one of which is written ONLY by the legacy open-mic engine.
+// On the Realtime lanes (the ones that actually run) it therefore printed a row
+// of em-dashes forever, which reads exactly like a dead pipeline and told you
+// nothing about the pipeline that was really running. Each lane now reports its
+// own vitals: WebRTC connection state, data-channel state, shared-AudioContext
+// state, and the last error — the four things that distinguish "connecting",
+// "connected but muted", and "dead" on a phone with no console.
 interface MicStatus {
   listening: boolean;
   hot: boolean;
@@ -782,7 +977,7 @@ interface MicStatus {
   openMic: boolean;
 }
 
-function MicDebugLine({ status }: { status: MicStatus }) {
+function MicDebugLine({ status, engine }: { status: MicStatus; engine: VoiceEngine }) {
   const { hot, armed, openMic } = status;
   const [line, setLine] = useState('');
   useEffect(() => {
@@ -790,28 +985,55 @@ function MicDebugLine({ status }: { status: MicStatus }) {
       const s = (window as unknown as {
         __cosmosStats?: {
           micCtxState?: string;
+          ctxState?: string;
           vadEnergy?: number;
           openMicError?: string | null;
           wakeGate?: { lastDecision?: string; lastUtterance?: string };
+          rtcState?: string;
+          dcState?: string;
+          iceState?: string;
+          rtcError?: string | null;
+          reconnects?: number;
+          ttsPath?: string | null;
+          textIdlessDrops?: number;
         };
       }).__cosmosStats;
-      const ctxState = s?.micCtxState ?? '—';
-      const vad = s?.vadEnergy !== undefined ? s.vadEnergy.toFixed(3) : '—';
-      const err = s?.openMicError ? ` · ERR ${s.openMicError}` : '';
-      const gate = s?.wakeGate?.lastDecision
-        ? ` · ${s.wakeGate.lastDecision}: “${(s.wakeGate.lastUtterance ?? '').slice(0, 32)}”`
-        : '';
-      // MOD #39d: build stamp — "does the gray line say v39g?" instantly
-      // answers whether the installed PWA pulled fresh JS (iOS staleness lore).
       const mic = hot ? 'hot' : armed ? 'armed' : 'off';
-      setLine(
-        `v60 · mic ${mic} · wake ${openMic ? 'on' : 'off'} · audio ${ctxState} · vad ${vad}${err}${gate}`,
-      );
+      // MOD #39d / #107: build stamp — "does the gray line say v107?" instantly
+      // answers whether the installed PWA pulled fresh JS (iOS staleness lore).
+      // BUMPED with this mod on purpose: an unchanged stamp is how a stale PWA
+      // masquerades as a working one.
+      const head = `v107 · ${engine} · mic ${mic} · wake ${openMic ? 'on' : 'off'}`;
+
+      if (engine === 'legacy') {
+        const ctxState = s?.micCtxState ?? '—';
+        const vad = s?.vadEnergy !== undefined ? s.vadEnergy.toFixed(3) : '—';
+        const err = s?.openMicError ? ` · ERR ${s.openMicError}` : '';
+        const gate = s?.wakeGate?.lastDecision
+          ? ` · ${s.wakeGate.lastDecision}: “${(s.wakeGate.lastUtterance ?? '').slice(0, 32)}”`
+          : '';
+        setLine(`${head} · audio ${ctxState} · vad ${vad}${err}${gate}`);
+        return;
+      }
+
+      const rtc = s?.rtcState ?? '—';
+      const dc = s?.dcState ?? '—';
+      const ice = s?.iceState ?? '—';
+      const ctx = s?.ctxState ?? s?.micCtxState ?? '—';
+      const rec = s?.reconnects ? ` · retry ${s.reconnects}` : '';
+      const tts = engine === 'realtime-el' ? ` · tts ${s?.ttsPath ?? '—'}` : '';
+      const err = s?.rtcError ? ` · ERR ${String(s.rtcError).slice(0, 48)}` : '';
+      // MOD #107 ROUND 4: the TextLane id requirement's failure mode. If OpenAI
+      // ever stops stamping response_id on text events the lane goes SILENT —
+      // and a silent JARVIS that looks healthy is the exact failure this line
+      // was written to kill. A non-zero count here is the tell.
+      const idless = s?.textIdlessDrops ? ` · idless-drop ${s.textIdlessDrops}` : '';
+      setLine(`${head} · rtc ${rtc} · dc ${dc} · ice ${ice} · audio ${ctx}${tts}${rec}${idless}${err}`);
     };
     read();
     const t = setInterval(read, 500);
     return () => clearInterval(t);
-  }, [hot, armed, openMic]);
+  }, [hot, armed, openMic, engine]);
   return (
     <p
       className="mt-1 truncate text-[10px] text-[#EDE8DF]/30"
