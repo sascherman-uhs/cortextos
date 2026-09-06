@@ -17,6 +17,10 @@ export default defineConfig({
       react: path.resolve(__dirname, 'dashboard/node_modules/react'),
       'react-dom': path.resolve(__dirname, 'dashboard/node_modules/react-dom'),
       'next/link': path.resolve(__dirname, 'dashboard/src/lib/os03/__tests__/stubs/next-link.tsx'),
+      // The board asks the router to re-read the page after a version conflict.
+      // useRouter() throws outside a mounted App Router, so static-markup tests
+      // get a no-op router rather than the component being untestable.
+      'next/navigation': path.resolve(__dirname, 'dashboard/src/lib/os03/__tests__/stubs/next-navigation.ts'),
     },
   },
   test: {

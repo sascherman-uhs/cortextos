@@ -139,6 +139,11 @@ export interface BoardCard {
   evidenceLabel: string;
   attempts: BoardAttempt[];
   unassignedRecovery: boolean;
+  /** OS-02 optimistic-concurrency token, carried onto the card so the one move
+   *  path can echo it back as `expectedVersion`. `null` means the row reached
+   *  the board without one — the move must then fail closed and ask the person
+   *  to refresh, never post a blind write. */
+  version: number | null;
 }
 
 /** Contract's word for a completion recorded before evidence was required. */
@@ -227,6 +232,7 @@ export function toBoardCard(task: ProjectedTask): BoardCard {
     evidenceLabel,
     attempts,
     unassignedRecovery: p.unassigned_recovery,
+    version: typeof task.version === 'number' && Number.isFinite(task.version) ? task.version : null,
   };
 }
 
