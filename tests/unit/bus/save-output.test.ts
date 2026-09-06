@@ -3,6 +3,11 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { saveOutput } from '../../../src/bus/save-output';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { seedTaskFile, cleanupTaskFixtures } from '../../helpers/task-fixture';
 import type { BusPaths } from '../../../src/types';
 
 describe('saveOutput path-traversal hardening (#13)', () => {
@@ -27,7 +32,7 @@ describe('saveOutput path-traversal hardening (#13)', () => {
     mkdirSync(paths.taskDir, { recursive: true });
   });
 
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => { cleanupTaskFixtures(); rmSync(dir, { recursive: true, force: true }); });
 
   it('rejects a traversal taskId before any path is built', () => {
     const src = join(dir, 'out.txt');
@@ -41,7 +46,7 @@ describe('saveOutput path-traversal hardening (#13)', () => {
     writeFileSync(src, 'x');
     const taskId = 'task_1_001';
     // A task file whose assigned_to carries traversal — must not build a path out of the tree.
-    writeFileSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify({ id: taskId, assigned_to: '../../../etc' }));
+    seedTaskFile(paths, { id: taskId, assigned_to: '../../../etc' });
     expect(() => saveOutput(paths, { sourcePath: src, taskId }))
       .toThrow(/Invalid agent name/);
   });
@@ -50,7 +55,7 @@ describe('saveOutput path-traversal hardening (#13)', () => {
     const src = join(dir, 'report.md');
     writeFileSync(src, '# hi');
     const taskId = 'task_2_002';
-    writeFileSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify({ id: taskId, assigned_to: 'boris', outputs: [] }));
+    seedTaskFile(paths, { id: taskId, assigned_to: 'boris', outputs: [] });
     const res = saveOutput(paths, { sourcePath: src, taskId });
     expect(res.linked).toBe(true);
     expect(res.storedPath).toContain('boris');

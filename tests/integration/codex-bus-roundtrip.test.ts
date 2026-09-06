@@ -12,7 +12,12 @@ import { mkdtempSync, rmSync, mkdirSync, readdirSync, readFileSync, writeFileSyn
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { sendMessage, checkInbox, ackInbox } from '../../src/bus/message.js';
-import { createTask, listTasks } from '../../src/bus/task.js';
+import { listTasks } from '../../src/bus/task.js';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, cleanupTaskFixtures } from '../helpers/task-fixture.js';
 import { logEvent } from '../../src/bus/event.js';
 import type { BusPaths } from '../../src/types/index.js';
 
@@ -40,6 +45,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanupTaskFixtures();
   rmSync(testDir, { recursive: true, force: true });
 });
 

@@ -15,7 +15,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, transitionTask, completeTask, canonicalStateOf, findTaskFile } from '../../../src/bus/task';
+import { transitionTask, completeTask, canonicalStateOf, findTaskFile } from '../../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, seedTaskFile, cleanupTaskFixtures } from '../../helpers/task-fixture';
 import { readTaskEvents } from '../../../src/bus/task-store';
 import {
   checkTransition,
@@ -47,9 +52,7 @@ function makePaths(dir: string): BusPaths {
  *  backfilled rows look like to the contract. */
 function writeLegacyTask(paths: BusPaths, id: string, status = 'pending') {
   mkdirSync(paths.taskDir, { recursive: true });
-  writeFileSync(
-    join(paths.taskDir, `${id}.json`),
-    JSON.stringify({
+  seedTaskFile(paths, ({
       id, title: 'Renew the Colanthe contract', description: '', type: 'agent',
       needs_approval: false, status, assigned_to: 'bob', created_by: 'alice',
       org: 'TestOrg', priority: 'normal', project: '', kpi_key: null,
@@ -72,6 +75,7 @@ describe('fix5 — legacy work has a documented way forward', () => {
     process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS = 'enforced';
   });
   afterEach(() => {
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
     delete process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS;
   });

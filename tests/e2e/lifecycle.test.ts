@@ -6,7 +6,12 @@ import { execSync } from 'child_process';
 
 // Import bus functions for verification
 import { sendMessage, checkInbox, ackInbox } from '../../src/bus/message';
-import { createTask, updateTask, completeTask, listTasks } from '../../src/bus/task';
+import { updateTask, completeTask, listTasks } from '../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, cleanupTaskFixtures } from '../helpers/task-fixture';
 import { logEvent } from '../../src/bus/event';
 import { updateHeartbeat, readAllHeartbeats } from '../../src/bus/heartbeat';
 import { createApproval } from '../../src/bus/approval';
@@ -39,6 +44,7 @@ describe('E2E Lifecycle', () => {
   });
 
   afterEach(() => {
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
   });
 
