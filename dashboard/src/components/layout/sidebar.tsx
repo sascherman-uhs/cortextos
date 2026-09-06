@@ -21,6 +21,7 @@ import {
   IconSearch,
   IconClock,
   IconTarget,
+  IconTrendingUp,
   IconMessages,
   IconNotes,
   IconFolders,
@@ -75,6 +76,11 @@ const navItems: NavItem[] = [
   { label: 'KB Checklist', href: '/knowledge-base/checklist', icon: IconChecklist, section: 'intel' },
   { label: 'Wiki', href: '/wiki', icon: IconNotes, section: 'intel' },
   { label: 'Experiments', href: '/experiments', icon: IconFlask, section: 'intel' },
+  // === OS-08 (2026-09-05): the self-improvement loop, with its rejected and
+  // reverted changes. Distinct from 'Experiments' above, which is the existing
+  // CortexOS A/B surface. ===
+  { label: 'Improvements', href: '/improvements', icon: IconTrendingUp, section: 'intel' },
+  // === END OS-08 ===
   { label: 'Skills', href: '/skills', icon: IconPuzzle, section: 'intel' },
 ];
 
