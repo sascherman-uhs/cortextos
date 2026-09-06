@@ -85,6 +85,10 @@ describe('OS-02 task contract', () => {
         expect({ name: c.name, ok: r.ok, error: r.error ?? null })
           .toEqual({ name: c.name, ok: c.ok, error: c.ok ? (r.error ?? null) : c.error });
         if (c.noop) expect(r.noop).toBe(true);
+        if (c.grandfathered) {
+          expect({ name: c.name, grandfathered: r.grandfathered, waived: r.waived })
+            .toEqual({ name: c.name, grandfathered: true, waived: c.waived });
+        }
       }
       expect(contract).toBeDefined();
     });
