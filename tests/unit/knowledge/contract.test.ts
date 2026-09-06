@@ -327,3 +327,41 @@ describe('reserved slots for the authoritative layers', () => {
     expect(response.results.some((r) => r.citation.layer === 'semantic')).toBe(true);
   });
 });
+
+describe('conflicts are surfaced on the answer, not reconciled', () => {
+  it('reports two retrieved sources disagreeing about the CRM of record', () => {
+    const response = retrieve({
+      question: 'where do I look up an existing client',
+      caller: operator,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => [
+          { source: '/j/vault/old-crm-guide.md', content: 'Look the client up in GoHighLevel.', similarity: 0.82 },
+          { source: '/j/CLAUDE.md', content: 'Client lookup uses Supabase uhs_projects and project_contacts.', similarity: 0.81 },
+        ],
+      },
+    });
+    const crm = response.conflicts.find((c) => c.claim === 'client CRM system of record');
+    expect(crm).toBeDefined();
+    expect(crm!.sources).toHaveLength(2);
+  });
+
+  it('does not invent a conflict when every source agrees', () => {
+    const response = retrieve({
+      question: 'where do I look up an existing client',
+      caller: operator,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => [
+          { source: '/j/a.md', content: 'Client lookup uses Supabase uhs_projects.', similarity: 0.82 },
+          { source: '/j/b.md', content: 'project_contacts holds the contacts.', similarity: 0.81 },
+        ],
+      },
+    });
+    expect(response.conflicts.find((c) => c.claim === 'client CRM system of record')).toBeUndefined();
+  });
+});

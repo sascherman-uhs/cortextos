@@ -253,6 +253,93 @@ export function isRestrictedSource(source: string, policy: RetrievalPolicy = POL
 }
 
 // ---------------------------------------------------------------------------
+// Conflicts — surfaced, never silently resolved
+// ---------------------------------------------------------------------------
+
+export interface ConflictProbe {
+  claim: string;
+  /** Every variant that matches must agree; two matching variants is a conflict. */
+  variants: Array<{ label: string; pattern: string }>;
+}
+
+export interface SourceConflict {
+  claim: string;
+  sources: string[];
+  detail: string;
+}
+
+/**
+ * Detection is deliberately narrow: a claim is a policy statement for a small
+ * set of subjects that have exactly one correct answer. Anything broader
+ * produces noise nobody reads, and a conflict nobody reads is not surfaced.
+ */
+export const DEFAULT_CONFLICT_PROBES: ConflictProbe[] = [
+  {
+    claim: 'client CRM system of record',
+    variants: [
+      { label: 'GoHighLevel (RETIRED 2026-07-06)', pattern: '\\bgohighlevel\\b|\\bghl\\b' },
+      { label: 'Supabase uhs_projects / project_contacts', pattern: 'uhs_projects|project_contacts' },
+    ],
+  },
+  {
+    claim: 'default outbound email client',
+    variants: [
+      { label: 'Outlook', pattern: '\\boutlook\\b' },
+      { label: 'Apple Mail / mailto: (forbidden)', pattern: 'apple mail|mailto:' },
+    ],
+  },
+  {
+    claim: 'listing photo source',
+    variants: [
+      { label: 'MLS Matrix', pattern: 'mls matrix' },
+      { label: 'Zillow (forbidden)', pattern: '\\bzillow\\b' },
+    ],
+  },
+  {
+    claim: 'booking link provider',
+    variants: [
+      { label: 'UHS Scheduler', pattern: 'uhsscheduler|book\\.utopiahomestaging\\.com' },
+      { label: 'Calendly (RETIRED 2026-07)', pattern: 'calendly' },
+    ],
+  },
+];
+
+export function detectConflicts(
+  documents: Array<{ sourceId: string; content: string }>,
+  probes: ConflictProbe[] = DEFAULT_CONFLICT_PROBES,
+): SourceConflict[] {
+  const out: SourceConflict[] = [];
+  for (const probe of probes) {
+    const byVariant = new Map<string, string[]>();
+    for (const doc of documents) {
+      const lower = doc.content.toLowerCase();
+      for (const variant of probe.variants) {
+        let re: RegExp;
+        try {
+          re = new RegExp(variant.pattern, 'i');
+        } catch {
+          continue;
+        }
+        if (!re.test(lower)) continue;
+        const list = byVariant.get(variant.label) ?? [];
+        if (!list.includes(doc.sourceId)) list.push(doc.sourceId);
+        byVariant.set(variant.label, list);
+      }
+    }
+    if (byVariant.size > 1) {
+      out.push({
+        claim: probe.claim,
+        sources: Array.from(new Set(Array.from(byVariant.values()).flat())),
+        detail: Array.from(byVariant.entries())
+          .map(([label, srcs]) => `${label}: ${srcs.length} source(s)`)
+          .join(' vs '),
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Citations and results
 // ---------------------------------------------------------------------------
 
@@ -274,7 +361,17 @@ export interface Citation {
   sourceModifiedAt: string | null;
   /** When the retrieval that produced this citation ran. */
   retrievedAt: string;
-  /** True when the source file is newer than what the index returned. */
+  /**
+   * True when the source file is newer than the index entry behind this hit.
+   *
+   * Only computable when the store reports WHEN it indexed the chunk. mmrag
+   * stores `ingested_at` in chunk metadata but does not emit it in `--json`
+   * output, and mmrag is a shared skill outside this package, so per-citation
+   * staleness is currently always false. Lag IS surfaced — from the ingestion
+   * ledger, which compares source mtime against the recorded index time, on
+   * /api/kb/health and the Knowledge view's Lag tab. Adding `ingested_at` to
+   * mmrag's query output is what would make this field live.
+   */
   stale: boolean;
   /** True when the cited file no longer resolves on disk. */
   missing: boolean;
@@ -870,6 +967,12 @@ export function retrieve(opts: RetrieveOptions): RetrievalResponse {
       degraded.push(`cited source no longer resolves on disk: ${hit.citation.canonicalSource}`);
     }
   }
+
+  // Two cited sources making incompatible claims are shown as a conflict, not
+  // silently reconciled by whichever one happened to rank higher.
+  response.conflicts = detectConflicts(
+    merged.map((h) => ({ sourceId: h.citation.sourceId, content: h.content })),
+  );
 
   response.results = merged;
   response.total = merged.length;

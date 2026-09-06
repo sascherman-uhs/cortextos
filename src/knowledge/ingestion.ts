@@ -337,91 +337,13 @@ function normalizePath(p: string): string {
 // Conflicts
 // ---------------------------------------------------------------------------
 
-export interface SourceConflict {
-  claim: string;
-  /** The source ids that disagree. */
-  sources: string[];
-  detail: string;
-}
-
-/**
- * Surface (never silently resolve) two sources making incompatible claims.
- * Detection is deliberately narrow: a claim is a policy statement of the form
- * "<subject> is <X>" for a small set of subjects that have exactly one correct
- * answer. Anything broader produces noise nobody reads.
- */
-export interface ConflictProbe {
-  claim: string;
-  /** Regexes whose matches must all agree. */
-  variants: Array<{ label: string; pattern: string }>;
-}
-
-export const DEFAULT_CONFLICT_PROBES: ConflictProbe[] = [
-  {
-    claim: 'client CRM system of record',
-    variants: [
-      { label: 'GoHighLevel (RETIRED 2026-07-06)', pattern: '\\bgohighlevel\\b|\\bghl\\b' },
-      { label: 'Supabase uhs_projects / project_contacts', pattern: 'uhs_projects|project_contacts' },
-    ],
-  },
-  {
-    claim: 'default outbound email client',
-    variants: [
-      { label: 'Outlook', pattern: '\\boutlook\\b' },
-      { label: 'Apple Mail / mailto: (forbidden)', pattern: 'apple mail|mailto:' },
-    ],
-  },
-  {
-    claim: 'listing photo source',
-    variants: [
-      { label: 'MLS Matrix', pattern: 'mls matrix|matrix' },
-      { label: 'Zillow (forbidden)', pattern: '\\bzillow\\b' },
-    ],
-  },
-  {
-    claim: 'booking link provider',
-    variants: [
-      { label: 'UHS Scheduler', pattern: 'uhsscheduler|book\\.utopiahomestaging\\.com' },
-      { label: 'Calendly (RETIRED 2026-07)', pattern: 'calendly' },
-    ],
-  },
-];
-
-export function detectConflicts(
-  documents: Array<{ sourceId: string; content: string }>,
-  probes: ConflictProbe[] = DEFAULT_CONFLICT_PROBES,
-): SourceConflict[] {
-  const out: SourceConflict[] = [];
-  for (const probe of probes) {
-    const byVariant = new Map<string, string[]>();
-    for (const doc of documents) {
-      const lower = doc.content.toLowerCase();
-      for (const variant of probe.variants) {
-        let re: RegExp;
-        try {
-          re = new RegExp(variant.pattern, 'i');
-        } catch {
-          continue;
-        }
-        if (re.test(lower)) {
-          const list = byVariant.get(variant.label) ?? [];
-          if (!list.includes(doc.sourceId)) list.push(doc.sourceId);
-          byVariant.set(variant.label, list);
-        }
-      }
-    }
-    if (byVariant.size > 1) {
-      out.push({
-        claim: probe.claim,
-        sources: Array.from(new Set(Array.from(byVariant.values()).flat())),
-        detail: Array.from(byVariant.entries())
-          .map(([label, srcs]) => `${label}: ${srcs.length} source(s)`)
-          .join(' vs '),
-      });
-    }
-  }
-  return out;
-}
+// Conflict detection lives in contract.ts so `retrieve()` can surface conflicts
+// on every answer without this module importing it back (ingestion already
+// imports the contract, and a cycle would be worse than a re-export).
+export {
+  DEFAULT_CONFLICT_PROBES, detectConflicts,
+  type ConflictProbe, type SourceConflict,
+} from './contract';
 
 export function defaultLedgerPath(instanceId: string, org: string): string {
   return join(
