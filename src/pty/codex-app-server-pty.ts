@@ -77,6 +77,32 @@ const TURN_PERMISSION_OVERRIDES = {
   sandboxPolicy: { type: 'dangerFullAccess' },
 } as const;
 
+/**
+ * Opt-in via AgentConfig.capability_profile === 'read_only' (see the field's
+ * doc comment in types/index.ts). approvalPolicy stays 'never' even here —
+ * this adapter has no handler for inbound approval requests (handleRpcMessage
+ * answers any unrecognized method+id request with a JSON-RPC error), so
+ * turning approvals on would just fail every action instead of gating it.
+ * Isolation instead comes from the sandbox: 'read-only' / readOnly are the
+ * most restrictive modes the installed codex-cli app-server protocol exposes
+ * — verified via `codex app-server generate-json-schema --out <dir>` against
+ * the v2 bundle's `SandboxMode` (thread-level: "read-only" | "workspace-write"
+ * | "danger-full-access") and `SandboxPolicy` (turn-level: dangerFullAccess |
+ * readOnly | externalSandbox | workspaceWrite) definitions. `networkAccess`
+ * on ReadOnlySandboxPolicy defaults to false; set explicitly for clarity.
+ * These block filesystem writes and outbound network at the codex-enforced
+ * OS sandbox layer (seatbelt/landlock), not by anything in this adapter.
+ */
+const READ_ONLY_THREAD_PERMISSION_OVERRIDES = {
+  approvalPolicy: 'never',
+  sandbox: 'read-only',
+} as const;
+
+const READ_ONLY_TURN_PERMISSION_OVERRIDES = {
+  approvalPolicy: 'never',
+  sandboxPolicy: { type: 'readOnly', networkAccess: false },
+} as const;
+
 const SOCKET_BASENAME = 'codex.sock';
 const SOCKET_PATH_WARN_BYTES = 100;
 const BOOTSTRAP_PATTERN = '[codex-app-server] ready';
@@ -253,6 +279,20 @@ export class CodexAppServerPTY {
   /** `{ model }` when an explicit selection is active, otherwise `{}`. */
   private modelParam(): Record<string, string> {
     return this._modelOverride ? { model: this._modelOverride } : {};
+  }
+
+  /** Thread-level (thread/start, thread/resume) permission override, gated by capability_profile. */
+  private threadPermissionOverrides(): typeof THREAD_PERMISSION_OVERRIDES | typeof READ_ONLY_THREAD_PERMISSION_OVERRIDES {
+    return this._config.capability_profile === 'read_only'
+      ? READ_ONLY_THREAD_PERMISSION_OVERRIDES
+      : THREAD_PERMISSION_OVERRIDES;
+  }
+
+  /** Turn-level (turn/start) permission override, gated by capability_profile. */
+  private turnPermissionOverrides(): typeof TURN_PERMISSION_OVERRIDES | typeof READ_ONLY_TURN_PERMISSION_OVERRIDES {
+    return this._config.capability_profile === 'read_only'
+      ? READ_ONLY_TURN_PERMISSION_OVERRIDES
+      : TURN_PERMISSION_OVERRIDES;
   }
 
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
@@ -523,7 +563,7 @@ export class CodexAppServerPTY {
           threadId: persisted.threadId,
           cwd: this._cwd,
           ...this.modelParam(),
-          ...THREAD_PERMISSION_OVERRIDES,
+          ...this.threadPermissionOverrides(),
           config: { features: { goals: true } },
           excludeTurns: true,
           persistExtendedHistory: true,
@@ -542,7 +582,7 @@ export class CodexAppServerPTY {
           threadId: latest,
           cwd: this._cwd,
           ...this.modelParam(),
-          ...THREAD_PERMISSION_OVERRIDES,
+          ...this.threadPermissionOverrides(),
           config: { features: { goals: true } },
           excludeTurns: true,
           persistExtendedHistory: true,
@@ -555,7 +595,7 @@ export class CodexAppServerPTY {
     const started = await this.request<ThreadResponse>('thread/start', {
       cwd: this._cwd,
       ...this.modelParam(),
-      ...THREAD_PERMISSION_OVERRIDES,
+      ...this.threadPermissionOverrides(),
       config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
@@ -603,7 +643,7 @@ export class CodexAppServerPTY {
       threadId: this._threadId,
       input,
       ...this.modelParam(),
-      ...TURN_PERMISSION_OVERRIDES,
+      ...this.turnPermissionOverrides(),
     });
     await completion;
   }
@@ -998,10 +1038,25 @@ export class CodexAppServerPTY {
     env['CTX_AGENT_DIR'] = this._env.agentDir;
     env['CTX_PROJECT_ROOT'] = this._env.projectRoot;
 
-    if (this._env.org && this._env.projectRoot) {
-      this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
+    // capability_profile === 'read_only': never load either env file
+    // unfiltered. Only vars named in capability_env_allowlist pass through
+    // (absent/empty allowlist = zero credentials injected). This is
+    // deliberately NOT "load then strip" — the unfiltered file contents
+    // never touch `env` at all in read_only mode.
+    if (this._config.capability_profile === 'read_only') {
+      const allowlist = new Set(this._config.capability_env_allowlist ?? []);
+      if (allowlist.size > 0) {
+        if (this._env.org && this._env.projectRoot) {
+          this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env, allowlist);
+        }
+        this.loadEnvFile(join(this._env.agentDir, '.env'), env, allowlist);
+      }
+    } else {
+      if (this._env.org && this._env.projectRoot) {
+        this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
+      }
+      this.loadEnvFile(join(this._env.agentDir, '.env'), env);
     }
-    this.loadEnvFile(join(this._env.agentDir, '.env'), env);
 
     if (env['CHAT_ID']) env['CTX_TELEGRAM_CHAT_ID'] = env['CHAT_ID'];
     if (this._config.timezone) {
@@ -1012,7 +1067,8 @@ export class CodexAppServerPTY {
     return env;
   }
 
-  private loadEnvFile(path: string, env: Record<string, string>): void {
+  /** `allowlist` present (read_only mode) restricts which keys are copied into `env`. */
+  private loadEnvFile(path: string, env: Record<string, string>, allowlist?: Set<string>): void {
     if (!existsSync(path)) return;
     try {
       for (const line of readFileSync(path, 'utf-8').split('\n')) {
@@ -1020,7 +1076,9 @@ export class CodexAppServerPTY {
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          env[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          const key = trimmed.slice(0, eqIdx).trim();
+          if (allowlist && !allowlist.has(key)) continue;
+          env[key] = trimmed.slice(eqIdx + 1).trim();
         }
       }
     } catch {

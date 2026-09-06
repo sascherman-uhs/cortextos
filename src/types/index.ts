@@ -213,6 +213,33 @@ export interface AgentConfig {
    * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
+  /**
+   * Runtime capability isolation for the codex-app-server runtime only.
+   * Defaults/absent = 'full' = today's behaviour, byte-for-byte unchanged
+   * (approvalPolicy 'never' + danger-full-access sandbox on every thread/turn,
+   * both org secrets.env and the agent's own .env loaded unfiltered).
+   * 'read_only' restricts the codex-app-server sandbox to the most
+   * restrictive mode the installed protocol supports — `sandbox: 'read-only'`
+   * at the thread level, `sandboxPolicy: { type: 'readOnly', networkAccess: false }`
+   * per turn — which blocks filesystem writes and outbound network at the
+   * codex-enforced OS sandbox layer. approvalPolicy stays 'never' even in
+   * 'read_only' because this adapter has no handler for inbound approval
+   * requests (any unrecognized app-server request is answered with a JSON-RPC
+   * error), so leaving approvals on would just fail every action rather than
+   * gate it — isolation here comes from the sandbox, not from an approval
+   * prompt. 'read_only' also drops both unfiltered env-file loads (org
+   * secrets.env and the agent's .env) — see `capability_env_allowlist`.
+   */
+  capability_profile?: 'full' | 'read_only';
+  /**
+   * Only consulted when `capability_profile === 'read_only'`. Names of env
+   * vars to allow through from `orgs/<org>/secrets.env` and `<agentDir>/.env`
+   * — e.g. a read-only Supabase key. Absent/empty = no credentials at all are
+   * injected for a read_only-profile agent (safer default than trying to
+   * filter an existing secrets file line-by-line). Ignored entirely when
+   * `capability_profile` is 'full'/absent.
+   */
+  capability_env_allowlist?: string[];
 }
 
 export interface CronEntry {

@@ -1187,6 +1187,149 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 });
 
+describe('CodexAppServerPTY capability_profile (WP-7 capability isolation)', () => {
+  it('absent capability_profile: thread/start overrides are byte-identical to pre-change baseline', async () => {
+    requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
+
+    expect(requestMock).toHaveBeenCalledWith('thread/start', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      config: { features: { goals: true } },
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    });
+  });
+
+  it("'full' capability_profile produces the same thread/start overrides as absent", async () => {
+    requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'full' });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
+
+    expect(requestMock).toHaveBeenCalledWith('thread/start', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      config: { features: { goals: true } },
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    });
+  });
+
+  it("'read_only' capability_profile: thread/start does NOT use danger-full-access", async () => {
+    requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'read_only' });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
+
+    const call = requestMock.mock.calls.find((c) => c[0] === 'thread/start')!;
+    const params = call[1] as Record<string, unknown>;
+    expect(params.sandbox).toBe('read-only');
+    expect(params.sandbox).not.toBe('danger-full-access');
+    // approvalPolicy stays 'never' by design — this adapter has no approval-response
+    // handler, so isolation comes from the sandbox, not from gating approvals.
+    expect(params.approvalPolicy).toBe('never');
+  });
+
+  it("'read_only' capability_profile: thread/resume does NOT use danger-full-access", async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'persisted-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-05-07T00:00:00Z',
+    }));
+    requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'read_only' });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
+
+    const call = requestMock.mock.calls.find((c) => c[0] === 'thread/resume')!;
+    const params = call[1] as Record<string, unknown>;
+    expect(params.sandbox).toBe('read-only');
+    expect(params.approvalPolicy).toBe('never');
+  });
+
+  it("'read_only' capability_profile: turn/start does NOT use dangerFullAccess sandboxPolicy", async () => {
+    requestMock.mockResolvedValue({ result: {} });
+    const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'read_only' });
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
+      request: requestMock,
+      respondError: respondErrorMock,
+    };
+
+    pty.write('hello');
+    pty.write('\r');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(requestMock).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'hello', text_elements: [] }],
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+    });
+  });
+
+  it("'full'/absent capability_profile: buildEnv loads org secrets.env and agentDir .env unfiltered (unchanged)", () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockImplementation((p: string) => {
+      if (String(p).includes('secrets.env')) return 'TELEGRAM_BOT_TOKEN=abc123\nMODEL_API_KEY=sk-live-xyz\n';
+      if (String(p).endsWith('.env')) return 'AGENT_SPECIFIC=foo\n';
+      return '';
+    });
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    const env = (pty as unknown as { buildEnv(): Record<string, string> }).buildEnv();
+    expect(env.TELEGRAM_BOT_TOKEN).toBe('abc123');
+    expect(env.MODEL_API_KEY).toBe('sk-live-xyz');
+    expect(env.AGENT_SPECIFIC).toBe('foo');
+  });
+
+  it("'read_only' capability_profile with NO allowlist: buildEnv injects zero credentials from either file", () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockImplementation((p: string) => {
+      if (String(p).includes('secrets.env')) return 'TELEGRAM_BOT_TOKEN=abc123\nMODEL_API_KEY=sk-live-xyz\n';
+      if (String(p).endsWith('.env')) return 'AGENT_SPECIFIC=foo\n';
+      return '';
+    });
+    const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'read_only' });
+    const env = (pty as unknown as { buildEnv(): Record<string, string> }).buildEnv();
+    expect(env.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    expect(env.MODEL_API_KEY).toBeUndefined();
+    expect(env.AGENT_SPECIFIC).toBeUndefined();
+    // Base CTX_* passthrough still present — only credential files are gated.
+    expect(env.CTX_AGENT_NAME).toBe('codex-app-agent');
+  });
+
+  it("'read_only' capability_profile WITH an allowlist: only the named keys pass through", () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockImplementation((p: string) => {
+      if (String(p).includes('secrets.env')) return 'TELEGRAM_BOT_TOKEN=abc123\nSUPABASE_READONLY_KEY=ro-key-1\n';
+      if (String(p).endsWith('.env')) return 'AGENT_SPECIFIC=foo\n';
+      return '';
+    });
+    const pty = new CodexAppServerPTY(mockEnv, {
+      capability_profile: 'read_only',
+      capability_env_allowlist: ['SUPABASE_READONLY_KEY'],
+    });
+    const env = (pty as unknown as { buildEnv(): Record<string, string> }).buildEnv();
+    expect(env.SUPABASE_READONLY_KEY).toBe('ro-key-1');
+    expect(env.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    expect(env.AGENT_SPECIFIC).toBeUndefined();
+  });
+});
+
 describe('CodexAppServerPTY buildMediaPayload — dynamic fence parsing', () => {
   it('extracts a caption wrapped in a dynamically-sized (4-backtick) fence', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
