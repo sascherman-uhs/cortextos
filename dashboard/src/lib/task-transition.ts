@@ -25,9 +25,25 @@ import {
   toCanonical,
   toNative,
   isAllowedMove,
+  legalTransitionsFrom,
   type CanonicalState,
   type TaskSource,
 } from '@/lib/data/transition-contract';
+
+/**
+ * Every transition that reaches this module came from a person at the board or
+ * from an HTTP client acting as one. That makes it INTERACTIVE, and interactive
+ * transitions are contract-enforced regardless of the per-source shadow flag:
+ * the flag exists to migrate legacy background writers one at a time, not to let
+ * a dashboard click bypass the rules (plan §4, §12).
+ *
+ * This is a constant on purpose. It is never read from the request body, a
+ * header, or a query parameter — a caller cannot downgrade itself to `writer`
+ * and buy the shadow window, because nothing on the wire is consulted. The only
+ * way to get `writer` treatment is to be a process that calls the bus CLI
+ * without `--origin`, which is exactly the population being migrated.
+ */
+const ORIGIN = 'interactive' as const;
 
 export interface TransitionRequest {
   taskId: string;
@@ -45,7 +61,66 @@ export interface TransitionRequest {
 export type TransitionOutcome =
   | { ok: true; version?: number; canonicalState: CanonicalState; nativeStatus: string }
   | { ok: false; status: 409; error: 'version_conflict'; current: Record<string, unknown> | null; currentVersion?: number }
+  | {
+      ok: false;
+      status: 422;
+      error: 'contract_violation';
+      /** A sentence for the person, naming what is legal from here. */
+      message: string;
+      detail?: string;
+      violation: string;
+      legalTransitions: CanonicalState[];
+    }
   | { ok: false; status: 400 | 404 | 500; error: string; detail?: string };
+
+/** Human words for a canonical state, so a refusal reads as a sentence rather
+ *  than an enum dump. Kept deliberately close to the lane names on the board. */
+function stateLabel(state: string): string {
+  return state.replace(/_/g, ' ');
+}
+
+/** Turn a contract refusal into the one shape the API and the board render. */
+export function contractRefusal(
+  from: CanonicalState | string,
+  to: CanonicalState | string,
+  violation: string,
+  detail?: string,
+): Extract<TransitionOutcome, { status: 422 }> {
+  const legal = legalTransitionsFrom(from as CanonicalState);
+  const reason =
+    violation === 'illegal_transition'
+      ? `"${stateLabel(String(from))}" cannot move to "${stateLabel(String(to))}".`
+      : `${detail ?? violation}`;
+  const options = legal.length
+    ? ` Legal moves from "${stateLabel(String(from))}": ${legal.map(stateLabel).join(', ')}.`
+    : ` Nothing can move out of "${stateLabel(String(from))}" — it is a terminal state.`;
+  return {
+    ok: false,
+    status: 422,
+    error: 'contract_violation',
+    message: `This move was refused by the work contract. ${reason}${options}`,
+    detail,
+    violation,
+    legalTransitions: legal,
+  };
+}
+
+/**
+ * The cheap legality half, applied before anything is written.
+ *
+ * Completion is a TWO-step contract move (doing -> verify -> done), so a
+ * request to finish work that is under way is judged on that path rather than
+ * on the single hop `doing -> done`, which the contract rightly does not list.
+ * The proof each leg costs is checked by the store's own boundary.
+ */
+export function interactiveLegalityRefusal(
+  from: CanonicalState,
+  to: CanonicalState,
+): Extract<TransitionOutcome, { status: 422 }> | null {
+  if (isAllowedMove(from, to)) return null;
+  if (to === 'done' && isAllowedMove(from, 'verify') && isAllowedMove('verify', 'done')) return null;
+  return contractRefusal(from, to, 'illegal_transition');
+}
 
 function isCanonical(v: string): v is CanonicalState {
   return ['backlog', 'ready', 'doing', 'verify', 'waiting', 'done', 'cancelled', 'failed_terminal'].includes(v);
@@ -110,6 +185,15 @@ async function transitionSupabase(req: TransitionRequest): Promise<TransitionOut
   } catch (err) {
     return { ok: false, status: 500, error: 'supabase_unreachable', detail: String(err) };
   }
+
+  // The RPC is a compare-and-set, not a validator: it will happily write any
+  // status it is handed. For an interactive caller the legality of the move is
+  // checked HERE, before the write, so a person cannot click a task from
+  // backlog straight to done just because this store's writers are still being
+  // migrated.
+  const fromCanonical = toCanonical('jarvis_tasks', String(current.status ?? ''));
+  const refused = interactiveLegalityRefusal(fromCanonical, target.canonical);
+  if (refused) return refused;
 
   try {
     const res = await fetch(`${supaUrl}/rest/v1/rpc/task_transition`, {
@@ -178,12 +262,28 @@ function transitionNative(req: TransitionRequest): TransitionOutcome {
     ? [req.taskId, String(req.evidence?.result ?? req.reason ?? '')]
     : [req.taskId, target.native];
 
+  // Completion carries the evidence the contract asks for. The verifier is the
+  // person who clicked, recorded by name — that is a true statement about who
+  // signed this off, and it is the only part of the proof a UI action can
+  // honestly supply. Acceptance-check results are NOT invented here: a task
+  // that declares acceptance criteria and has no recorded results is refused,
+  // which is the whole point of "no verified Done without proof".
+  if (target.native === 'completed' && req.evidence && Object.keys(req.evidence).length > 0) {
+    args.push('--evidence', JSON.stringify(req.evidence));
+  }
+  // Interactive origin: enforced regardless of the source's shadow flag.
+  args.push('--origin', ORIGIN);
+
   const result = spawnSync('bash', [path.join(frameworkRoot, 'bus', script), ...args], {
     encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe',
   });
 
   if (result.status !== 0) {
     const stderr = String(result.stderr ?? '');
+    // A contract refusal comes back as a structured line so the board can name
+    // the rule and the legal moves rather than showing "transition failed".
+    const refusal = parseContractRefusal(stderr);
+    if (refusal) return refusal;
     // The bus surfaces a version conflict by name; translate it into the same
     // 409 the Supabase branch produces so the UI has one behavior to handle.
     if (/version conflict/i.test(stderr)) {
@@ -196,6 +296,31 @@ function transitionNative(req: TransitionRequest): TransitionOutcome {
   }
 
   return { ok: true, canonicalState: target.canonical, nativeStatus: target.native };
+}
+
+/**
+ * Read the CLI's structured refusal line. The CLI prints
+ * `CONTRACT_REFUSED {json}` on stderr and exits non-zero; anything else on
+ * stderr is an ordinary failure and is left alone.
+ */
+export function parseContractRefusal(
+  stderr: string,
+): Extract<TransitionOutcome, { status: 422 }> | null {
+  const line = stderr.split('\n').find((l) => l.startsWith('CONTRACT_REFUSED '));
+  if (!line) return null;
+  try {
+    const payload = JSON.parse(line.slice('CONTRACT_REFUSED '.length)) as {
+      from?: string; to?: string; error?: string; detail?: string;
+    };
+    return contractRefusal(
+      payload.from ?? 'unknown',
+      payload.to ?? 'unknown',
+      payload.error ?? 'contract_violation',
+      payload.detail,
+    );
+  } catch {
+    return null;
+  }
 }
 
 /** The one entry point. Routes on which store owns the record. */
