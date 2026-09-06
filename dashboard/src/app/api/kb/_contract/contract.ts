@@ -952,8 +952,13 @@ export function retrieve(opts: RetrieveOptions): RetrievalResponse {
     const slots = reserved[layer] ?? 0;
     front.push(...all.filter((h) => h.citation.layer === layer).slice(0, slots));
   }
+  // The reserved slots are ADDITIVE to topK, not carved out of it. Carving them
+  // out meant that when seven authoritative pointers fired for "which email
+  // client are outbound UHS emails drafted in?" they filled every slot and the
+  // document that actually says Outlook never appeared. A pointer costs one
+  // line and says where the fact lives; it must never displace the fact.
   const rest = all.filter((h) => !front.includes(h));
-  const merged = [...front, ...rest].slice(0, Math.max(topK, front.length));
+  const merged = [...front, ...rest.slice(0, topK)];
 
   // --- retired guidance + staleness ----------------------------------------
   for (const hit of merged) {

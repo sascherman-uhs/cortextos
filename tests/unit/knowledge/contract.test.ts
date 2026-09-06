@@ -365,3 +365,42 @@ describe('conflicts are surfaced on the answer, not reconciled', () => {
     expect(response.conflicts.find((c) => c.claim === 'client CRM system of record')).toBeUndefined();
   });
 });
+
+describe('reserved slots are additive, never carved out of topK', () => {
+  it('keeps the answer when many authoritative pointers fire', () => {
+    // "Which email client are outbound UHS emails drafted in?" fired two
+    // registry hits and five structured pointers. Carved out of topK=6 they
+    // filled every slot and the document that says "Outlook" never appeared.
+    const response = retrieve({
+      question: 'Which email client are outbound UHS emails drafted in?',
+      caller: operator, topK: 6,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['structured', 'semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => [{
+          source: '/j/AGENTS.md',
+          content: 'Email default: Outlook (scott@utopiahomestaging.com).',
+          similarity: 0.79,
+        }],
+      },
+    });
+    expect(response.results.map((r) => r.content).join(' ')).toMatch(/Outlook/);
+  });
+
+  it('still returns topK non-authoritative results alongside the pointers', () => {
+    const response = retrieve({
+      question: 'who is the owner of this property',
+      caller: operator, topK: 4,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['structured', 'semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => Array.from({ length: 6 }, (_, i) => ({
+          source: `/j/note${i}.md`, content: `note ${i}`, similarity: 0.85 - i * 0.01,
+        })),
+      },
+    });
+    expect(response.results.filter((r) => r.citation.layer === 'semantic')).toHaveLength(4);
+  });
+});
