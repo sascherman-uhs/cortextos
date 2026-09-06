@@ -94,8 +94,17 @@ export async function GET(request: NextRequest) {
   // and are invisible without this scan when the history log is empty or absent.
   const seen = new Set<string>(messages.map(m => m.id));
   const processedBase = path.join(ctxRoot, 'processed');
+  // fix8 — a message about work that ended is moved to `superseded/<agent>/`
+  // instead of being deleted, precisely so a person can still see it was sent.
+  // Leaving it out of this scan would hide it, which is the half of the fix
+  // that keeps the sweep honest.
+  const supersededBase = path.join(ctxRoot, 'superseded');
 
-  for (const [base, subs] of [[inboxBase, ['inflight', '']], [processedBase, ['']]] as const) {
+  for (const [base, subs] of [
+    [inboxBase, ['inflight', '']],
+    [processedBase, ['']],
+    [supersededBase, ['']],
+  ] as const) {
     if (!fs.existsSync(base)) continue;
     let agentDirs: string[];
     try {

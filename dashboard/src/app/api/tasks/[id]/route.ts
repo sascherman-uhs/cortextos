@@ -694,8 +694,29 @@ export async function PATCH(
         // the recipient name passes the agent-name whitelist — prevents
         // passing crafted names into the bus CLI.
         const agentNames = new Set(['dashboard', 'human', 'user']);
-        if (createdBy && !agentNames.has(createdBy) && isValidAgentName(createdBy)) {
-          const rawMsg = status === 'completed'
+
+        // fix8 — do not put a NEW pointer into an inbox for work that is over.
+        //
+        // The store has just superseded every message naming this task, because
+        // the transition reached a terminal state. Sending a fresh
+        // "Task status updated to cancelled: [task_…]" straight afterwards
+        // would land AFTER that sweep and undo it: the assignee ends up holding
+        // a pointer to cancelled work again, which is the defect this route was
+        // making worse rather than fixing.
+        //
+        // `done` is the deliberate exception, and only in its unblocking form:
+        // that message is not an instruction about the finished task, it tells
+        // the recipient that THEIR OWN blocked work can move. Cancelled and
+        // abandoned carry no such consequence for anyone, so they send nothing;
+        // the outcome is on the board and in the superseded notice.
+        const terminalOutcome =
+          outcome.canonicalState === 'done'
+          || outcome.canonicalState === 'cancelled'
+          || outcome.canonicalState === 'failed_terminal';
+        const notifiable = !terminalOutcome || outcome.canonicalState === 'done';
+
+        if (notifiable && createdBy && !agentNames.has(createdBy) && isValidAgentName(createdBy)) {
+          const rawMsg = outcome.canonicalState === 'done'
             ? `Human task completed by user: [${id}] ${task.title} - you can now unblock your work`
             : `Task status updated to ${status}: [${id}] ${task.title}`;
           const msg = capText(rawMsg);
