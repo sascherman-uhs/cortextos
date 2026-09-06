@@ -22,6 +22,7 @@ import {
   IconTarget,
   IconMessages,
   IconNotes,
+  IconFolders,
   // === JARVIS MOD #19 (2026-07-03): Cosmos tab nav icon ===
   IconPlanet,
   // === END JARVIS MOD #19 ===
@@ -61,6 +62,9 @@ const navItems: NavItem[] = [
   { label: 'Analytics', href: '/analytics', icon: IconChartDots3, section: 'ops' },
 
   // Intelligence
+  // === OS-05 (2026-09-05): Projects — the portfolio-v1 registry surface ===
+  { label: 'Projects', href: '/projects', icon: IconFolders, section: 'intel' },
+  // === END OS-05 ===
   { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2, section: 'intel' },
   { label: 'KB Checklist', href: '/knowledge-base/checklist', icon: IconChecklist, section: 'intel' },
   { label: 'Wiki', href: '/wiki', icon: IconNotes, section: 'intel' },
