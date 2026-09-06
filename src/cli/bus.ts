@@ -53,6 +53,14 @@ function resolveOrigin(opt?: string): TransitionOrigin {
  * The dashboard turns this into the board's refusal alert; a human reading a
  * terminal gets the same sentence.
  */
+/** An actor name reduced to something safe to store and compare. Undefined when
+ *  there is nothing usable, so the caller falls back rather than recording ''. */
+function sanitizeActorName(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const cleaned = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? cleaned.slice(0, 64) : undefined;
+}
+
 function exitOnContractViolation(err: unknown): never {
   if (err instanceof ContractViolation) {
     const legal = err.legalTransitions;
@@ -240,9 +248,10 @@ busCommand
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
   .option('--origin <origin>', 'interactive (a human at a UI — always enforced) or writer (a migrating background writer — honours the shadow flag)')
   .option('--fields <json>', 'Contract fields a person is supplying inline for a record that predates the contract: {"outcome","acceptanceCriteria":[],"humanAccountableId","agentRoleId"}. Recorded as a legacy_upgraded event.')
+  .option('--actor <name>', 'Who this transition is recorded against. A person when a human is driving it — the journal entry for an upgraded or waived legacy record has to name someone, and "dashboard" names a program.')
   .option('--canonical <state>', 'The canonical state this move is aiming at (backlog|ready|doing|verify|waiting|done|cancelled|failed_terminal). Needed because the native vocabulary is coarser: backlog and ready are both "pending", so without it a backlog -> ready move looks like a no-op and skips the Ready gate.')
   .option('--grandfather <json>', 'A named person\'s explicit waiver of the fields a legacy record never had: {"actor","reason"}. Recorded as a legacy_grandfathered event. Cannot waive dependencies, an illegal transition, or any part of the completion proof gate.')
-  .action((id: string, status: string, opts: { origin?: string; fields?: string; grandfather?: string; canonical?: string }) => {
+  .action((id: string, status: string, opts: { origin?: string; fields?: string; grandfather?: string; canonical?: string; actor?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -284,9 +293,11 @@ busCommand
       updateTask(paths, id, status as TaskStatus, {
         origin: resolveOrigin(opts.origin),
         ...(opts.canonical ? { canonicalState: opts.canonical as CanonicalState } : {}),
-        // Only overridden when a person named themselves in the waiver. Left
-        // alone otherwise so the existing audit line keeps its current actor.
-        ...(grandfather?.actor ? { actor: grandfather.actor } : {}),
+        // Only overridden when the caller names someone. Left alone otherwise
+        // so the existing audit line keeps its current actor.
+        ...(opts.actor || grandfather?.actor
+          ? { actor: sanitizeActorName(opts.actor) ?? grandfather!.actor }
+          : {}),
         fields,
         grandfather,
       });

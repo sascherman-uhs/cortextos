@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # update-task.sh — wrapper for Node.js CLI
 # Usage: update-task.sh <id> <status> [note] [blocked_by] [--origin interactive|writer]
-#                       [--fields <json>] [--grandfather <json>]
+#                       [--canonical <state>] [--fields <json>] [--grandfather <json>]
 #
 # --origin is forwarded to the CLI so a caller acting for a human at a UI can
 # say so: interactive transitions are contract-ENFORCED regardless of the
@@ -12,6 +12,11 @@
 # explicit waiver when the information genuinely is not available (the fallback
 # path). Both are audited by the store; neither is silent, and neither can buy
 # an illegal transition or a Done without proof.
+#
+# --canonical says which canonical state the move is aiming at. It is needed
+# because the native vocabulary is coarser than the canonical one: backlog and
+# ready are both "pending", so without it a backlog -> ready leg looks like a
+# no-op and skips the Ready gate entirely.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,7 +26,7 @@ ID="${1:-}"
 STATUS="${2:-}"
 
 if [[ -z "$ID" || -z "$STATUS" ]]; then
-  echo "Usage: update-task.sh <id> <status> [note] [blocked_by] [--origin interactive|writer] [--fields <json>] [--grandfather <json>]" >&2
+  echo "Usage: update-task.sh <id> <status> [note] [blocked_by] [--origin interactive|writer] [--canonical <state>] [--fields <json>] [--grandfather <json>]" >&2
   exit 1
 fi
 
@@ -33,12 +38,12 @@ FLAG_ARGS=()
 shift 2 || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --origin|--fields|--grandfather)
+    --origin|--fields|--grandfather|--canonical|--actor)
       [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 1; }
       FLAG_ARGS+=("$1" "$2")
       shift 2
       ;;
-    --origin=*|--fields=*|--grandfather=*)
+    --origin=*|--fields=*|--grandfather=*|--canonical=*|--actor=*)
       FLAG_ARGS+=("${1%%=*}" "${1#*=}")
       shift
       ;;

@@ -448,7 +448,7 @@ function transitionNative(req: TransitionRequest): TransitionOutcome {
   const args = target.native === 'completed'
     ? [req.taskId, String(req.evidence?.result ?? req.reason ?? '')]
     : [req.taskId, target.native];
-  if (target.native !== 'completed') args.push('--canonical', target.canonical);
+  if (target.native !== 'completed') args.push('--canonical', target.canonical, '--actor', req.actor);
   const legacyArgs = legacyPathArgs(req);
   args.push(...legacyArgs);
 
@@ -533,7 +533,7 @@ function transitionNativePath(
   for (const [index, hop] of legs.entries()) {
     const native = toNative('cortexos_tasks', hop);
     if (!native) return { ok: false, status: 400, error: 'unmappable_target_state', detail: hop };
-    const args = [req.taskId, native, '--canonical', hop, '--origin', ORIGIN];
+    const args = [req.taskId, native, '--canonical', hop, '--origin', ORIGIN, '--actor', req.actor];
     // The upgrade and the waiver belong to the leg that needed them.
     if (index === 0) args.push(...legacyPathArgs(req));
     const result = spawnSync('bash', [path.join(frameworkRoot, 'bus', 'update-task.sh'), ...args], {
