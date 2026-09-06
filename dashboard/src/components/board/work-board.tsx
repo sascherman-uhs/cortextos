@@ -33,6 +33,7 @@ import type { ProjectedTask } from '@/lib/data/tasks';
 import type { WaitingSubtype } from '@/lib/data/task-projection';
 import { BoardCardView } from './board-card';
 import { TaskDrawer, emptyDetail, type DrawerDetail } from './task-drawer';
+import { LegacyWorkDialog, type LegacyPrompt, type LegacySubmission } from './legacy-work-dialog';
 
 export type SaveState =
   | { kind: 'idle' }
@@ -58,6 +59,9 @@ export function WorkBoard({
   const [detail, setDetail] = useState<DrawerDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [mobileLane, setMobileLane] = useState<CanonicalState>('doing');
+  // A refused move that the person can actually fix. Holds what the server said
+  // was missing until they either supply it, waive it, or walk away.
+  const [legacyPrompt, setLegacyPrompt] = useState<LegacyPrompt | null>(null);
 
   // Derived state adjusted during render rather than in an effect: a fresh
   // server render replaces the optimistic rows, and switching cards clears the
@@ -99,7 +103,7 @@ export function WorkBoard({
   // The one move path
   // -------------------------------------------------------------------------
   const attemptMove = useCallback(
-    async (taskId: string, to: CanonicalState) => {
+    async (taskId: string, to: CanonicalState, submission?: LegacySubmission) => {
       const card = cardById.get(taskId);
       if (!card) return;
 
@@ -136,11 +140,12 @@ export function WorkBoard({
         const res = await fetch(`/api/tasks/${taskId}/transition`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ to, actor: 'dashboard' }),
+          body: JSON.stringify({ to, ...(submission ?? {}) }),
         });
         const data = await res.json().catch(() => ({}));
 
         if (res.ok) {
+          setLegacyPrompt(null);
           setSave({ kind: 'saved', taskId, message: `Moved to ${COLUMN_LABEL[to]}.` });
           setAnnouncement(`${card.title} moved to ${COLUMN_LABEL[to]}.`);
           // Take the server's word for the new state, not the optimistic guess.
@@ -163,6 +168,26 @@ export function WorkBoard({
             ? (data.message ??
                'This task changed while you were looking at it. The board has been put back and refreshed.')
             : (data.reason ?? data.error ?? 'The server refused this move.');
+
+        // A refusal the person can fix is not a dead end. When the server says
+        // which contract fields the record is missing, offer to take them.
+        if (res.status === 422 && Array.isArray(data.missing) && data.missing.length > 0) {
+          setLegacyPrompt({
+            taskId,
+            title: card.title,
+            to,
+            toLabel: COLUMN_LABEL[to],
+            missing: data.missing as string[],
+            waivable: data.waivable === true,
+            message,
+            suggestedOutcome: card.title,
+          });
+          setSave({ kind: 'idle' });
+          setAnnouncement(`${message} A form is open to supply what is missing.`);
+          return;
+        }
+
+        setLegacyPrompt(null);
         setSave({ kind: 'error', taskId, message });
         setAnnouncement(message);
       } catch {
@@ -275,6 +300,21 @@ export function WorkBoard({
 
   return (
     <div className="space-y-4">
+      {legacyPrompt && (
+        <LegacyWorkDialog
+          prompt={legacyPrompt}
+          busy={save.kind === 'saving'}
+          onCancel={() => {
+            setLegacyPrompt(null);
+            setAnnouncement('Left where it was. Nothing was changed.');
+            boardRef.current?.focus();
+          }}
+          onSubmit={(submission) => {
+            void attemptMove(legacyPrompt.taskId, legacyPrompt.to as CanonicalState, submission);
+          }}
+        />
+      )}
+
       {/* Save / error state, always visible and always announced. */}
       <div aria-live="polite" className="sr-only" data-testid="board-live-region">
         {announcement}

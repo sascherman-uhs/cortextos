@@ -26,6 +26,9 @@ import {
   toNative,
   isAllowedMove,
   legalTransitionsFrom,
+  resolveInteractivePath,
+  checkReady,
+  missingContractFields,
   type CanonicalState,
   type TaskSource,
 } from '@/lib/data/transition-contract';
@@ -56,6 +59,30 @@ export interface TransitionRequest {
   evidence?: Record<string, unknown>;
   reason?: string;
   org?: string;
+  /**
+   * Contract fields the person supplied inline for a record that predates the
+   * contract. The UPGRADE path: the task stops being legacy and every later
+   * transition is judged on the merits.
+   */
+  fields?: {
+    outcome?: string;
+    acceptanceCriteria?: string[];
+    humanAccountableId?: string;
+    agentRoleId?: string;
+  };
+  /**
+   * The person's explicit waiver of fields a legacy record never had. The
+   * FALLBACK path. Audited, never silent, and powerless over dependencies, the
+   * state graph, or the completion proof gate.
+   */
+  grandfather?: { actor?: string; reason?: string };
+  /**
+   * The native status the caller believes the record is in, from the board's
+   * own projection. Used only to CHOOSE a route; the owning store re-reads the
+   * canonical record and refuses the move if this was stale, so a wrong guess
+   * costs a refusal, never a bad write.
+   */
+  fromNativeStatus?: string;
 }
 
 export type TransitionOutcome =
@@ -70,6 +97,15 @@ export type TransitionOutcome =
       detail?: string;
       violation: string;
       legalTransitions: CanonicalState[];
+      /** Contract fields the record does not have. Present so the board can
+       *  offer the form that supplies them instead of a dead end. */
+      missing?: string[];
+      /** The record predates the contract and is missing required fields. */
+      legacy?: boolean;
+      /** A human may waive these particular gaps on this record. */
+      waivable?: boolean;
+      /** What the person can actually do about it, in order of preference. */
+      remedies?: ('supply_fields' | 'grandfather')[];
     }
   | { ok: false; status: 400 | 404 | 500; error: string; detail?: string };
 
@@ -85,6 +121,7 @@ export function contractRefusal(
   to: CanonicalState | string,
   violation: string,
   detail?: string,
+  extra: { missing?: string[]; legacy?: boolean; waivable?: boolean } = {},
 ): Extract<TransitionOutcome, { status: 422 }> {
   const legal = legalTransitionsFrom(from as CanonicalState);
   const reason =
@@ -94,14 +131,54 @@ export function contractRefusal(
   const options = legal.length
     ? ` Legal moves from "${stateLabel(String(from))}": ${legal.map(stateLabel).join(', ')}.`
     : ` Nothing can move out of "${stateLabel(String(from))}" — it is a terminal state.`;
+
+  // A refusal that only names the rule leaves the person stuck. When the record
+  // is simply missing information, say which information and what they can do
+  // about it — that is the difference between a wall and a form.
+  // A refusal of the waiver itself is about the waiver, not about the record's
+  // gaps — say so rather than repeating the missing-fields sentence.
+  if (violation.startsWith('missing_grandfather')) {
+    return {
+      ok: false,
+      status: 422,
+      error: 'contract_violation',
+      message: detail ?? 'A waiver has to name a person and record why.',
+      detail,
+      violation,
+      legalTransitions: legal,
+      ...(extra.missing?.length ? { missing: extra.missing } : {}),
+      ...(extra.legacy !== undefined ? { legacy: extra.legacy } : {}),
+      ...(extra.waivable !== undefined ? { waivable: extra.waivable } : {}),
+      remedies: ['supply_fields', 'grandfather'],
+    };
+  }
+
+  const missing = extra.missing ?? [];
+  const remedies: ('supply_fields' | 'grandfather')[] = missing.length
+    ? extra.waivable ? ['supply_fields', 'grandfather'] : ['supply_fields']
+    : [];
+  const guidance = missing.length
+    ? ` This task is missing ${missing.join(' and ')}.`
+      + (extra.legacy
+        ? ' It predates the work contract, so nothing ever asked for them —'
+          + ' supply them now and the task moves as ordinary contract work.'
+        : ' It was created under the work contract, so these have to be filled in.')
+    : '';
+
   return {
     ok: false,
     status: 422,
     error: 'contract_violation',
-    message: `This move was refused by the work contract. ${reason}${options}`,
+    message: missing.length
+      ? `This move was refused by the work contract.${guidance}`
+      : `This move was refused by the work contract. ${reason}${options}`,
     detail,
     violation,
     legalTransitions: legal,
+    ...(missing.length ? { missing } : {}),
+    ...(extra.legacy !== undefined ? { legacy: extra.legacy } : {}),
+    ...(extra.waivable !== undefined ? { waivable: extra.waivable } : {}),
+    ...(remedies.length ? { remedies } : {}),
   };
 }
 
@@ -117,9 +194,7 @@ export function interactiveLegalityRefusal(
   from: CanonicalState,
   to: CanonicalState,
 ): Extract<TransitionOutcome, { status: 422 }> | null {
-  if (isAllowedMove(from, to)) return null;
-  if (to === 'done' && isAllowedMove(from, 'verify') && isAllowedMove('verify', 'done')) return null;
-  return contractRefusal(from, to, 'illegal_transition');
+  return resolveInteractivePath(from, to) ? null : contractRefusal(from, to, 'illegal_transition');
 }
 
 function isCanonical(v: string): v is CanonicalState {
@@ -187,50 +262,153 @@ async function transitionSupabase(req: TransitionRequest): Promise<TransitionOut
   }
 
   // The RPC is a compare-and-set, not a validator: it will happily write any
-  // status it is handed. For an interactive caller the legality of the move is
-  // checked HERE, before the write, so a person cannot click a task from
-  // backlog straight to done just because this store's writers are still being
-  // migrated.
+  // status it is handed. For this store the dashboard IS the boundary, so the
+  // legality of the move AND the proof each leg costs are checked HERE, before
+  // any write, using the same fixture the core validator reads.
   const fromCanonical = toCanonical('jarvis_tasks', String(current.status ?? ''));
-  const refused = interactiveLegalityRefusal(fromCanonical, target.canonical);
-  if (refused) return refused;
 
-  try {
-    const res = await fetch(`${supaUrl}/rest/v1/rpc/task_transition`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        p_task_id: numericId,
-        p_expected_version: expected,
-        p_new_status: target.native,
-        p_actor: req.actor,
-        p_evidence: req.evidence ?? {},
-        p_reason: req.reason ?? null,
-      }),
+  // One gesture, possibly several legs. "Start" on a backlog card is a request
+  // to go through Ready, not a request to invent a backlog -> doing edge.
+  const path = resolveInteractivePath(fromCanonical, target.canonical);
+  if (!path) return contractRefusal(fromCanonical, target.canonical, 'illegal_transition');
+
+  const item = supabaseContractItem(current, req.fields);
+
+  // Gate the Ready leg before writing anything. A refusal here carries what the
+  // record is missing, so the board can offer the form rather than a wall.
+  let grandfathered: { waived: string[]; actor: string; reason: string } | null = null;
+  if (path.includes('ready')) {
+    const ready = checkReady(item, {
+      grandfather: req.grandfather ? { actor: req.grandfather.actor ?? req.actor, ...req.grandfather } : undefined,
     });
-    if (!res.ok) {
-      return { ok: false, status: 500, error: 'transition_rpc_failed', detail: `${res.status}` };
+    if (!ready.ok) {
+      return contractRefusal(fromCanonical, 'ready', ready.error ?? 'contract_violation', ready.detail, {
+        missing: ready.missing,
+        legacy: ready.legacy,
+        waivable: ready.waivable,
+      });
     }
-    const out = await res.json();
-    if (out?.ok === false && out?.error === 'version_conflict') {
-      return {
-        ok: false, status: 409, error: 'version_conflict',
-        current: out.current ?? current,
-        currentVersion: Number(out.current_version),
+    if (ready.grandfathered) {
+      grandfathered = {
+        waived: ready.waived ?? [],
+        actor: req.grandfather?.actor ?? req.actor,
+        reason: req.grandfather?.reason ?? '',
       };
     }
-    if (out?.ok !== true) {
-      return { ok: false, status: 500, error: String(out?.error ?? 'transition_failed') };
-    }
-    return {
-      ok: true,
-      version: Number(out.version),
-      canonicalState: target.canonical,
-      nativeStatus: target.native,
-    };
-  } catch (err) {
-    return { ok: false, status: 500, error: 'supabase_unreachable', detail: String(err) };
   }
+
+  // Upgrading a record or recording a waiver has to happen in the same
+  // compare-and-set as the move it authorises, which is what task_transition_v2
+  // exists for. An install that has not run migration 005 says so plainly
+  // rather than half-writing anything.
+  const needsV2 = Boolean(grandfathered) || fieldPatch(req.fields) !== null;
+
+  let version = expected as number;
+  let lastNative = String(current.status ?? '');
+  for (const [index, hop] of path.entries()) {
+    const native = toNative('jarvis_tasks', hop);
+    if (!native) return { ok: false, status: 400, error: 'unmappable_target_state', detail: hop };
+    // The upgrade and the waiver belong to the leg that needed them — the first
+    // one — and must not be replayed on every hop.
+    const first = index === 0;
+    const useV2 = needsV2 && first;
+    const body: Record<string, unknown> = {
+      p_task_id: numericId,
+      p_expected_version: version,
+      p_new_status: native,
+      p_actor: req.actor,
+      p_evidence: hop === target.canonical ? (req.evidence ?? {}) : {},
+      p_reason: hop === target.canonical ? (req.reason ?? null) : `leg of ${fromCanonical} -> ${target.canonical}`,
+    };
+    if (useV2) {
+      body.p_fields = fieldPatch(req.fields);
+      body.p_grandfather = grandfathered
+        ? { ...grandfathered, was_missing: missingContractFields(supabaseContractItem(current)) }
+        : null;
+      body.p_canonical_to = hop;
+    }
+
+    try {
+      const res = await fetch(`${supaUrl}/rest/v1/rpc/${useV2 ? 'task_transition_v2' : 'task_transition'}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        if (useV2 && (res.status === 404 || res.status === 400)) {
+          return {
+            ok: false, status: 500, error: 'legacy_path_unavailable',
+            detail:
+              'This task needs the legacy-work path (migration 005_legacy_grandfather.sql), which is not installed '
+              + 'on this database. Nothing was changed.',
+          };
+        }
+        return { ok: false, status: 500, error: 'transition_rpc_failed', detail: `${res.status}` };
+      }
+      const out = await res.json();
+      if (out?.ok === false && out?.error === 'version_conflict') {
+        return {
+          ok: false, status: 409, error: 'version_conflict',
+          current: out.current ?? current,
+          currentVersion: Number(out.current_version),
+        };
+      }
+      if (out?.ok !== true) {
+        return { ok: false, status: 500, error: String(out?.error ?? 'transition_failed') };
+      }
+      version = Number(out.version);
+      lastNative = native;
+    } catch (err) {
+      return { ok: false, status: 500, error: 'supabase_unreachable', detail: String(err) };
+    }
+  }
+
+  return {
+    ok: true,
+    version,
+    canonicalState: target.canonical,
+    nativeStatus: lastNative,
+  };
+}
+
+/**
+ * The contract's view of a Supabase task row.
+ *
+ * `outcome` falls back to the payload title, the same default the native store
+ * uses at creation: the title IS the stated outcome for ordinary work, and
+ * pretending otherwise would make every row fail a check it actually passes.
+ * Fields the caller is supplying right now are folded in, so the gate judges the
+ * record as it will stand after the write rather than as it stands before it.
+ */
+export function supabaseContractItem(
+  row: Record<string, unknown>,
+  fields?: TransitionRequest['fields'],
+): Record<string, unknown> {
+  const payload = (row.payload ?? {}) as Record<string, unknown>;
+  const criteria = Array.isArray(row.acceptance_criteria) ? row.acceptance_criteria : [];
+  const supplied = (fields?.acceptanceCriteria ?? []).filter((c) => String(c ?? '').trim().length > 0);
+  return {
+    outcome: fields?.outcome?.trim() || row.outcome || payload.title || null,
+    agent_role_id: fields?.agentRoleId?.trim() || row.agent_role_id || null,
+    human_accountable_id: fields?.humanAccountableId?.trim() || row.human_accountable_id || null,
+    acceptance_criteria: supplied.length ? supplied : criteria,
+    contract_version: row.contract_version ?? null,
+  };
+}
+
+/** The subset of columns the inline form may write, or null when it writes
+ *  nothing. Deliberately not a general task editor. */
+export function fieldPatch(fields: TransitionRequest['fields']): Record<string, unknown> | null {
+  if (!fields) return null;
+  const patch: Record<string, unknown> = {};
+  if (fields.outcome?.trim()) patch.outcome = fields.outcome.trim();
+  const criteria = (fields.acceptanceCriteria ?? [])
+    .map((c) => String(c ?? '').trim())
+    .filter((c) => c.length > 0);
+  if (criteria.length) patch.acceptance_criteria = criteria;
+  if (fields.humanAccountableId?.trim()) patch.human_accountable_id = fields.humanAccountableId.trim();
+  if (fields.agentRoleId?.trim()) patch.agent_role_id = fields.agentRoleId.trim();
+  return Object.keys(patch).length ? patch : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,10 +435,22 @@ function transitionNative(req: TransitionRequest): TransitionOutcome {
     CTX_ORG: req.org ?? '',
   };
 
+  // One gesture, possibly several legs — the core bus judges each on its own
+  // terms. Completion still goes through complete-task.sh, which owns the
+  // doing -> verify -> done pair; everything else walks the resolved path.
+  if (target.native !== 'completed') {
+    const from = toCanonical('cortexos_tasks', String(currentNativeStatus(req) ?? ''));
+    const path = resolveInteractivePath(from, target.canonical);
+    if (path && path.length > 1) return transitionNativePath(req, path, frameworkRoot, env);
+  }
+
   const script = target.native === 'completed' ? 'complete-task.sh' : 'update-task.sh';
   const args = target.native === 'completed'
     ? [req.taskId, String(req.evidence?.result ?? req.reason ?? '')]
     : [req.taskId, target.native];
+  if (target.native !== 'completed') args.push('--canonical', target.canonical, '--actor', req.actor);
+  const legacyArgs = legacyPathArgs(req);
+  args.push(...legacyArgs);
 
   // Completion carries the evidence the contract asks for. The verifier is the
   // person who clicked, recorded by name — that is a true statement about who
@@ -299,6 +489,72 @@ function transitionNative(req: TransitionRequest): TransitionOutcome {
 }
 
 /**
+ * The current native status of a native task, read from the SQLite projection.
+ *
+ * A projection is good enough to CHOOSE a route: the core bus re-reads the
+ * canonical record under a lock and refuses the move if the projection was
+ * stale, so a wrong guess here costs a refusal, never a bad write.
+ */
+function currentNativeStatus(req: TransitionRequest): string | null {
+  if (req.fromNativeStatus) return req.fromNativeStatus;
+  return null;
+}
+
+/** Flags that carry the inline-supplied fields and the recorded waiver to the
+ *  core bus, which owns the audit. Empty when this is an ordinary move. */
+function legacyPathArgs(req: TransitionRequest): string[] {
+  const args: string[] = [];
+  const patch = req.fields;
+  if (patch && (patch.outcome || patch.acceptanceCriteria?.length || patch.humanAccountableId || patch.agentRoleId)) {
+    args.push('--fields', JSON.stringify(patch));
+  }
+  if (req.grandfather) {
+    args.push('--grandfather', JSON.stringify({ actor: req.grandfather.actor ?? req.actor, reason: req.grandfather.reason }));
+  }
+  return args;
+}
+
+/**
+ * Walk a multi-leg path against the native store, one bus call per leg.
+ *
+ * Legs are separate transitions on purpose: each is validated, versioned and
+ * journalled in its own right, so the history reads "backlog -> ready (waived
+ * by scott, reason ...)" then "ready -> doing" rather than a single hop that
+ * quietly skipped the gate. A refused leg stops the walk and the earlier legs
+ * stand, which is the honest outcome — they were legal and they happened.
+ */
+function transitionNativePath(
+  req: TransitionRequest,
+  legs: CanonicalState[],
+  frameworkRoot: string,
+  env: NodeJS.ProcessEnv,
+): TransitionOutcome {
+  let last: TransitionOutcome = { ok: false, status: 500, error: 'empty_path' };
+  for (const [index, hop] of legs.entries()) {
+    const native = toNative('cortexos_tasks', hop);
+    if (!native) return { ok: false, status: 400, error: 'unmappable_target_state', detail: hop };
+    const args = [req.taskId, native, '--canonical', hop, '--origin', ORIGIN, '--actor', req.actor];
+    // The upgrade and the waiver belong to the leg that needed them.
+    if (index === 0) args.push(...legacyPathArgs(req));
+    const result = spawnSync('bash', [path.join(frameworkRoot, 'bus', 'update-task.sh'), ...args], {
+      encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe',
+    });
+    if (result.status !== 0) {
+      const stderr = String(result.stderr ?? '');
+      const refusal = parseContractRefusal(stderr);
+      if (refusal) return refusal;
+      if (/version conflict/i.test(stderr)) {
+        return { ok: false, status: 409, error: 'version_conflict', current: null };
+      }
+      if (/not found/i.test(stderr)) return { ok: false, status: 404, error: 'task_not_found' };
+      return { ok: false, status: 500, error: 'transition_failed', detail: stderr.slice(0, 500) };
+    }
+    last = { ok: true, canonicalState: hop, nativeStatus: native };
+  }
+  return last;
+}
+
+/**
  * Read the CLI's structured refusal line. The CLI prints
  * `CONTRACT_REFUSED {json}` on stderr and exits non-zero; anything else on
  * stderr is an ordinary failure and is left alone.
@@ -311,12 +567,14 @@ export function parseContractRefusal(
   try {
     const payload = JSON.parse(line.slice('CONTRACT_REFUSED '.length)) as {
       from?: string; to?: string; error?: string; detail?: string;
+      missing?: string[]; legacy?: boolean; waivable?: boolean;
     };
     return contractRefusal(
       payload.from ?? 'unknown',
       payload.to ?? 'unknown',
       payload.error ?? 'contract_violation',
       payload.detail,
+      { missing: payload.missing, legacy: payload.legacy, waivable: payload.waivable },
     );
   } catch {
     return null;

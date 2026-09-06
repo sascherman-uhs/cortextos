@@ -20,7 +20,7 @@
 // === END header ===
 
 import {
-  isAllowedMove,
+  resolveInteractivePath,
   loadTransitionContract,
   sourceForTaskId,
   toCanonical,
@@ -379,7 +379,11 @@ export function checkMove(
   if (card.state === to) {
     return { allowed: false, reason: 'That card is already in this lane.', serverWillCheck: [] };
   }
-  if (!isAllowedMove(card.state, to)) {
+  // A move may legitimately decompose into more than one leg: Start on a
+  // backlog card means "through Ready", the way Complete means "through
+  // Verify". Only a gesture with no route at all is refused before sending.
+  const legs = resolveInteractivePath(card.state, to, contract);
+  if (!legs) {
     const legal = contract.allowed_transitions[card.state] ?? [];
     return {
       allowed: false,
@@ -391,8 +395,11 @@ export function checkMove(
     };
   }
 
-  const req = contract.requirements[to] as Record<string, unknown> | undefined;
+  // Every leg's requirements are the person's to know about, not just the last
+  // one's: a Start that has to pass through Ready is gated on Ready's fields.
   const serverWillCheck: string[] = [];
+  for (const leg of legs) {
+  const req = contract.requirements[leg] as Record<string, unknown> | undefined;
   if (req) {
     if (Array.isArray(req.fields)) {
       serverWillCheck.push(`Required fields: ${(req.fields as string[]).join(', ')}`);
@@ -410,7 +417,8 @@ export function checkMove(
       );
     }
   }
-  return { allowed: true, reason: null, serverWillCheck };
+  }
+  return { allowed: true, reason: null, serverWillCheck: [...new Set(serverWillCheck)] };
 }
 
 /** Lanes a card may be dropped into, for keyboard and drag affordances. */

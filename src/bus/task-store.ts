@@ -47,6 +47,11 @@ export interface TaskContractMeta {
   agent_role_id?: string | null;
   outcome?: string | null;
   acceptance_criteria?: unknown[];
+  /** Stamped at creation by a contract-aware writer. Absent on every record
+   *  written before OS-02 — that absence is how legacy work is identified. */
+  contract_version?: number | null;
+  /** Set when a human advanced this record without its required fields. */
+  legacy_grandfathered?: boolean;
   dependency_ids?: string[];
   authorization_scope?: string | null;
   attempt_limit?: number | null;
@@ -161,6 +166,9 @@ export function readMeta(task: Record<string, unknown>): TaskContractMeta {
     agent_role_id: (task.agent_role_id as string) ?? null,
     outcome: (task.outcome as string) ?? null,
     acceptance_criteria: Array.isArray(task.acceptance_criteria) ? task.acceptance_criteria : [],
+    contract_version:
+      typeof task.contract_version === 'number' ? task.contract_version : null,
+    legacy_grandfathered: task.legacy_grandfathered === true,
     dependency_ids: Array.isArray(task.dependency_ids) ? (task.dependency_ids as string[]) : [],
     authorization_scope: (task.authorization_scope as string) ?? null,
     attempt_limit: (task.attempt_limit as number) ?? null,
@@ -221,6 +229,14 @@ export interface MutateOptions {
    *  verified-pending task back to `doing` would lose the distinction the whole
    *  proof gate depends on. */
   canonicalState?: CanonicalState;
+  /**
+   * Extra journal entries written under the SAME lock and the same version as
+   * the transition itself. A legacy record being upgraded or waived produces
+   * two facts — what the human supplied, and where the task moved — and they
+   * must land together or not at all. Appending them after the lock releases
+   * would let a crash record a move whose authorisation is missing.
+   */
+  extraEvents?: { event: string; payload?: Record<string, unknown> }[];
 }
 
 export interface MutateResult<T = Record<string, unknown>> {
@@ -269,6 +285,14 @@ export function mutateTask(
     task.canonical_state = opts.canonicalState ?? toCanonical('cortexos_tasks', task.status as string);
 
     atomicWriteSync(taskFile, JSON.stringify(task));
+    for (const extra of opts.extraEvents ?? []) {
+      appendTaskEvent(paths, taskFile, taskId, {
+        version: nextVersion,
+        event: extra.event,
+        actor: opts.actor,
+        payload: extra.payload,
+      });
+    }
     appendTaskEvent(paths, taskFile, taskId, {
       version: nextVersion,
       event: opts.event,

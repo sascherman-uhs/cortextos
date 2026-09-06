@@ -21,9 +21,10 @@
 import { NextRequest } from 'next/server';
 import { getTaskById } from '@/lib/data/tasks';
 import { transitionTask } from '@/lib/task-transition';
+import { signedInActor } from '@/lib/actor';
 import {
-  isAllowedMove,
   loadTransitionContract,
+  resolveInteractivePath,
   sourceForTaskId,
   toCanonical,
   type CanonicalState,
@@ -45,6 +46,46 @@ const BOARD_FORBIDDEN: Partial<Record<CanonicalState, string>> = {
 
 function isValidId(id: string): boolean {
   return /^[a-zA-Z0-9_-]+$/.test(id);
+}
+
+const MAX_CRITERIA = 20;
+const MAX_TEXT = 500;
+
+/** The inline "fill in what is missing" form. Only the contract's required
+ *  fields, capped — this is not a general task editor on a different door. */
+function parseFields(raw: unknown): {
+  outcome?: string;
+  acceptanceCriteria?: string[];
+  humanAccountableId?: string;
+  agentRoleId?: string;
+} | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const f = raw as Record<string, unknown>;
+  const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, MAX_TEXT) : undefined);
+  const criteria = Array.isArray(f.acceptanceCriteria)
+    ? f.acceptanceCriteria
+        .map((c) => (typeof c === 'string' ? c.trim().slice(0, MAX_TEXT) : ''))
+        .filter((c) => c.length > 0)
+        .slice(0, MAX_CRITERIA)
+    : undefined;
+  const out = {
+    outcome: text(f.outcome),
+    acceptanceCriteria: criteria?.length ? criteria : undefined,
+    humanAccountableId: text(f.humanAccountableId),
+    agentRoleId: text(f.agentRoleId),
+  };
+  return Object.values(out).some((v) => v !== undefined) ? out : undefined;
+}
+
+/** The waiver. The actor is the signed-in person, never the request body: a
+ *  client cannot sign someone else's name to a decision. */
+function parseGrandfather(raw: unknown, actor: string): { actor: string; reason: string } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  // A blank reason is NOT dropped back to an ordinary move: the person asked to
+  // waive, and the contract owes them the specific refusal that says a waiver
+  // has to record why.
+  const reason = (raw as Record<string, unknown>).reason;
+  return { actor, reason: typeof reason === 'string' ? reason.trim().slice(0, MAX_TEXT) : '' };
 }
 
 export async function POST(
@@ -96,7 +137,10 @@ export async function POST(
     );
   }
 
-  if (!isAllowedMove(from, to)) {
+  // A gesture may legitimately decompose into more than one leg — Start on a
+  // backlog card means "through Ready", the way Complete means "through
+  // Verify". Only a request with no route at all is refused here.
+  if (!resolveInteractivePath(from, to)) {
     const legal = loadTransitionContract().allowed_transitions[from] ?? [];
     return Response.json(
       {
@@ -112,17 +156,56 @@ export async function POST(
     );
   }
 
+  // Who is doing this. A waiver has to name a person, and 'dashboard' names a
+  // program. Never taken from the request body.
+  const actor = (await signedInActor()) ?? 'dashboard';
+
+  const fields = parseFields(body.fields);
+  const grandfather = parseGrandfather(body.grandfather, actor);
+  if (grandfather && actor === 'dashboard') {
+    return Response.json(
+      {
+        error: 'grandfather_needs_a_person',
+        reason:
+          'Advancing a task without its acceptance criteria is recorded against the person who decided it. '
+          + 'Sign in first so the waiver can name you.',
+      },
+      { status: 403 },
+    );
+  }
+
   const outcome = await transitionTask({
     taskId: id,
     to,
-    actor: 'dashboard',
+    actor,
     expectedVersion:
       typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined,
     reason: typeof body.reason === 'string' ? body.reason.slice(0, 2000) : undefined,
     org: task.org || '',
+    fromNativeStatus: task.status,
+    fields,
+    grandfather,
   });
 
   if (!outcome.ok) {
+    if (outcome.status === 422) {
+      // The rules said no, and the response says what is missing so the board
+      // can offer the form that fixes it rather than a dead end.
+      return Response.json(
+        {
+          error: outcome.error,
+          reason: outcome.message,
+          detail: outcome.detail,
+          violation: outcome.violation,
+          legalTransitions: outcome.legalTransitions,
+          missing: outcome.missing,
+          legacy: outcome.legacy,
+          waivable: outcome.waivable,
+          remedies: outcome.remedies,
+        },
+        { status: 422 },
+      );
+    }
     if (outcome.status === 409) {
       return Response.json(
         {
