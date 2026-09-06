@@ -14,13 +14,15 @@
  *   C5  D13    failed and cancelled work is in the default /tasks Kanban.
  *   C6  D6     create-task with no org refuses (covered at the CLI); the
  *              with-org path reaches the board.
- *   C7  D3     /improvements renders an honest empty state, no Supabase 404s.
+*   C7  D3     /improvements renders an honest empty state, no Supabase 404s.
+ *   C8  D6b    create-approval with no org refuses; with an org it reaches the
+ *              approvals queue, the API and the dashboard.
  *   C8  L3'    the acceptance-criteria gate still fires once a version is sent.
  *
  * Every fixture carries ZZTEST and is deleted in a finally block.
  */
 import { test, expect, type Page } from '@playwright/test';
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
@@ -55,7 +57,40 @@ function patchNativeTask(id: string, mutate: (t: Record<string, unknown>) => voi
   mutate(t);
   writeFileSync(taskPath(id), JSON.stringify(t, null, 2));
 }
-function deleteNativeTask(id: string) { try { unlinkSync(taskPath(id)); } catch { /* gone */ } }
+/**
+ * Remove a fixture and everything it left behind. Deleting only the task file
+ * leaves the audit log, the task-events log and the inbox messages the board
+ * generated when the card moved — 134 such files had accumulated across this
+ * verification effort before anyone looked. Cleanup means all of it.
+ */
+function deleteNativeTask(id: string) {
+  const ORG_ROOT = join(process.env.HOME || '', '.cortextos', 'default', 'orgs', 'uhs');
+  const INSTANCE_ROOT = join(process.env.HOME || '', '.cortextos', 'default');
+  for (const f of [
+    taskPath(id),
+    join(ORG_ROOT, 'tasks', 'audit', `${id}.jsonl`),
+    join(ORG_ROOT, 'task-events', `${id}.jsonl`),
+    join(INSTANCE_ROOT, 'tasks', 'audit', `${id}.jsonl`),
+    join(INSTANCE_ROOT, 'task-events', `${id}.jsonl`),
+  ]) {
+    try { unlinkSync(f); } catch { /* not there */ }
+  }
+  // Inbox notifications the dashboard sent about this task, to whichever
+  // agent they were addressed to.
+  const inbox = join(INSTANCE_ROOT, 'inbox');
+  let agents: string[] = [];
+  try { agents = readdirSync(inbox); } catch { return; }
+  for (const agent of agents) {
+    let files: string[] = [];
+    try { files = readdirSync(join(inbox, agent)); } catch { continue; }
+    for (const f of files) {
+      const full = join(inbox, agent, f);
+      try {
+        if (readFileSync(full, 'utf-8').includes(id)) unlinkSync(full);
+      } catch { /* unreadable or already gone */ }
+    }
+  }
+}
 async function shot(page: Page, name: string) { await page.screenshot({ path: join(SHOTS, `${name}.png`), fullPage: true }); }
 function saveEvidence(name: string, e: unknown) { writeFileSync(join(SHOTS, `${name}.json`), JSON.stringify(e, null, 2)); }
 
@@ -389,4 +424,103 @@ test('C7: the Improvements view renders an honest empty state with no failing re
   expect(e.mentions_404, 'the page must not surface a missing-table error').toBe(false);
   expect(failed, `failing requests: ${JSON.stringify(failed)}`).toHaveLength(0);
   expect(Number(e.chars), 'the page must render content').toBeGreaterThan(200);
+});
+
+// ===========================================================================
+// C8. The same org hole on approvals, and the worse one: an approval nobody
+//     can see looks, to the agent waiting on it, exactly like one still pending.
+// ===========================================================================
+const APPROVAL_ROOT = join(process.env.HOME || '', '.cortextos', 'default', 'orgs', 'uhs', 'approvals');
+const NO_ORG_APPROVAL_ROOT = join(process.env.HOME || '', '.cortextos', 'default', 'approvals');
+
+function deleteApproval(id: string) {
+  for (const f of [
+    join(APPROVAL_ROOT, 'pending', `${id}.json`),
+    join(APPROVAL_ROOT, 'resolved', `${id}.json`),
+    join(APPROVAL_ROOT, 'events', `${id}.jsonl`),
+    join(NO_ORG_APPROVAL_ROOT, 'pending', `${id}.json`),
+    join(NO_ORG_APPROVAL_ROOT, 'resolved', `${id}.json`),
+    join(NO_ORG_APPROVAL_ROOT, 'events', `${id}.jsonl`),
+  ]) {
+    try { unlinkSync(f); } catch { /* not there */ }
+  }
+}
+
+test('C8: create-approval refuses with no org, and with an org reaches the queue and the dashboard', async ({ page }) => {
+  test.setTimeout(240_000);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+
+  const title = 'ZZTEST-close-C8 approval org guard probe';
+  const e: Record<string, unknown> = {};
+  let id = '';
+
+  // --- the refusal, with CTX_ORG genuinely absent from the child env --------
+  const noOrgEnv = { ...CLI_ENV } as Record<string, string | undefined>;
+  delete noOrgEnv.CTX_ORG;
+  try {
+    execFileSync(BIN, ['bus', 'create-approval', 'ZZTEST-close-C8 no-org probe', 'other', 'ZZTEST'],
+      { encoding: 'utf-8', env: noOrgEnv as NodeJS.ProcessEnv, timeout: 30_000, stdio: 'pipe' });
+    e.no_org_refused = false;
+  } catch (err) {
+    const x = err as { status?: number; stderr?: string; stdout?: string };
+    e.no_org_refused = true;
+    e.no_org_exit = x.status ?? null;
+    e.no_org_message = String(x.stderr ?? x.stdout ?? '').replace(/\s+/g, ' ').trim();
+  }
+  // Nothing may have been written to the directory nothing reads.
+  e.no_org_dir_untouched = !existsSync(join(NO_ORG_APPROVAL_ROOT, 'pending'))
+    || readdirSync(join(NO_ORG_APPROVAL_ROOT, 'pending')).length === 0;
+
+  try {
+    // --- the with-org path --------------------------------------------------
+    const out = execFileSync(BIN,
+      ['bus', 'create-approval', title, 'other', 'ZZTEST close verification. Deleted by the test.'],
+      { encoding: 'utf-8', env: CLI_ENV, timeout: 30_000 });
+    id = out.trim().split(/\s+/).pop() ?? '';
+    e.approval_id = id;
+    e.landed_in_org_queue = existsSync(join(APPROVAL_ROOT, 'pending', `${id}.json`));
+    e.did_not_land_outside_an_org = !existsSync(join(NO_ORG_APPROVAL_ROOT, 'pending', `${id}.json`));
+    e.record = JSON.parse(readFileSync(join(APPROVAL_ROOT, 'pending', `${id}.json`), 'utf-8'));
+
+    const failed: { url: string; status: number }[] = [];
+    page.on('response', (r) => {
+      if (r.status() >= 400 && !/\/api\/auth\//.test(r.url())) failed.push({ url: r.url(), status: r.status() });
+    });
+
+    const api = await page.request.get(`${URL}/api/approvals?org=uhs`);
+    const apiText = await api.text();
+    e.api_status = api.status();
+    e.api_carries_the_approval = apiText.includes(id);
+
+    const res = await page.goto(`${URL}/approvals`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(5000);
+    e.page_status = res?.status() ?? null;
+    const defaultBody = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
+    // The surface opens on "Your Tasks"; the Approvals tab carries the count.
+    e.visible_on_the_tab_that_opens = defaultBody.includes(title);
+    e.approvals_tab_shows_a_count = /Approvals\s+\d+/.test(defaultBody);
+    const tab = page.getByRole('tab', { name: /Approvals/i })
+      .or(page.getByRole('button', { name: /^Approvals\b/i })).first();
+    if (await tab.count()) { await tab.click(); await page.waitForTimeout(4000); }
+    const body = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
+    e.visible_on_the_approvals_tab = body.includes(title);
+    e.failed_requests = failed;
+    await shot(page, 'C8-approvals-page');
+    saveEvidence('C8-approval-evidence', e);
+
+    expect(e.no_org_refused, 'create-approval with no org must refuse').toBe(true);
+    expect(e.no_org_exit, 'the refusal must exit non-zero').not.toBe(0);
+    expect(String(e.no_org_message), 'the refusal must say how to fix it').toMatch(/--org|CTX_ORG/);
+    expect(e.no_org_dir_untouched, 'the refusal must create nothing outside an org').toBe(true);
+    expect(e.landed_in_org_queue, 'the with-org path must reach the org approvals queue').toBe(true);
+    expect(e.did_not_land_outside_an_org, 'it must not also land where nothing reads it').toBe(true);
+    expect((e.record as Record<string, unknown>).org, 'the record must carry its org').toBe('uhs');
+    expect((e.record as Record<string, unknown>).status, 'a new approval is pending').toBe('pending');
+    expect(e.api_carries_the_approval, 'the approvals API must return it').toBe(true);
+    expect(e.page_status, 'the approvals page must render').toBe(200);
+    expect(e.visible_on_the_approvals_tab, 'the approval must be visible on the dashboard').toBe(true);
+    expect(failed, `failing requests: ${JSON.stringify(failed)}`).toHaveLength(0);
+  } finally {
+    if (id) deleteApproval(id);
+  }
 });
