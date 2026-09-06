@@ -233,6 +233,31 @@ export type EnforcementMode = 'shadow' | 'enforced';
 export const FLAG_NAME = 'AGENTIC_OS_TASK_CONTRACT';
 
 /**
+ * Where a transition came from.
+ *
+ *  - `interactive` — a human acting through a UI or an HTTP API. ALWAYS
+ *    enforced. The shadow flag exists to migrate background writers one at a
+ *    time; it was never a licence for a person to click past the contract.
+ *  - `writer` — a background producer still being migrated. Honours the
+ *    per-source shadow flag.
+ *
+ * The default everywhere is `interactive`: a caller that cannot prove it is a
+ * migrating writer is enforced. Only the CLI (the one surface the legacy fleet
+ * actually calls) declares `writer`, and the HTTP boundary never lets a client
+ * choose — see dashboard/src/lib/task-transition.ts.
+ */
+export type TransitionOrigin = 'interactive' | 'writer';
+
+/** Legal next states from `from`, for a refusal message that tells the person
+ *  what they CAN do instead of only what they cannot. */
+export function legalTransitionsFrom(
+  from: CanonicalState | string,
+  contract = loadContract(),
+): CanonicalState[] {
+  return contract.allowed_transitions[String(from)] ?? [];
+}
+
+/**
  * Effective mode for one source.
  *
  * Precedence: `AGENTIC_OS_TASK_CONTRACT__<SOURCE>`, then
@@ -254,7 +279,31 @@ export function enforcementMode(
   return String(value).trim().toLowerCase() === 'enforced' ? 'enforced' : 'shadow';
 }
 
+/**
+ * The mode that actually applies to one transition, given where it came from.
+ *
+ * An interactive transition is enforced no matter what the flag says. This is
+ * the distinction the shadow flag was missing: a legacy background writer gets
+ * a migration window, a human's dashboard click does not. Plan §4 puts the
+ * rules "in server/worker boundaries"; plan §12's hard invariant is "no
+ * verified Done without proof" — a flag that let a UI skip both made the
+ * invariant a suggestion.
+ */
+export function effectiveMode(
+  source: string,
+  origin: TransitionOrigin = 'interactive',
+  flags?: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): EnforcementMode {
+  if (origin !== 'writer') return 'enforced';
+  return enforcementMode(source, flags, env);
+}
+
 export class ContractViolation extends Error {
+  /** What the record COULD move to from here. Carried so the refusal a person
+   *  sees names the legal moves rather than only the illegal one. */
+  readonly legalTransitions: CanonicalState[];
+
   constructor(
     readonly source: string,
     readonly result: CheckResult,
@@ -263,14 +312,16 @@ export class ContractViolation extends Error {
   ) {
     super(`[${source}] ${from} -> ${to} refused: ${result.error}${result.detail ? ` (${result.detail})` : ''}`);
     this.name = 'ContractViolation';
+    this.legalTransitions = legalTransitionsFrom(from);
   }
 }
 
 /**
- * Validate, then act on this source's enforcement mode: shadow logs and lets
- * the caller proceed, enforced throws. Shadow mode is the entire migration
- * strategy — a writer nobody knew about surfaces as a log line before it
- * surfaces as an outage.
+ * Validate, then act on the mode that applies to this source AND this origin:
+ * shadow logs and lets the caller proceed, enforced throws. Shadow mode is the
+ * migration strategy for background writers — a writer nobody knew about
+ * surfaces as a log line before it surfaces as an outage. It is NOT available
+ * to an interactive caller, which is always enforced.
  */
 export function guardTransition(
   source: string,
@@ -279,13 +330,21 @@ export function guardTransition(
   item: ContractItem = {},
   evidence: Evidence = {},
   context: { unsatisfied_dependencies?: string[] } = {},
-  opts: { flags?: Record<string, unknown>; log?: (m: string) => void; env?: NodeJS.ProcessEnv } = {},
+  opts: {
+    flags?: Record<string, unknown>;
+    log?: (m: string) => void;
+    env?: NodeJS.ProcessEnv;
+    /** Defaults to `interactive` — enforced. Only a caller that can prove it is
+     *  a migrating background writer passes `writer`. */
+    origin?: TransitionOrigin;
+  } = {},
 ): CheckResult {
   const result = checkTransition(from, to, item, evidence, context);
   if (result.ok) return result;
-  const mode = enforcementMode(source, opts.flags, opts.env);
+  const origin: TransitionOrigin = opts.origin ?? 'interactive';
+  const mode = effectiveMode(source, origin, opts.flags, opts.env);
   const message =
-    `[task-contract:${mode}] ${source}: ${from} -> ${to} violates ${result.error}` +
+    `[task-contract:${mode}:${origin}] ${source}: ${from} -> ${to} violates ${result.error}` +
     (result.detail ? ` (${result.detail})` : '');
   (opts.log ?? ((m: string) => console.warn(m)))(message);
   if (mode === 'enforced') throw new ContractViolation(source, result, String(from), String(to));

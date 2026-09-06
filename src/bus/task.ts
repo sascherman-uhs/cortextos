@@ -14,7 +14,7 @@ import {
   LeaseHeldError,
   type TaskContractMeta,
 } from './task-store.js';
-import { toCanonical, toNative, guardTransition, checkTransition, enforcementMode, type CanonicalState, type Evidence } from './task-contract.js';
+import { toCanonical, toNative, guardTransition, checkTransition, effectiveMode, ContractViolation, type CanonicalState, type Evidence, type TransitionOrigin } from './task-contract.js';
 
 /**
  * Create a new task. Identical JSON format to bash create-task.sh.
@@ -340,6 +340,22 @@ export interface TransitionOptions {
   reason?: string;
   /** Ids of dependencies the caller knows are still open. */
   unsatisfiedDependencies?: string[];
+  /**
+   * Where this transition came from.
+   *
+   * This module IS the legacy writer surface — the bus CLI, the agent fleet and
+   * the shell scripts all land here — so an omitted origin means `writer` and
+   * keeps honouring the per-source shadow flag. That is the migration window
+   * plan §4 asks for, and nothing else in-process is a human.
+   *
+   * A human-facing boundary must say so explicitly: the dashboard's transition
+   * service passes `interactive` as a constant it never reads off the wire, and
+   * the CLI forwards `--origin interactive` for it. Interactive transitions are
+   * enforced regardless of the flag. The pure guard in task-contract.ts defaults
+   * the other way — enforced — so a NEW caller that forgets to declare an
+   * origin fails closed rather than silently inheriting the writer's window.
+   */
+  origin?: TransitionOrigin;
   /** Suppress the legacy `tasks/audit/` line for a step that a higher-level
    *  operation will log itself. The OS-02 event journal always records it; this
    *  only keeps the old audit log reading exactly as it did before, so existing
@@ -396,6 +412,7 @@ export function transitionTask(
         contractItemFrom(task, meta),
         options.evidence ?? {},
         { unsatisfied_dependencies: options.unsatisfiedDependencies },
+        { origin: options.origin ?? 'writer' },
       );
 
       task.status = status;
@@ -434,7 +451,25 @@ function markVerify(
   actor: string,
   evidence: Evidence,
   options: TransitionOptions,
+  from: CanonicalState = 'doing',
 ): void {
+  // This leg used to write with no contract check at all, which is how a
+  // `pending` task could be marched straight into verify by a UI click: the
+  // only guard ran on the SECOND leg, after the first had already been
+  // persisted. Validate before anything is written, so a refused completion
+  // leaves the record exactly as it was.
+  {
+    const snapshot = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+    guardTransition(
+      'cortexos_tasks',
+      from,
+      'verify',
+      contractItemFrom(snapshot, readMeta(snapshot)),
+      evidence,
+      {},
+      { origin: options.origin ?? 'writer' },
+    );
+  }
   mutateTask(
     paths,
     filePath,
@@ -725,7 +760,7 @@ export function completeTask(
 
   // Step 1: reach verify. Costs an artifact.
   if (current !== 'verify' && current !== 'done') {
-    markVerify(paths, filePath, taskId, actor, evidence, options);
+    markVerify(paths, filePath, taskId, actor, evidence, options, current);
   }
 
   // Step 2: verify -> done. Costs recorded acceptance results and an
@@ -747,14 +782,16 @@ export function completeTask(
       actor,
       payload: { error: check.error, detail: check.detail, evidence },
     });
-    if (enforcementMode('cortexos_tasks') === 'enforced') {
-      throw new Error(
-        `Task ${taskId} cannot be completed: ${check.error}${check.detail ? ` (${check.detail})` : ''}. ` +
-        `It remains in verify.`,
-      );
+    if (effectiveMode('cortexos_tasks', options.origin ?? 'writer') === 'enforced') {
+      // A structured refusal, so the CLI (and through it the dashboard) can
+      // tell a person WHAT is missing instead of a generic failure. The task is
+      // left where it actually is — in verify — and the message says so.
+      const violation = new ContractViolation('cortexos_tasks', check, 'verify', 'done');
+      violation.message += ` Task ${taskId} remains in verify.`;
+      throw violation;
     }
     console.warn(
-      `[task-contract:shadow] cortexos_tasks: ${taskId} completed without proof (${check.error}). ` +
+      `[task-contract:shadow:writer] cortexos_tasks: ${taskId} completed without proof (${check.error}). ` +
       `Under enforcement this would stay in verify.`,
     );
   }
@@ -763,6 +800,7 @@ export function completeTask(
     actor,
     evidence,
     fenceToken: options.fenceToken,
+    origin: options.origin,
     suppressLegacyAudit: true,
   });
   withTaskLock(filePath, () => {
