@@ -90,3 +90,19 @@ eval "$(grep -E '^ADMIN_(USERNAME|PASSWORD)=' ~/cortextos/dashboard/.env.local |
 Check H creates a native task through `cortextos bus create-task` with a `ZZTEST` title
 and deletes its record in a `finally` block. The append-only audit log for that task id
 is deliberately left in place — it is an immutable journal, not test data.
+
+### Checks J and K (clear-pin safety, operation history)
+
+| Test | What it covers |
+|---|---|
+| `J` | "Clear legacy pin" on `jarvis-marketing`: the outcome is stated, a refusal would arrive as a receipt rather than a bare 503, Revert restores the pin, and the restored pin is byte-identical (same entry_id, kind and expiry) per `cortextos model list --json`. |
+| `K` | Whether a past operation is still identifiable and revertible after a page reload. |
+
+J deliberately uses `jarvis-marketing`, never `jarvis-mls` — an earlier verifier
+destroyed jarvis-mls's legacy pin through this same button and it had to be rebuilt
+with `cortextos model migrate --bootstrap`.
+
+Timing note for J: the receipt renders before the panel finishes its post-operation
+refresh, and `submitting` stays true throughout, so Revert is disabled for roughly three
+seconds with nothing on screen saying why. The test waits that window out before judging
+the control and records its length in the evidence.

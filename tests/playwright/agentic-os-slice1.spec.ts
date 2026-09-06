@@ -87,6 +87,16 @@ function busUpdateTask(id: string, status: string) {
   }
 }
 
+/** The registry's own view of an agent's pin, read through the CLI (check J). */
+function registryPin(agent: string): Record<string, string> | null {
+  const out = execFileSync(CORTEXTOS_BIN, ['model', 'list', '--org', 'uhs', '--json'], {
+    encoding: 'utf-8',
+    timeout: 30_000,
+  });
+  const parsed = JSON.parse(out) as { agents?: Record<string, { pin?: Record<string, string> | null }> };
+  return parsed.agents?.[agent]?.pin ?? null;
+}
+
 function deleteNativeTask(id: string) {
   try {
     unlinkSync(taskPath(id));
@@ -1012,4 +1022,216 @@ test('I: person-scoped briefings are server-filtered and Angelic-only content st
     .toBe(true);
   expect(capture.switcher_text ?? '', 'the switcher names every permitted person')
     .toMatch(/Scott.*Raquel.*Angelic/);
+});
+
+// ===========================================================================
+// J. Clear-pin safety.
+//
+// A previous verifier destroyed jarvis-mls's legacy-migration pin through a
+// clear-pin that failed with a bare 503 and looked like nothing had happened.
+// This check exercises the same button on a DIFFERENT agent and requires that
+// (a) the outcome is stated, (b) a refusal arrives as a receipt rather than a
+// bare error status, (c) Revert puts the pin back, and (d) the restored pin is
+// the same pin — same entry_id, same expiry — not a fresh one.
+// ===========================================================================
+test('J: clearing a legacy pin states its outcome and is reversible', async ({ page }) => {
+  test.setTimeout(300_000);
+  await page.setViewportSize({ width: 1600, height: 1200 });
+
+  const AGENT = 'jarvis-marketing';
+  const evidence: Record<string, unknown> = { agent: AGENT };
+
+  // The pin as the registry holds it now, read straight off the CLI.
+  const pinBefore = registryPin(AGENT);
+  evidence.pin_before = pinBefore;
+  expect(pinBefore, `${AGENT} must start with a pin for this check to mean anything`)
+    .not.toBeNull();
+
+  // Every response to the unpin door, so a bare 503 cannot hide behind a
+  // rendered receipt.
+  const patches: { url: string; status: number; body: string }[] = [];
+  page.on('response', async (r) => {
+    if (r.request().method() === 'PATCH' && r.url().includes(`/api/agents/${AGENT}/config`)) {
+      patches.push({ url: r.url(), status: r.status(), body: (await r.text().catch(() => '')).slice(0, 800) });
+    }
+  });
+
+  await page.goto(`${URL}/agents`, { waitUntil: 'domcontentloaded' });
+  await waitForRouting(page);
+
+  const row = () => routingRow(page, AGENT);
+  evidence.row_before = (await row().innerText()).replace(/\s+/g, ' ');
+
+  const clearBtn = row().getByRole('button', { name: 'Clear legacy pin' });
+  await expect(clearBtn, 'the pinned row offers "Clear legacy pin"').toBeVisible();
+  await clearBtn.click();
+
+  // --- (a) the UI states an outcome ---------------------------------------
+  const receipt = page.locator('[role="status"]').first();
+  await expect(receipt, 'clearing a pin produces a visible receipt, never a silent no-op')
+    .toBeVisible({ timeout: 180_000 });
+  await expect
+    .poll(async () => (await receipt.innerText()).match(/op_[a-z0-9]+/)?.[0] ?? null, { timeout: 180_000 })
+    .not.toBeNull();
+  const opUnpin = (await receipt.innerText()).match(/op_[a-z0-9]+/)?.[0] ?? null;
+  const unpinReceipt = (await receipt.innerText()).replace(/\s+/g, ' ');
+  evidence.unpin_operation_id = opUnpin;
+  evidence.unpin_receipt = unpinReceipt;
+  await shot(page, 'J1-clear-pin-receipt');
+
+  expect(unpinReceipt, 'the receipt names a terminal outcome for the operation')
+    .toMatch(/Applied|Blocked|Failed|Desired written|Draining/);
+
+  // --- (b) a refusal is a receipt, not a bare error status -----------------
+  evidence.patch_responses = patches;
+  const bareErrors = patches.filter((p) => {
+    if (p.status === 200) return false;
+    try {
+      return !JSON.parse(p.body).receipt;
+    } catch {
+      return true;
+    }
+  });
+  evidence.bare_error_responses = bareErrors;
+  expect
+    .soft(bareErrors, 'a blocked clear-pin must carry a receipt, not a bare 503')
+    .toHaveLength(0);
+
+  evidence.pin_after_clear = registryPin(AGENT);
+  evidence.row_after_clear = (await row().innerText()).replace(/\s+/g, ' ');
+
+  // --- (c) Revert restores the pin -----------------------------------------
+  // The receipt renders before the panel finishes its post-operation refresh,
+  // and `submitting` stays true for the whole refresh — so Revert is dead for
+  // several seconds with nothing saying why. Wait the refresh out before
+  // judging the control, and record how long the dead window lasted.
+  const deadWindowStart = Date.now();
+  await waitForRouting(page);
+  await expect
+    .poll(async () => receipt.getByRole('button', { name: 'Revert' }).isEnabled().catch(() => false) ||
+                      (await receipt.locator('#revert-reason').inputValue().catch(() => '')) !== null,
+      { timeout: 60_000 })
+    .toBeTruthy();
+  evidence.refresh_ms_before_controls_settle = Date.now() - deadWindowStart;
+
+  const reasonInput = receipt.locator('#revert-reason');
+  const revertBtn = receipt.getByRole('button', { name: 'Revert' });
+  evidence.revert_offered = await revertBtn.count();
+  evidence.revert_enabled_before_reason = await revertBtn.isEnabled().catch(() => false);
+
+  if (await reasonInput.count()) {
+    await reasonInput.fill('ZZTEST-reverify-5-clearpin-revert');
+  }
+  const canRevert = await revertBtn.isEnabled().catch(() => false);
+  evidence.revert_enabled_with_reason = canRevert;
+
+  if (canRevert) {
+    await revertBtn.click();
+    await expect
+      .poll(async () => (await receipt.innerText()).match(/op_[a-z0-9]+/)?.[0] ?? null, { timeout: 180_000 })
+      .not.toBe(opUnpin);
+    evidence.revert_operation_id = (await receipt.innerText()).match(/op_[a-z0-9]+/)?.[0] ?? null;
+    evidence.revert_receipt = (await receipt.innerText()).replace(/\s+/g, ' ');
+  }
+  await shot(page, 'J2-after-revert');
+
+  // --- (d) the SAME pin is back, per the CLI -------------------------------
+  const pinAfter = registryPin(AGENT);
+  evidence.pin_after_revert = pinAfter;
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await waitForRouting(page);
+  evidence.row_final = (await routingRow(page, AGENT).innerText()).replace(/\s+/g, ' ');
+  await shot(page, 'J3-final-row');
+  writeFileSync(join(SHOTS, 'J-clear-pin-evidence.json'), JSON.stringify(evidence, null, 2));
+
+  expect(pinAfter, 'the pin is present again after the revert').not.toBeNull();
+  expect(pinAfter?.entry_id, 'the restored pin points at the original entry')
+    .toBe(pinBefore?.entry_id);
+  expect(pinAfter?.kind, 'the restored pin is still a legacy-migration pin')
+    .toBe(pinBefore?.kind);
+  expect(pinAfter?.expires_at, 'the restored pin keeps its original expiry')
+    .toBe(pinBefore?.expires_at);
+});
+
+// ===========================================================================
+// K. Operation history after a reload.
+//
+// Revert lives on the receipt the panel is holding in memory. If nothing else
+// lists past operations, then reloading the page is enough to make a switch
+// permanently un-undoable from the UI, even though the journal behind
+// `cortextos model events` still has it.
+// ===========================================================================
+test('K: a past operation is reachable and revertible after a page reload', async ({ page }) => {
+  test.setTimeout(300_000);
+  await page.setViewportSize({ width: 1600, height: 1200 });
+  await page.goto(`${URL}/agents`, { waitUntil: 'domcontentloaded' });
+  await waitForRouting(page);
+
+  const evidence: Record<string, unknown> = {};
+
+  // Make one real operation to look for afterwards.
+  const row = routingRow(page, 'jarvis-accounting');
+  await row.getByRole('button', { name: 'Change model' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('radio', { name: /Role tier/ }).check();
+  await dialog.locator('#change-model-tier').selectOption('premium');
+  await dialog.locator('#change-model-reason').fill('ZZTEST-reverify-6-history');
+  await dialog.getByRole('button', { name: 'Submit change' }).click();
+
+  const receipt = page.locator('[role="status"]').first();
+  await expect(receipt).toBeVisible({ timeout: 180_000 });
+  await expect
+    .poll(async () => (await receipt.innerText()).match(/op_[a-z0-9]+/)?.[0] ?? null, { timeout: 180_000 })
+    .not.toBeNull();
+  const opId = (await receipt.innerText()).match(/op_[a-z0-9]+/)?.[0] ?? '';
+  evidence.operation_id = opId;
+  evidence.revert_available_in_session = await receipt
+    .getByRole('button', { name: 'Revert' })
+    .isEnabled();
+  await shot(page, 'K1-receipt-in-session');
+
+  // --- the reload ----------------------------------------------------------
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await waitForRouting(page);
+  await page.waitForTimeout(2000);
+
+  const bodyText = await page.locator('body').innerText();
+  evidence.operation_id_visible_after_reload = bodyText.includes(opId);
+  evidence.any_operation_id_visible_after_reload = /op_[a-z0-9]{6,}/.test(bodyText);
+  evidence.receipt_panels_after_reload = await page.locator('[role="status"]').count();
+  evidence.revert_buttons_after_reload = await page.getByRole('button', { name: 'Revert' }).count();
+  evidence.history_heading_after_reload = await page
+    .getByRole('heading', { name: /history|recent operations|activity|audit|journal/i })
+    .count();
+  await shot(page, 'K2-after-reload');
+
+  // The data exists behind the API — that is what makes its absence a UI gap
+  // rather than a missing capability.
+  const api = await page.request.get(`${URL}/api/model-routing?limit=50`);
+  const body = (await api.json()) as { events?: { operation_id?: string }[] };
+  evidence.api_returns_events = (body.events ?? []).length;
+  evidence.api_has_this_operation = (body.events ?? []).some((e) => e.operation_id === opId);
+
+  writeFileSync(join(SHOTS, 'K-history-evidence.json'), JSON.stringify(evidence, null, 2));
+
+  // --- restore the registry regardless of the outcome ----------------------
+  const res = await page.request.patch(`${URL}/api/agents/jarvis-accounting/config`, {
+    data: {
+      op: 'model_routing',
+      action: 'revert',
+      operation_id: opId,
+      reason: 'ZZTEST-reverify-6-history-revert',
+    },
+  });
+  evidence.cleanup_revert_status = res.status();
+  writeFileSync(join(SHOTS, 'K-history-evidence.json'), JSON.stringify(evidence, null, 2));
+
+  expect(
+    evidence.operation_id_visible_after_reload,
+    'a past operation must still be identifiable in the UI after a reload',
+  ).toBe(true);
+  expect(
+    Number(evidence.revert_buttons_after_reload),
+    'a past operation must still be revertible after a reload',
+  ).toBeGreaterThan(0);
 });
