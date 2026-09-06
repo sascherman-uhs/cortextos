@@ -25,12 +25,57 @@ const TONE_VARIANT: Record<ReceiptTone, 'default' | 'secondary' | 'destructive' 
   error: 'destructive',
 };
 
+/**
+ * Answers exactly one question: is the running model the one we EXPECTED to be
+ * running? The label says so in words and names its own baseline, because the
+ * same badge sat next to a resolved-vs-running arrow and was read as a verdict
+ * on that comparison instead.
+ */
 export function ConfidenceBadge({ resolution }: { resolution: Resolution | null }) {
   const d = describeDesiredVsRunning(resolution);
   return (
-    <Badge variant={TONE_VARIANT[d.tone]} title={d.hint} aria-label={`Running model confidence: ${d.confidenceLabel}`}>
-      {d.confidenceLabel}
+    <Badge
+      variant={TONE_VARIANT[d.tone]}
+      title={d.hint}
+      aria-label={`Running model versus expected: ${d.expectationLabel}. ${d.hint}`}
+    >
+      {d.expectationLabel}
     </Badge>
+  );
+}
+
+/** The registry route, and whether it is actually being applied. */
+export function ResolvedRouteCell({ resolution }: { resolution: Resolution | null }) {
+  const d = describeDesiredVsRunning(resolution);
+  return (
+    <span className="flex flex-wrap items-center gap-1">
+      <span className="font-mono">{d.resolved}</span>
+      {d.resolvedNote && (
+        <Badge
+          variant="outline"
+          title={
+            'Shadow mode: this route is computed but not passed to the runtime, so it is not ' +
+            'what the agent is running. That is the intended behaviour of shadow, not a fault.'
+          }
+        >
+          {d.resolvedNote}
+        </Badge>
+      )}
+    </span>
+  );
+}
+
+/** What is actually running, plus the expectation verdict and its baseline. */
+export function RunningModelCell({ resolution }: { resolution: Resolution | null }) {
+  const d = describeDesiredVsRunning(resolution);
+  return (
+    <span className="flex flex-wrap items-center gap-1">
+      <span className="font-mono">{d.running}</span>
+      <ConfidenceBadge resolution={resolution} />
+      <span className="w-full text-muted-foreground">
+        expected {d.expected} &middot; from {d.expectedFromLabel}
+      </span>
+    </span>
   );
 }
 

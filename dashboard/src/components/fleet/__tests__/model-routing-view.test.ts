@@ -248,7 +248,7 @@ describe('desired vs running with observation fields', () => {
   });
 
   it('says so plainly when there is no observation to go on', () => {
-    expect(describeDesiredVsRunning(resolution()).hint).toContain('no observation available');
+    expect(describeDesiredVsRunning(resolution()).hint).toContain('No observation available');
     expect(describeDesiredVsRunning(resolution({ observed: null })).confidence).toBe('unconfirmed');
     // An observation with no model id is not evidence of anything.
     expect(
