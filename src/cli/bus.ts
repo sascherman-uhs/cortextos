@@ -15,7 +15,7 @@ import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity 
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
-import { createApproval, updateApproval } from '../bus/approval.js';
+import { createApproval, decideApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
@@ -1326,7 +1326,8 @@ busCommand
   .argument('<id>', 'Approval ID')
   .argument('<status>', 'Resolution: approved or denied')
   .argument('[note]', 'Resolution note')
-  .action((id: string, status: string, note?: string) => {
+  .option('--actor <name>', 'Who is deciding this. Defaults to CTX_AGENT_NAME (e.g. the dashboard PATCH route sets this to "dashboard"). Recorded as the decider identity — a CLI/dashboard decision is now identity-checked the same way a Telegram decision is.')
+  .action((id: string, status: string, note: string | undefined, opts: { actor?: string }) => {
     const validStatuses: ApprovalStatus[] = ['approved', 'rejected'];
     if (!validStatuses.includes(status as ApprovalStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: approved, rejected`);
@@ -1334,7 +1335,27 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    updateApproval(paths, id, status as ApprovalStatus, note);
+    // WP-5B: this is the ONE decision boundary now — the CLI (and the
+    // dashboard PATCH route, which shells out to this exact command) no
+    // longer calls updateApproval() directly with zero identity/CAS check.
+    // env.agentName is CTX_AGENT_NAME, which the dashboard route explicitly
+    // sets to 'dashboard' before spawning this process, so the two first-party
+    // surfaces are distinguishable in the audit trail without extra plumbing.
+    const actor = sanitizeActorName(opts.actor) ?? sanitizeActorName(env.agentName);
+    if (!actor) {
+      console.error('ERROR: could not resolve a decider identity (--actor or CTX_AGENT_NAME required).');
+      process.exit(1);
+    }
+    const route = actor === 'dashboard' ? 'dashboard' : 'cli';
+    const result = decideApproval(paths, id, status as 'approved' | 'rejected', actor, { route }, note);
+    if (!result.ok) {
+      // Dashboard PATCH route (bus/update-approval.sh -> this command) greps
+      // stderr for "not found" to distinguish 404 from 500 — preserve that
+      // phrase for the missing-approval case so its behavior is unchanged.
+      const prefix = result.rejection === 'approval_missing' ? `Approval ${id} not found` : `Approval ${id} decision REFUSED (${result.rejection ?? 'unknown'})`;
+      console.error(`${prefix}: ${result.detail ?? ''}`);
+      process.exit(1);
+    }
     console.log(`Approval ${id} -> ${status}`);
   });
 

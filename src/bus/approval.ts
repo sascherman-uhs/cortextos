@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from 'fs';
+import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Approval, ApprovalCategory, ApprovalStatus, BusPaths } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
@@ -15,6 +15,12 @@ import {
   approvalVersion,
   payloadHash,
   botIdentityFor,
+  consumeBinding,
+  readApproval,
+  readBinding,
+  computePresentationHash,
+  isValidRef,
+  type BindingRejection,
 } from './approval-binding.js';
 
 /**
@@ -272,7 +278,15 @@ export function updateApproval(
   approvalId: string,
   status: ApprovalStatus,
   note?: string,
-  options: { route?: string; decider?: string; bindingRef?: string } = {},
+  options: {
+    route?: string;
+    decider?: string;
+    bindingRef?: string;
+    // ApprovalV2 (WP-5B): recorded on the decision event for audit/reconciliation.
+    // action_hash is null for decision_only approvals.
+    actionHash?: string | null;
+    presentationHash?: string;
+  } = {},
 ): void {
   const pendingDir = join(paths.approvalDir, 'pending');
   const filePath = join(pendingDir, `${approvalId}.json`);
@@ -309,6 +323,8 @@ export function updateApproval(
         payload_hash: payloadHash(approval),
         binding_ref: options.bindingRef ?? null,
         note: note ?? null,
+        ...(options.actionHash !== undefined ? { action_hash: options.actionHash } : {}),
+        ...(options.presentationHash !== undefined ? { presentation_hash: options.presentationHash } : {}),
       },
     });
     revokeBindingsFor(paths, approvalId, `decided:${status}`);
@@ -322,6 +338,205 @@ export function updateApproval(
   } catch (err) {
     throw new Error(`Approval ${approvalId} not found: ${err}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// decideApproval — the ONE decision boundary (WP-5B, plan-r01.md §5.2).
+//
+// Before this, Telegram was the only caller that checked anything before
+// calling updateApproval() (via consumeBinding). The CLI's `bus
+// update-approval` command — which is also what the dashboard's PATCH route
+// invokes, via `bus/update-approval.sh` — called updateApproval() directly
+// with no binding check at all: either surface could resolve any pending
+// approval as any decider string.
+//
+// decideApproval() is now the only supported entry point for all three
+// routes. It:
+//   1. Takes an approval-ID-level exclusive lock, so two callers racing to
+//      decide the same approval cannot both win (one gets 'approval_locked').
+//   2. Re-reads the CURRENT approval under that lock.
+//   3. Requires a non-empty, authenticated `actor` on every route — a worker
+//      cannot self-assert a human decider identity by leaving it blank.
+//   4. For route 'telegram': consumes the caller-supplied binding
+//      (unchanged checks — decider/bot/chat/expiry/version/payload/hash).
+//   5. For every route, when the approval is ApprovalV2 (`action_spec`
+//      present), re-verifies `presentation_hash` against the CURRENT record.
+//      This is the check that legacy payload_hash cannot make: unchanged
+//      prose with a changed recipient/account/amount/target/attachment still
+//      fails here, even outside Telegram's binding path.
+//   6. Only then calls the existing updateApproval() to persist the decision.
+// ---------------------------------------------------------------------------
+
+export type DecideApprovalRoute = 'telegram' | 'cli' | 'dashboard' | 'console';
+
+export type DecideApprovalRejection =
+  | BindingRejection
+  | 'missing_actor'
+  | 'missing_binding'
+  | 'approval_locked';
+
+export interface DecideApprovalTelegramContext {
+  route: 'telegram';
+  bindingRef: string;
+  presented: { decider: string | number; botIdentity: string; chatId: string | number };
+}
+
+export interface DecideApprovalFirstPartyContext {
+  route: 'cli' | 'dashboard' | 'console';
+}
+
+export type DecideApprovalContext = DecideApprovalTelegramContext | DecideApprovalFirstPartyContext;
+
+export interface DecideApprovalResult {
+  ok: boolean;
+  status?: ApprovalStatus;
+  rejection?: DecideApprovalRejection;
+  detail?: string;
+  current?: Approval | null;
+}
+
+function decisionLockPath(paths: BusPaths, approvalId: string): string {
+  return join(paths.approvalDir, 'decisions', `${approvalId}.lock`);
+}
+
+/**
+ * Approval-ID-level exclusive lock via O_EXCL create, mirroring the
+ * single-use marker pattern `consumeBinding` already uses for per-reference
+ * exclusivity. This is the per-approval equivalent: it makes "read current
+ * status, decide, persist" one critical section across ALL routes (Telegram,
+ * CLI, dashboard), not just across bindings on the same reference.
+ */
+function withDecisionLock<T>(paths: BusPaths, approvalId: string, fn: () => T): { ok: true; value: T } | { ok: false } {
+  const lockPath = decisionLockPath(paths, approvalId);
+  ensureDir(join(paths.approvalDir, 'decisions'));
+  try {
+    writeFileSync(lockPath, `${process.pid}\t${new Date().toISOString()}\n`, { flag: 'wx', mode: 0o600 });
+  } catch {
+    return { ok: false };
+  }
+  try {
+    return { ok: true, value: fn() };
+  } finally {
+    try { unlinkSync(lockPath); } catch { /* best-effort */ }
+  }
+}
+
+/**
+ * The shared decision function every route must call. `decision` is the
+ * outcome being requested ('approved' | 'rejected'); `actor` is the
+ * authenticated identity making it — never optional, never inferred.
+ */
+export function decideApproval(
+  paths: BusPaths,
+  approvalId: string,
+  decision: 'approved' | 'rejected',
+  actor: string,
+  context: DecideApprovalContext,
+  note?: string,
+): DecideApprovalResult {
+  if (!actor || !actor.trim()) {
+    return { ok: false, rejection: 'missing_actor', detail: 'a decider identity is required to resolve an approval' };
+  }
+
+  if (context.route === 'telegram') {
+    if (!context.bindingRef || !isValidRef(context.bindingRef)) {
+      return { ok: false, rejection: 'missing_binding', detail: 'telegram decisions require a valid binding reference' };
+    }
+  }
+
+  // Resolve the approval-level lock key. For Telegram, prefer the binding's
+  // OWN approval_id (a non-consuming peek) over whatever the caller passed —
+  // that keeps the lock correct even when the caller could not resolve the
+  // id in advance (e.g. an unknown/garbage ref), and means the lock
+  // genuinely serializes against a same-approval CLI/dashboard decision
+  // racing in on the other side.
+  let lockKey = approvalId;
+  if (context.route === 'telegram') {
+    const peeked = readBinding(paths, context.bindingRef);
+    if (peeked) lockKey = peeked.approval_id;
+  }
+
+  const locked = withDecisionLock(paths, lockKey || '__unresolved__', (): DecideApprovalResult => {
+    if (context.route === 'telegram') {
+      // consumeBinding has its own correct precedence (unknown ref ->
+      // already-consumed -> expired -> wrong decider/bot/chat -> approval
+      // missing/resolved -> version/payload changed), verified against the
+      // CURRENT approval it re-reads itself. Do not duplicate/reorder that
+      // logic with a separate pending-status pre-check here.
+      const result = consumeBinding(paths, context.bindingRef, context.presented);
+      if (!result.ok) {
+        return { ok: false, rejection: result.rejection, current: result.current ?? null, detail: result.detail };
+      }
+      const current = result.current!;
+      const expectedStatus = result.binding!.action === 'allow' ? 'approved' : 'rejected';
+      if (expectedStatus !== decision) {
+        // Defensive: the binding's own action must match what the caller
+        // asked decideApproval to record. A mismatch here means the caller
+        // derived `decision` incorrectly upstream — refuse rather than
+        // silently recording the binding's action instead of the request.
+        return { ok: false, rejection: 'payload_changed', current, detail: 'requested decision does not match the consumed binding action' };
+      }
+
+      const specCheck = checkActionSpecUnchanged(current);
+      if (specCheck) return specCheck;
+
+      updateApproval(paths, current.id, decision, note, {
+        route: context.route,
+        decider: actor,
+        bindingRef: context.bindingRef,
+        actionHash: current.schema_version === 2 ? (current.action_hash ?? null) : undefined,
+        presentationHash: current.schema_version === 2 ? current.presentation_hash : undefined,
+      });
+      return { ok: true, status: decision, current };
+    }
+
+    // First-party surfaces (cli/dashboard/console): no binding to consult —
+    // this IS the check. Previously these routes called updateApproval()
+    // directly with none of this.
+    const current = readApproval(paths, approvalId);
+    if (!current) {
+      return { ok: false, rejection: 'approval_missing', current: null, detail: 'no such approval' };
+    }
+    if (current.status !== 'pending') {
+      return { ok: false, rejection: 'approval_resolved', current, detail: `already ${current.status}` };
+    }
+
+    const specCheck = checkActionSpecUnchanged(current);
+    if (specCheck) return specCheck;
+
+    updateApproval(paths, approvalId, decision, note, {
+      route: context.route,
+      decider: actor,
+      actionHash: current.schema_version === 2 ? (current.action_hash ?? null) : undefined,
+      presentationHash: current.schema_version === 2 ? current.presentation_hash : undefined,
+    });
+    return { ok: true, status: decision, current };
+  });
+
+  if (!locked.ok) {
+    return { ok: false, rejection: 'approval_locked', detail: 'another decision is being recorded for this approval right now' };
+  }
+  return locked.value;
+}
+
+/**
+ * ApprovalV2 anti-confused-deputy check, independent of route: a structured
+ * field can change while every word of prose stays the same. `payload_hash`
+ * (checked inside consumeBinding for Telegram only) cannot see that;
+ * `presentation_hash` can, and this runs for every route.
+ */
+function checkActionSpecUnchanged(current: Approval): DecideApprovalResult | null {
+  if (current.schema_version === 2 && current.presentation_hash) {
+    if (computePresentationHash(current) !== current.presentation_hash) {
+      return {
+        ok: false,
+        rejection: 'action_spec_changed',
+        current,
+        detail: 'the structured action on this approval no longer matches the presentation it was created with',
+      };
+    }
+  }
+  return null;
 }
 
 /**

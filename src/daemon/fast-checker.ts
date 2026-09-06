@@ -5,11 +5,11 @@ import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
-import { updateApproval } from '../bus/approval.js';
+import { decideApproval } from '../bus/approval.js';
 import {
-  consumeBinding,
   isValidRef,
   readApproval,
+  readBinding,
   type BindingRejection,
 } from '../bus/approval-binding.js';
 import { AgentProcess } from './agent-process.js';
@@ -607,20 +607,45 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
-    const result = consumeBinding(this.paths, ref, {
-      decider: query.from?.id ?? 'unknown',
-      botIdentity: api?.botId ?? 'unknown-bot',
-      chatId: chatId ?? '',
-    });
+    // Peek (non-consuming) at the binding purely to learn which decision
+    // this specific button requests — decideApproval() does the actual
+    // consume-and-verify under its own lock. If the ref is unknown/garbage,
+    // decision here is a placeholder: decideApproval's own consumeBinding
+    // call rejects with 'unknown_ref' before this value is ever compared.
+    const peeked = readBinding(this.paths, ref);
+    const decision: 'approved' | 'rejected' = peeked?.action === 'allow' ? 'approved' : 'rejected';
+
+    const firstName = query.from?.first_name;
+    const username = query.from?.username;
+    const auditWho = firstName && username
+      ? `${firstName} (@${username})`
+      : firstName ?? (username ? `@${username}` : `user ${query.from?.id ?? 'unknown'}`);
+
+    const result = decideApproval(
+      this.paths,
+      peeked?.approval_id ?? '',
+      decision,
+      String(query.from?.id ?? 'unknown'),
+      {
+        route: 'telegram',
+        bindingRef: ref,
+        presented: {
+          decider: query.from?.id ?? 'unknown',
+          botIdentity: api?.botId ?? 'unknown-bot',
+          chatId: chatId ?? '',
+        },
+      },
+      `via Telegram by ${auditWho}`,
+    );
 
     if (!result.ok) {
-      const rejection = result.rejection as BindingRejection;
+      const rejection = result.rejection ?? 'unknown_ref';
       this.log(`Approval callback REJECTED (${rejection}) ref=${ref.slice(0, 8)}… : ${result.detail ?? ''}`);
       if (api) {
         try { await api.answerCallbackQuery(callbackQueryId, this.rejectionMessage(rejection)); } catch { /* ignore */ }
         // Re-render the request as it stands now, so the person can act on the
         // real thing instead of guessing what changed.
-        const current = result.current ?? (result.binding ? readApproval(this.paths, result.binding.approval_id) : null);
+        const current = result.current ?? (peeked ? readApproval(this.paths, peeked.approval_id) : null);
         if (chatId && messageId && current) {
           const body = [
             `⚠️ ${this.rejectionMessage(rejection)}`,
@@ -638,42 +663,23 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
-    const binding = result.binding!;
-    const status = binding.action === 'allow' ? 'approved' : 'rejected';
-    const firstName = query.from?.first_name;
-    const username = query.from?.username;
-    const auditWho = firstName && username
-      ? `${firstName} (@${username})`
-      : firstName ?? (username ? `@${username}` : `user ${query.from?.id ?? 'unknown'}`);
-
-    try {
-      updateApproval(this.paths, binding.approval_id, status, `via Telegram by ${auditWho}`, {
-        route: 'telegram',
-        decider: String(query.from?.id ?? 'unknown'),
-        bindingRef: ref,
-      });
-    } catch (err) {
-      this.log(`Approval callback: updateApproval failed for ${binding.approval_id}: ${err}`);
-      if (api) {
-        try { await api.answerCallbackQuery(callbackQueryId, 'Approval not found or already resolved'); } catch { /* ignore */ }
-      }
-      return;
-    }
+    const status = result.status!;
+    const approvalId = result.current!.id;
 
     if (api) {
-      try { await api.answerCallbackQuery(callbackQueryId, binding.action === 'allow' ? 'Approved' : 'Denied'); } catch { /* ignore */ }
+      try { await api.answerCallbackQuery(callbackQueryId, status === 'approved' ? 'Approved' : 'Denied'); } catch { /* ignore */ }
       if (chatId && messageId) {
-        const label = binding.action === 'allow' ? `✅ Approved by ${auditWho}` : `❌ Denied by ${auditWho}`;
+        const label = status === 'approved' ? `✅ Approved by ${auditWho}` : `❌ Denied by ${auditWho}`;
         try { await api.editMessageText(chatId, messageId, label); } catch { /* ignore */ }
       }
     }
     // The decision is recorded. Execution is a SEPARATE event with its own
     // intent and provider receipt — no external effect happens here.
-    this.log(`Approval decision recorded: ${status} for ${binding.approval_id} by ${auditWho} (execution pending its own intent)`);
+    this.log(`Approval decision recorded: ${status} for ${approvalId} by ${auditWho} (execution pending its own intent)`);
   }
 
   /** Plain-language reason a bound button was refused. */
-  private rejectionMessage(rejection: BindingRejection): string {
+  private rejectionMessage(rejection: BindingRejection | 'missing_actor' | 'missing_binding' | 'approval_locked'): string {
     switch (rejection) {
       case 'already_consumed': return 'This decision was already recorded.';
       case 'expired': return 'This approval button has expired. Open the current request.';
@@ -682,8 +688,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       case 'wrong_chat': return 'A forwarded approval button cannot authorize anything.';
       case 'version_changed':
       case 'payload_changed': return 'The request changed since this button was posted, so it no longer applies.';
+      case 'action_spec_changed': return 'The underlying action changed since this button was posted, even though the text did not. Open the current request.';
       case 'approval_resolved': return 'This request has already been decided.';
       case 'approval_missing': return 'The request this button refers to no longer exists.';
+      case 'approval_locked': return 'This request is being decided right now. Try again in a moment.';
       default: return 'This approval button is not valid.';
     }
   }

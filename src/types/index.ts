@@ -122,6 +122,129 @@ export type ApprovalCategory =
 
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
+// ---------------------------------------------------------------------------
+// ApprovalV2 — additive structured action specification (WP-5B, 2026-09-06
+// CortexOS V4 safety review, plan-r01.md §5.1).
+//
+// Every field below is OPTIONAL on `Approval`. An approval record with no
+// `action_spec` is a legacy/"decision_only" record: it can be approved or
+// denied exactly as before, but it can never be read as authorizing a new
+// structured executable action — free text never supplies execution
+// arguments. Only a record carrying `execution_kind: 'provider_action'` and
+// a populated `action_spec` is an executable approval, and even then no real
+// provider adapter exists yet (Stage 2 of the plan is inert by design: this
+// schema, its hashing, and the shared decision boundary — no live executor).
+// ---------------------------------------------------------------------------
+
+export type ExecutionKind = 'decision_only' | 'provider_action';
+
+export interface RecipientV1 {
+  role: 'to' | 'cc' | 'bcc' | 'chat' | 'payee' | 'other';
+  provider_id: string | null;
+  address: string | null;
+}
+
+/** `minor_units` is a nonnegative-integer decimal STRING — never a float. */
+export interface AmountV1 {
+  currency: string;
+  minor_units: string;
+  currency_exponent: number;
+}
+
+export interface TargetV1 {
+  resource_type: string;
+  resource_id: string | null;
+  parent_id: string | null;
+  create_key: string | null;
+}
+
+export interface ContentV1 {
+  subject: string | null;
+  body: string;
+  format: 'plain' | 'html' | 'json';
+  /** sha256 of the exact UTF-8 body bytes. */
+  sha256: string;
+}
+
+export interface AttachmentV1 {
+  artifact_id: string;
+  immutable_version: string;
+  sha256: string;
+  byte_length: number;
+  filename: string;
+  media_type: string;
+}
+
+/** Stable provider principal + server-side credential mapping. Never a token value. */
+export interface AccountV1 {
+  provider_account_id: string;
+  tenant_id: string | null;
+  credential_binding_id: string;
+}
+
+export interface ActorV1 {
+  requester_id: string;
+  executor_principal_id: string;
+  policy_id: string;
+  policy_version: string;
+}
+
+export interface PreconditionV1 {
+  resource_type: string;
+  resource_id: string;
+  version_kind: 'etag' | 'version' | 'sha256';
+  expected: string;
+}
+
+/** All effect-bearing request fields the operation will send, excluding transport auth. */
+export interface ProviderRequestV1 {
+  method: string;
+  endpoint_id: string;
+  path_params: Record<string, unknown>;
+  query: Record<string, unknown>;
+  headers: Record<string, unknown>;
+  body: Record<string, unknown> | null;
+}
+
+export interface ActionSpecV1 {
+  schema_version: 1;
+  /** Immutable action UUID. Retries retain this ID; a changed operation is a new action. */
+  action_id: string;
+  provider: string;
+  operation: string;
+  adapter_version: string;
+  account: AccountV1;
+  actor: ActorV1;
+  recipients: RecipientV1[];
+  target: TargetV1;
+  amount: AmountV1 | null;
+  content: ContentV1 | null;
+  attachments: AttachmentV1[];
+  provider_request: ProviderRequestV1;
+  preconditions: PreconditionV1[];
+  max_observation_age_seconds: number;
+  idempotency_key: string;
+  not_before: string;
+  expires_at: string;
+}
+
+export interface ApprovalDecisionV2 {
+  decision_id: string;
+  outcome: 'approved' | 'rejected';
+  decider_id: string;
+  route: string;
+  decided_at: string;
+  approved_version: number;
+  action_hash: string | null;
+  presentation_hash: string;
+}
+
+export interface ApprovalRevocationV2 {
+  revoked_at: string;
+  revoked_by: string;
+  reason: string;
+}
+
 export interface Approval {
   id: string;
   title: string;
@@ -134,6 +257,20 @@ export interface Approval {
   updated_at: string;
   resolved_at: string | null;
   resolved_by: string | null;
+
+  // --- Pre-existing additive fields (OS-02 approval binding). ---
+  version?: number;
+  payload_hash?: string;
+
+  // --- ApprovalV2 additive fields (WP-5B). Absent `action_spec` = legacy
+  //     decision_only record; see block comment above. ---
+  schema_version?: 2;
+  execution_kind?: ExecutionKind;
+  action_spec?: ActionSpecV1 | null;
+  action_hash?: string | null;
+  presentation_hash?: string;
+  decision?: ApprovalDecisionV2 | null;
+  revocation?: ApprovalRevocationV2 | null;
 }
 
 // Agent Config Types (config.json)

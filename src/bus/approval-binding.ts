@@ -27,7 +27,7 @@
 import { createHash, randomBytes } from 'crypto';
 import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import type { Approval, BusPaths } from '../types/index.js';
+import type { ActionSpecV1, Approval, BusPaths } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 
 export type ApprovalAction = 'allow' | 'deny';
@@ -49,6 +49,11 @@ export interface ApprovalBinding {
   created_at: string;
   consumed_at?: string | null;
   consumed_by?: string | null;
+  // --- ApprovalV2 additive (WP-5B). Present only when the bound approval is
+  // schema_version 2. `action_hash` is null for decision_only records. ---
+  schema_version?: 2;
+  action_hash?: string | null;
+  presentation_hash?: string;
 }
 
 export type BindingRejection =
@@ -61,7 +66,8 @@ export type BindingRejection =
   | 'version_changed'
   | 'payload_changed'
   | 'approval_missing'
-  | 'approval_resolved';
+  | 'approval_resolved'
+  | 'action_spec_changed';
 
 export interface BindingResult {
   ok: boolean;
@@ -129,6 +135,164 @@ export function approvalVersion(approval: Approval & { version?: number }): numb
   return typeof approval.version === 'number' && approval.version > 0 ? approval.version : 1;
 }
 
+// ---------------------------------------------------------------------------
+// ApprovalV2 canonicalization + hashing (WP-5B, plan-r01.md §5.1).
+//
+// `payloadHash` above only ever hashes free text (title/category/description/
+// requesting_agent/org) — it cannot detect a changed recipient, amount, or
+// target on a structured `action_spec`. These functions close that gap: a
+// changed structured field invalidates `presentation_hash` even when every
+// word of prose is byte-identical to what a human approved.
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonicalize a value for hashing: object keys sorted recursively, array
+ * order preserved, `undefined` and non-finite numbers rejected outright
+ * (never silently dropped — a dropped field is a hidden material detail).
+ */
+export function canonicalize(value: unknown): unknown {
+  if (value === undefined) {
+    throw new Error('canonicalize: undefined is not a valid canonical value');
+  }
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error('canonicalize: non-finite numbers are not allowed (amounts must be decimal strings)');
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => canonicalize(v));
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(obj).sort()) {
+      out[key] = canonicalize(obj[key]);
+    }
+    return out;
+  }
+  throw new Error(`canonicalize: unsupported value type '${typeof value}'`);
+}
+
+/** Deterministic JSON text of a canonicalized value — the exact bytes that get hashed. */
+export function canonicalStringify(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+/**
+ * Parse JSON text while rejecting duplicate keys within any single object
+ * literal. Native `JSON.parse` silently keeps the last of a duplicate key,
+ * which is exactly the kind of thing a canonical hash must never paper over
+ * — an attacker (or a buggy adapter) could smuggle a second `recipients` or
+ * `amount` key past a naive parse. Delegates actual value construction to
+ * `JSON.parse` once the duplicate-key scan has passed.
+ */
+export function parseStrictJson(text: string): unknown {
+  let i = 0;
+  const n = text.length;
+
+  function skipWs(): void {
+    while (i < n && /\s/.test(text[i]!)) i++;
+  }
+
+  function parseStringToken(): string {
+    // Assumes text[i] === '"'.
+    const start = i;
+    i++;
+    while (i < n) {
+      const c = text[i];
+      if (c === '\\') { i += 2; continue; }
+      if (c === '"') { i++; return text.slice(start, i); }
+      i++;
+    }
+    throw new Error('parseStrictJson: unterminated string');
+  }
+
+  function parseValue(): void {
+    skipWs();
+    const c = text[i];
+    if (c === '{') {
+      i++;
+      const seen = new Set<string>();
+      skipWs();
+      if (text[i] === '}') { i++; return; }
+      for (;;) {
+        skipWs();
+        if (text[i] !== '"') throw new Error('parseStrictJson: expected string key');
+        const rawKey = parseStringToken();
+        const key = JSON.parse(rawKey) as string;
+        if (seen.has(key)) throw new Error(`parseStrictJson: duplicate key '${key}'`);
+        seen.add(key);
+        skipWs();
+        if (text[i] !== ':') throw new Error("parseStrictJson: expected ':'");
+        i++;
+        parseValue();
+        skipWs();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === '}') { i++; break; }
+        throw new Error("parseStrictJson: expected ',' or '}'");
+      }
+      return;
+    }
+    if (c === '[') {
+      i++;
+      skipWs();
+      if (text[i] === ']') { i++; return; }
+      for (;;) {
+        parseValue();
+        skipWs();
+        if (text[i] === ',') { i++; continue; }
+        if (text[i] === ']') { i++; break; }
+        throw new Error("parseStrictJson: expected ',' or ']'");
+      }
+      return;
+    }
+    if (c === '"') { parseStringToken(); return; }
+    const rest = text.slice(i);
+    const m = /^(-?\d+(\.\d+)?([eE][+-]?\d+)?|true|false|null)/.exec(rest);
+    if (!m) throw new Error(`parseStrictJson: unexpected token at position ${i}`);
+    if (/^-?\d/.test(m[0])) {
+      if (!Number.isFinite(Number(m[0]))) throw new Error('parseStrictJson: non-finite number');
+    }
+    i += m[0].length;
+  }
+
+  parseValue();
+  skipWs();
+  if (i !== n) throw new Error('parseStrictJson: trailing content after JSON value');
+  return JSON.parse(text);
+}
+
+/** SHA-256 of the canonical bytes of a structured action specification. */
+export function computeActionHash(actionSpec: ActionSpecV1): string {
+  return createHash('sha256').update(canonicalStringify(actionSpec)).digest('hex');
+}
+
+/**
+ * SHA-256 of the exact approval presentation: prose fields plus (when
+ * present) the full structured action spec — account, recipients, target,
+ * amount, content/attachment access and expiry all included, per plan §5.1
+ * ("truncation cannot hide material details"). For a decision_only approval
+ * (`action_spec` null/absent) this reduces to hashing the prose fields only.
+ */
+export function computePresentationHash(
+  approval: Pick<Approval, 'title' | 'category' | 'description' | 'requesting_agent' | 'org'> & {
+    action_spec?: ActionSpecV1 | null;
+  },
+): string {
+  return createHash('sha256').update(canonicalStringify({
+    title: approval.title ?? '',
+    category: approval.category ?? '',
+    description: approval.description ?? '',
+    requesting_agent: approval.requesting_agent ?? '',
+    org: approval.org ?? '',
+    action_spec: approval.action_spec ?? null,
+  })).digest('hex');
+}
+
 export function readApproval(paths: BusPaths, approvalId: string): Approval | null {
   for (const bucket of ['pending', 'resolved']) {
     const p = join(paths.approvalDir, bucket, `${approvalId}.json`);
@@ -165,6 +329,11 @@ export function createBinding(
     consumed_at: null,
     consumed_by: null,
   };
+  if (approval.schema_version === 2) {
+    binding.schema_version = 2;
+    binding.action_hash = approval.action_spec ? computeActionHash(approval.action_spec) : null;
+    binding.presentation_hash = computePresentationHash(approval);
+  }
   ensureDir(bindingDir(paths));
   atomicWriteSync(bindingPath(paths, binding.ref), JSON.stringify(binding));
   return binding;
@@ -234,6 +403,16 @@ export function consumeBinding(
   if (payloadHash(current) !== binding.payload_hash) {
     return { ok: false, rejection: 'payload_changed', binding, current,
       detail: 'the request text changed since this button was posted' };
+  }
+  // ApprovalV2: prose can be byte-identical while a structured field
+  // (recipient/account/amount/target/content/attachment) changed underneath
+  // it — payload_hash alone cannot see that. presentation_hash covers the
+  // full action_spec, so this is the anti-confused-deputy check.
+  if (binding.schema_version === 2 && binding.presentation_hash !== undefined) {
+    if (computePresentationHash(current) !== binding.presentation_hash) {
+      return { ok: false, rejection: 'action_spec_changed', binding, current,
+        detail: 'the structured action changed since this button was posted, even though the visible text did not' };
+    }
   }
 
   // Single-use gate. O_EXCL: the first writer wins, the second is told the
