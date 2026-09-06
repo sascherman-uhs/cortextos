@@ -182,14 +182,22 @@ export function TaskDetailSheet({
           description: editDesc.trim(),
           priority: editPriority,
           assignee: editAssignee.trim() || undefined,
+          // OS-02: the version this form was populated from. If an agent moved
+          // the task while the drawer was open, the save is refused rather than
+          // overwriting whatever the agent recorded.
+          expectedVersion: (task as unknown as { version?: number }).version,
         }),
       });
       if (res.ok) {
         setEditing(false);
         onEdit?.(task.id);
       } else {
-        const data = await res.json();
-        setError(data.error || 'Failed to save');
+        const data = await res.json().catch(() => ({}));
+        setError(
+          res.status === 409
+            ? (data.message ?? 'This task changed while you were editing it. Reopen it to see the current version.')
+            : (data.error || 'Failed to save'),
+        );
       }
     } catch {
       setError('Network error');
