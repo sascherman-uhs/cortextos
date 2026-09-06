@@ -38,10 +38,16 @@ function render(receipt: Receipt | null, receiptError: string | null) {
     <RoutingReceiptPanel
       receipt={receipt}
       receiptError={receiptError}
-      revertReason=""
-      onRevertReasonChange={() => {}}
-      revertControl={{ disabled: true, note: null }}
-      onRevert={() => {}}
+      revert={{
+        editing: false,
+        reason: '',
+        disabled: true,
+        note: null,
+        onOpen: () => {},
+        onReasonChange: () => {},
+        onCancel: () => {},
+        onConfirm: () => {},
+      }}
       onDismiss={() => {}}
     />,
   );

@@ -16,6 +16,7 @@
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { RevertControl, type RevertControlProps } from './routing-revert-control';
 import {
   RECEIPT_STATE_ORDER,
   describeReceipt,
@@ -27,22 +28,12 @@ export interface RoutingReceiptPanelProps {
   receipt: Receipt | null;
   /** Transport- or service-level error for the same operation, if any. */
   receiptError: string | null;
-  revertReason: string;
-  onRevertReasonChange: (value: string) => void;
-  revertControl: { disabled: boolean; note: string | null };
-  onRevert: () => void;
+  /** The shared Revert control's wiring, minus what the receipt itself knows. */
+  revert: Omit<RevertControlProps, 'operationId' | 'revertible' | 'blockedReason'>;
   onDismiss: () => void;
 }
 
-export function RoutingReceiptPanel({
-  receipt,
-  receiptError,
-  revertReason,
-  onRevertReasonChange,
-  revertControl,
-  onRevert,
-  onDismiss,
-}: RoutingReceiptPanelProps) {
+export function RoutingReceiptPanel({ receipt, receiptError, revert, onDismiss }: RoutingReceiptPanelProps) {
   const display = describeReceipt(receipt);
   const outcome = describeReceiptOutcome(receipt);
   if (!display || !receipt) return null;
@@ -84,33 +75,24 @@ export function RoutingReceiptPanel({
         <p className="mt-1 text-muted-foreground">Affected: {receipt.affected_consumers.join(', ')}</p>
       )}
 
-      {display.canRevert && (
-        <div className="mt-2 space-y-1">
-          <label htmlFor="revert-reason" className="block font-medium">
-            Reason for reverting <span className="text-destructive">*</span>
-          </label>
-          <input
-            id="revert-reason"
-            value={revertReason}
-            onChange={(e) => onRevertReasonChange(e.target.value)}
-            className="w-full rounded-lg border border-border bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-            placeholder="Why is this being reverted? Recorded on the revert receipt."
-          />
-        </div>
-      )}
+      {/* The same control the operation history renders: open, edit the reason,
+          confirm. A one-click revert with a canned reason records a decision
+          nobody made, which is why the two surfaces no longer differ. */}
+      <RevertControl
+        {...revert}
+        operationId={receipt.operation_id}
+        revertible={display.canRevert}
+        blockedReason={
+          display.canRevert
+            ? null
+            : 'Nothing to revert — this operation has not changed the registry.'
+        }
+      />
 
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        <Button size="xs" variant="outline" disabled={revertControl.disabled} onClick={onRevert}>
-          Revert
-        </Button>
         <Button size="xs" variant="ghost" onClick={onDismiss}>
           Dismiss
         </Button>
-        {revertControl.note && (
-          <span className="text-muted-foreground" aria-live="polite">
-            {revertControl.note}
-          </span>
-        )}
       </div>
       {receiptError && (
         <p className="mt-1 text-destructive" role="alert">
