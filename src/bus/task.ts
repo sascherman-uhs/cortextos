@@ -1203,9 +1203,17 @@ export function archiveTasks(paths: BusPaths, dryRun: boolean = false): ArchiveR
   const tasks = readAllTasks(paths.taskDir);
 
   for (const task of tasks) {
-    // Only archive completed tasks
-    if (task.status !== 'completed') continue;
-
+    // Eligibility is decided by completed_at, not the live `status` field.
+    // `status` is a snapshot from this unlocked directory scan and can be
+    // stale by the time we get here — a concurrent transitionTask racing
+    // this same task can flip it away from 'completed' between the scan and
+    // this check. completed_at is written once, on completion, and nothing
+    // in this codebase clears it, so it is the stable fact "this task earned
+    // archival eligibility 7+ days ago" that a later, unrelated status
+    // change should not silently revoke. (Without this, a transition that
+    // wins the race by landing before this scan makes the task invisible to
+    // archiveTasks entirely — neither archived nor retried — which is the
+    // exact silent-third-outcome this package exists to close.)
     if (!task.completed_at) {
       skipped++;
       continue;
@@ -1236,24 +1244,43 @@ export function archiveTasks(paths: BusPaths, dryRun: boolean = false): ArchiveR
         // finishes first (and archive sees its result) or fails loudly with
         // "unreadable"/ENOENT after the file has moved — never a silent
         // clobber.
-        try {
-          withTaskLock(srcPath, () => {
-            const current = JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>;
-            const meta = readMeta(current);
-            const nextVersion = meta.version + 1;
-            current.archived = true;
-            current.version = nextVersion;
-            current.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-            atomicWriteSync(srcPath, JSON.stringify(current));
-            appendTaskEvent(paths, srcPath, task.id, {
-              version: nextVersion,
-              event: 'archived',
-              actor: 'archive-tasks',
+        // A task merely waiting behind another writer (a transitionTask
+        // racing this same file) throws "Task lock busy" from withTaskLock
+        // once its own LOCK_WAIT_MS poll deadline passes — that is lock
+        // contention, not a data problem, so it gets a few more attempts in
+        // this same pass rather than being counted as permanently skipped.
+        // Any other error (corrupt JSON, ENOENT, etc.) still skips on the
+        // first failure.
+        const ARCHIVE_LOCK_RETRIES = 3;
+        let lockedOk = false;
+        let lastErr: unknown;
+        for (let attempt = 1; attempt <= ARCHIVE_LOCK_RETRIES; attempt++) {
+          try {
+            withTaskLock(srcPath, () => {
+              const current = JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>;
+              const meta = readMeta(current);
+              const nextVersion = meta.version + 1;
+              current.archived = true;
+              current.version = nextVersion;
+              current.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+              atomicWriteSync(srcPath, JSON.stringify(current));
+              appendTaskEvent(paths, srcPath, task.id, {
+                version: nextVersion,
+                event: 'archived',
+                actor: 'archive-tasks',
+              });
+              renameSync(srcPath, join(archiveDir, `${task.id}.json`));
             });
-            renameSync(srcPath, join(archiveDir, `${task.id}.json`));
-          });
-        } catch (err) {
-          console.error(`[bus/task] archive ${task.id}: locked write/move failed: ${err}`);
+            lockedOk = true;
+            break;
+          } catch (err) {
+            lastErr = err;
+            const isLockBusy = err instanceof Error && err.message.startsWith('Task lock busy');
+            if (!isLockBusy || attempt === ARCHIVE_LOCK_RETRIES) break;
+          }
+        }
+        if (!lockedOk) {
+          console.error(`[bus/task] archive ${task.id}: locked write/move failed: ${lastErr}`);
           skipped++;
           continue;
         }
