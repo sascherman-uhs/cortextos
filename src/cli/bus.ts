@@ -6,6 +6,7 @@ import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { ContractViolation, type CanonicalState, type TransitionOrigin } from '../bus/task-contract.js';
+import { deleteTask, TaskDeletionRefused } from '../bus/task-delete.js';
 import { requireOrgForOrgScopedWrite } from '../utils/org.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -254,6 +255,45 @@ busCommand
       const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
+    }
+  });
+
+busCommand
+  .command('delete-task')
+  .description('Remove a task and every actionable remnant of it. Refused for an obligation or for work that is not already terminal — cancel those instead.')
+  .requiredOption('--id <id>', 'Task ID to delete')
+  .option('--org <name>', 'Organization that owns the task. Falls back to CTX_ORG. Required, for the same reason create-task requires it: without it the id is resolved against every org and the first match wins.')
+  .requiredOption('--reason <why>', 'Why this task is being removed. Recorded in the org deletion log.')
+  .option('--actor <name>', 'Who is deleting it. Defaults to the calling agent.')
+  .option('--force', 'Delete anyway when the contract refuses — genuine junk, fixtures, a malformed record. Recorded as forced, with the actor and the reason.')
+  .action((opts: { id: string; org?: string; reason: string; actor?: string; force?: boolean }) => {
+    const env = resolveEnv();
+    const resolved = requireOrgForOrgScopedWrite(opts.org || env.org, env.frameworkRoot, 'task', 'delete');
+    if (!resolved.ok) {
+      console.error(resolved.message);
+      process.exit(1);
+    }
+    const paths = resolvePaths(env.agentName, env.instanceId, resolved.org);
+    try {
+      const report = deleteTask(paths, opts.id, {
+        actor: opts.actor || env.agentName,
+        reason: opts.reason,
+        force: opts.force === true,
+      });
+      const msgCount = report.messages.length;
+      console.log(
+        `Deleted ${report.taskId}${report.forced ? ' (forced)' : ''}: `
+        + `${report.removed.length} path(s) removed, ${msgCount} unacked message(s) swept`
+        + (msgCount ? ` (${report.messages.map((m) => `${m.agent}/${m.queue}`).join(', ')})` : '')
+        + `. Recorded in ${report.tombstone}.`,
+      );
+    } catch (err) {
+      if (err instanceof TaskDeletionRefused) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
     }
   });
 

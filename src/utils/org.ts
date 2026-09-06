@@ -108,6 +108,10 @@ export function requireOrgForOrgScopedWrite(
   org: string | undefined,
   frameworkRoot: string,
   kind: 'task' | 'approval' = 'task',
+  /** What the caller was about to do. `delete` reaches the same refusal from
+   *  the other direction: an unqualified delete would scan for the id across
+   *  every org and remove whichever copy it happened to find first. */
+  action: 'create' | 'delete' = 'create',
 ): { ok: true; org: string } | { ok: false; message: string } {
   const name = (org ?? '').trim();
   if (name) return { ok: true, org: name };
@@ -116,11 +120,17 @@ export function requireOrgForOrgScopedWrite(
     kind === 'approval'
       ? 'not the approvals queue, not sync, not any human'
       : 'not the board, not sync, not any agent';
+  const article = kind === 'approval' ? 'an' : 'a';
+  const why =
+    action === 'delete'
+      ? `Refusing to delete ${article} ${kind} with no organization: the id would be resolved against every org directory `
+        + 'and the first match removed, which is a guess about whose work is being destroyed.'
+      : `Refusing to create ${article} ${kind} with no organization: it would be written outside every `
+        + `org directory, where nothing reads it — ${reader}.`;
   return {
     ok: false,
     message:
-      `Refusing to create ${kind === 'approval' ? 'an' : 'a'} ${kind} with no organization: it would be written outside every `
-      + `org directory, where nothing reads it — ${reader}.\n`
+      why + '\n'
       + 'Pass --org <name> or set CTX_ORG.'
       + (available.length ? `\nOrganizations here: ${available.join(', ')}.` : ''),
   };
