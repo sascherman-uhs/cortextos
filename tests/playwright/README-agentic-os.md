@@ -58,3 +58,35 @@ screenshot directory. The default target is the live dev server on
   and a repeatable test must not leave the live registry somewhere it cannot return
   from. The gap is asserted and reported instead.
 - It sends no Telegram or email and restarts nothing outside the switch flow itself.
+
+## Re-verification run (2026-09-05, second pass)
+
+The suite was extended after the seven defects from the first pass were fixed and
+deployed. Added checks:
+
+| Test | What it re-checks |
+|---|---|
+| `DEF-1` | trillion-coder's invalid pin renders as a remediation code + sentence, never a CLI exit status. |
+| `DEF-2` | `jarvis-scout` (enabled, unconfigured) is a muted "Configuration missing" note — no row, no Change button, and zero requests to its config endpoint. |
+| `DEF-3` | Confidence badges come from real observations: at least one `verified`, and trillion-coder's `mismatch` visible. |
+| `DEF-4` | A switch whose agents are all pinned reports "no restart needed" and never narrates a restart it did not perform. |
+| `DEF-5` | The Change-model dialog offers the clear-legacy-pins checkbox with a preview of what would be cleared; a refused operation replaces the displayed receipt instead of leaving a stale Revert. |
+| `DEF-6` | The per-row Attempts expander lists requested/resolved/observed/confidence for the last five dispatch attempts. |
+| `B` | A switch that clears a pin really restarts the agent and the receipt says so; the revert takes an operator-supplied reason and restores both the tier and the pin. |
+| `H` | A Kanban/detail-sheet move that violates the transition contract, and an edit made from a stale version. |
+| `I` | `/briefing?person=…` person views and their server-side ACL. |
+
+Screenshots and evidence for this pass land in
+`output/2026-09-05/screenshots/slice1-reverify/`.
+
+Credentials live in `~/cortextos/dashboard/.env.local` (NOT `~/cortextos/.env.local`).
+That file contains an unquoted path with spaces, so sourcing it whole fails under zsh —
+export only the two variables the suite needs:
+
+```bash
+eval "$(grep -E '^ADMIN_(USERNAME|PASSWORD)=' ~/cortextos/dashboard/.env.local | sed 's/^/export /')"
+```
+
+Check H creates a native task through `cortextos bus create-task` with a `ZZTEST` title
+and deletes its record in a `finally` block. The append-only audit log for that task id
+is deliberately left in place — it is an immutable journal, not test data.
