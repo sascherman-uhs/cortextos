@@ -24,8 +24,15 @@
 /** `${env:KEY}` — the only reference form. KEY is a normal env identifier. */
 const ENV_REF = /\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
-/** Telegram bot token shape. Deliberately narrow: `<digits>:<secret>`. */
-const BOT_TOKEN_LITERAL = /\b\d{6,12}:[A-Za-z0-9_-]{30,}\b/g;
+/**
+ * Telegram bot token shape: `<digits>:<secret>`.
+ *
+ * No leading `\b`. The literal this exists to catch sits in
+ * `https://api.telegram.org/bot<TOKEN>/sendDocument`, where the digits follow
+ * the letter `t` and there is no word boundary at all. `(?<!\d)` still keeps
+ * it from matching the tail of a longer digit run.
+ */
+const BOT_TOKEN_LITERAL = /(?<!\d)\d{6,12}:[A-Za-z0-9_-]{30,}/g;
 
 /**
  * Rewrite `${env:KEY}` references into shell expansions.

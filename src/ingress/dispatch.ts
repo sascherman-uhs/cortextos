@@ -76,9 +76,17 @@ function recordPath(paths: IngressPaths, id: string): string {
   return join(paths.dispatchQueueDir, `${id.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`);
 }
 
-function idForKey(dedupeKey: string): string {
+/**
+ * Filesystem-safe record id for a dedupe key.
+ *
+ * Exported because callers (and tests) need to address a row they accepted by
+ * its key without re-deriving the sanitisation and getting it subtly wrong.
+ */
+export function dispatchIdFor(dedupeKey: string): string {
   return dedupeKey.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 180);
 }
+
+const idForKey = dispatchIdFor;
 
 function journal(paths: IngressPaths, event: Record<string, unknown>): void {
   appendJsonl(paths.dispatchEventsPath, event);
