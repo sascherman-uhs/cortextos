@@ -9,7 +9,7 @@
       "id": "registry",
       "order": 1,
       "authority": "canonical-registry",
-      "min_score": 0.5,
+      "min_score": 0.2,
       "description": "Capability/vendor/project registry lookup. Answers 'do we have X?' with a path, never from memory."
     },
     {
@@ -23,14 +23,14 @@
       "id": "documents",
       "order": 3,
       "authority": "approved-document",
-      "min_score": 0.5,
+      "min_score": 0.4,
       "description": "Scoped source documents and wiki: deterministic lookup over registered document roots."
     },
     {
       "id": "semantic",
       "order": 4,
       "authority": "semantic-retrieval",
-      "min_score": 0.0,
+      "min_score": 0.72,
       "description": "Semantic retrieval over the federated permitted collections. Always cited, never authoritative on its own."
     }
   ],
@@ -110,6 +110,13 @@
     "primary": "score_band",
     "band_size": 0.1,
     "tiebreak": "layer_order",
+    "authoritative_layers": ["registry", "structured"],
+    "authoritative_reserved_slots": {
+      "registry": 2,
+      "structured": 5,
+      "_note": "Registry hits are keyword matches and are bounded. Structured hits are pointers into a small curated list of authoritative record systems, so ALL that fire are surfaced: an agent-versus-owner question must name both uhsMLS.agents and the Assessor, and reserving two slots let one of them fall off."
+    },
+    "semantic_floor_note": "0.72 is an EMPIRICAL floor for Gemini Embedding 2 in this store, not a round number: unrelated content ('the UHS policy on submarine leasing in Antarctica') scores 0.69-0.70 against every UHS document, while a genuinely correct match scores 0.75-0.84. At the old 0.5 default nothing was ever below threshold, so the contract could never say 'no source answers this' — it always had six confident-looking citations for a question with no answer. Re-measure this floor if the embedding model changes.",
     "note": "Layer order is AUTHORITY, not display order. A weak registry keyword match must not bury a strong semantic hit, so results rank by score band first and layer order only inside a band. Each layer also has a min_score: a deterministic keyword layer that barely matched contributes nothing."
   },
 
@@ -201,6 +208,17 @@
       "note": "calendly.com links are dead; UHS self-hosts its scheduler."
     }
   ],
+
+  "registry_query": {
+    "stopwords": [
+      "the", "and", "for", "our", "are", "was", "with", "this", "that", "what",
+      "where", "does", "have", "has", "need", "needs", "set", "setup", "should",
+      "would", "could", "can", "get", "use", "using", "uhs", "utopia", "policy",
+      "account", "accounts", "new", "one", "any", "all", "how", "who", "why",
+      "from", "into", "about", "there", "their", "them", "you", "your"
+    ],
+    "note": "A registry lookup answers 'do we have X?'. Scoring by the raw fraction of matched query terms let 'the UHS policy on submarine leasing in Antarctica' match registry entries on 'uhs' and 'policy' and score 0.29 — above the floor, so a question with no answer came back with citations. Only distinctive terms count toward a registry match, and a query with no distinctive term matches nothing."
+  },
 
   "registry_sources": [
     {

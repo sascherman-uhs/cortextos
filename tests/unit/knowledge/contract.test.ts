@@ -142,7 +142,9 @@ describe('dedupe by canonical source + content hash', () => {
         query: (collection) => [{
           source: '/v/uhsJARVIS/vault/business/terms.md',
           content: 'The service period runs 30 days.',
-          similarity: collection === 'uhs' ? 0.9 : 0.7,
+          // Both above the policy's empirical semantic floor (0.72), so the
+          // duplicate is a real duplicate rather than one hit and one reject.
+          similarity: collection === 'uhs' ? 0.9 : 0.85,
         }],
       },
     });
@@ -236,5 +238,92 @@ describe('policy shape', () => {
   it('never grants an anonymous role anything', () => {
     const anonGrants = POLICY.authorization.roles.anonymous;
     expect(Object.values(anonGrants).some((v) => v === true)).toBe(false);
+  });
+});
+
+
+/**
+ * Relevance floors and reserved authoritative slots.
+ *
+ * Every assertion below was written after the JARVIS acceptance corpus caught
+ * the behaviour it pins. They are regressions waiting to happen, not
+ * hypotheticals.
+ */
+describe('relevance floors', () => {
+  it('returns nothing, and says so, for a question with no answer', () => {
+    // Gemini Embedding 2 scores unrelated UHS content at ~0.70 against any
+    // question, so at the old 0.5 threshold "the UHS policy on submarine
+    // leasing in Antarctica" came back with six confident citations.
+    const response = retrieve({
+      question: 'What is the UHS policy on submarine leasing in Antarctica?',
+      caller: operator,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => [
+          { source: '/j/vault/business/warehouse.md', content: '3100 Sirius Ave', similarity: 0.702 },
+          { source: '/j/memory/MEMORY.md', content: 'index', similarity: 0.701 },
+        ],
+      },
+    });
+    expect(response.total).toBe(0);
+    expect(response.uncertainty).toMatch(/No source was found/);
+  });
+
+  it('still admits a genuinely correct match', () => {
+    const response = retrieve({
+      question: 'GoHighLevel retirement',
+      caller: operator,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => [{
+          source: '/j/memory/feedback_gohighlevel_retired.md',
+          content: 'GoHighLevel CRM retired 2026-07-06.', similarity: 0.816,
+        }],
+      },
+    });
+    expect(response.total).toBe(1);
+  });
+});
+
+describe('reserved slots for the authoritative layers', () => {
+  it('keeps an authoritative pointer that prose about it would outrank', () => {
+    // The Assessor pointer scores 0.50 as a keyword match; a memory note about
+    // it scores 0.76 as a semantic match. Ranking alone dropped the source.
+    const response = retrieve({
+      question: 'Who is the owner of a listed property and who is the listing agent?',
+      caller: operator, topK: 3,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['structured', 'semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => [
+          { source: '/j/memory/feedback_agent_vs_owner.md', content: 'Agent is not owner.', similarity: 0.764 },
+          { source: '/j/memory/reference_uhsmls_query.md', content: 'Query notes.', similarity: 0.75 },
+        ],
+      },
+    });
+    const sources = response.results.map((r) => r.citation.canonicalSource);
+    expect(sources).toContain('supabase:assessor.owner');
+    expect(sources).toContain('supabase:uhsmls.agents');
+  });
+
+  it('does not let the reserved slots crowd out the semantic answer', () => {
+    const response = retrieve({
+      question: 'Who is the owner of a listed property and who is the listing agent?',
+      caller: operator, topK: 6,
+      store: { frameworkRoot: '/nonexistent', instanceId: 'test', org: 'uhs' },
+      layers: ['structured', 'semantic'],
+      transport: {
+        listCollections: () => ['uhs'],
+        query: () => Array.from({ length: 6 }, (_, i) => ({
+          source: `/j/memory/note${i}.md`, content: `note ${i}`, similarity: 0.8 - i * 0.01,
+        })),
+      },
+    });
+    expect(response.results.some((r) => r.citation.layer === 'semantic')).toBe(true);
   });
 });

@@ -48,7 +48,11 @@ export interface RetrievalPolicy {
   policy_version: string;
   org: string;
   layers: Array<{ id: LayerId; order: number; authority: string; min_score: number; description: string }>;
-  ranking: { primary: string; band_size: number; tiebreak: string };
+  ranking: {
+    primary: string; band_size: number; tiebreak: string;
+    authoritative_layers: LayerId[];
+    authoritative_reserved_slots: Partial<Record<LayerId, number>> & { _note?: string };
+  };
   collections: {
     org: Array<{ name: string; authority: string; description: string }>;
     agent_prefix: string;
@@ -68,6 +72,7 @@ export interface RetrievalPolicy {
   freshness: { lag_warn_hours: number; lag_fail_hours: number };
   structured_sources: StructuredSource[];
   retired_sources: RetiredSource[];
+  registry_query: { stopwords: string[] };
   registry_sources: Array<{ id: string; authority: string; relative_path: string; description: string }>;
   document_roots: Array<{ id: string; relative_path: string; authority: string; max_depth?: number }>;
 }
@@ -485,7 +490,15 @@ export function registryLookup(
 ): RetrievalHit[] {
   if (!roots.jarvisRoot) return [];
   const hits: RetrievalHit[] = [];
-  const terms = question.toLowerCase().split(/[^a-z0-9.+_-]+/).filter((t) => t.length > 2);
+  // Only DISTINCTIVE terms count. Scoring on every word let "the UHS policy on
+  // submarine leasing in Antarctica" match registry entries on "uhs" and
+  // "policy" and clear the relevance floor, so a question with no answer came
+  // back with citations. A query with no distinctive term matches nothing.
+  const stop = new Set(policy.registry_query?.stopwords ?? []);
+  const terms = question.toLowerCase()
+    .split(/[^a-z0-9.+_-]+/)
+    .filter((t) => t.length > 2 && !stop.has(t));
+  if (terms.length === 0) return hits;
   for (const src of policy.registry_sources) {
     const p = join(roots.jarvisRoot, src.relative_path);
     if (!existsSync(p)) continue;
@@ -812,7 +825,7 @@ export function retrieve(opts: RetrieveOptions): RetrievalResponse {
   // exactly how a "layered" retriever starts returning noise. Rank by score
   // band, and let authority decide only inside a band.
   const band = policy.ranking?.band_size || 0.1;
-  const merged = Array.from(byKey.values()).sort((a, b) => {
+  const byBand = (a: RetrievalHit, b: RetrievalHit): number => {
     const ba = Math.floor(a.citation.score / band);
     const bb = Math.floor(b.citation.score / band);
     if (ba !== bb) return bb - ba;
@@ -820,7 +833,30 @@ export function retrieve(opts: RetrieveOptions): RetrievalResponse {
     const rb = authorityRank.get(b.citation.layer) ?? 99;
     if (ra !== rb) return ra - rb;
     return b.citation.score - a.citation.score;
-  }).slice(0, topK);
+  };
+
+  // Reserved slots for the authoritative layers.
+  //
+  // Semantic similarity and keyword-match fraction are different numbers on the
+  // same scale, and the semantic one is always larger: "who is the owner of a
+  // listed property" scored 0.76 on a memory note and 0.50 on the Assessor
+  // record pointer, so pure ranking dropped the authoritative source that
+  // actually answers the question and kept the prose about it. A registry or
+  // structured hit that fires at all is telling the caller WHERE the current
+  // fact lives, which is the first thing the contract is supposed to do — so a
+  // bounded number of them are placed at the front instead of competing on a
+  // score that means something else.
+  const authoritative = new Set<LayerId>(policy.ranking?.authoritative_layers ?? []);
+  const reserved = policy.ranking?.authoritative_reserved_slots ?? {};
+  const all = Array.from(byKey.values()).sort(byBand);
+  const front: RetrievalHit[] = [];
+  for (const layer of policy.layers.map((l) => l.id)) {
+    if (!authoritative.has(layer)) continue;
+    const slots = reserved[layer] ?? 0;
+    front.push(...all.filter((h) => h.citation.layer === layer).slice(0, slots));
+  }
+  const rest = all.filter((h) => !front.includes(h));
+  const merged = [...front, ...rest].slice(0, Math.max(topK, front.length));
 
   // --- retired guidance + staleness ----------------------------------------
   for (const hit of merged) {
