@@ -6,7 +6,7 @@ import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { ContractViolation, type CanonicalState, type TransitionOrigin } from '../bus/task-contract.js';
-import { requireOrgForTaskWrite } from '../utils/org.js';
+import { requireOrgForOrgScopedWrite } from '../utils/org.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -229,7 +229,7 @@ busCommand
     // the CLI printed an id, the caller believed the task existed, and it
     // reached no board, no projection and no agent. Silent task loss.
     // Refuse instead, and name the orgs that would have worked.
-    const resolved = requireOrgForTaskWrite(opts.org || env.org, env.frameworkRoot);
+    const resolved = requireOrgForOrgScopedWrite(opts.org || env.org, env.frameworkRoot, 'task');
     if (!resolved.ok) {
       console.error(resolved.message);
       process.exit(1);
@@ -1254,21 +1254,29 @@ busCommand
   .argument('<title>', 'What you are requesting approval for')
   .argument('<category>', 'Category: external-comms, financial, deployment, data-deletion, other')
   .argument('[context]', 'Additional context')
-  .action(async (title: string, category: string, context?: string) => {
+  .option('--org <name>', 'Organization this approval belongs to. Falls back to CTX_ORG. Required: approvals are stored per org, and one written outside an org reaches no human.')
+  .action(async (title: string, category: string, context: string | undefined, opts: { org?: string }) => {
     const validCategories: ApprovalCategory[] = ['external-comms', 'financial', 'deployment', 'data-deletion', 'other'];
     if (!validCategories.includes(category as ApprovalCategory)) {
       console.error(`Invalid category '${category}'. Must be one of: ${validCategories.join(', ')}`);
       process.exit(1);
     }
     const env = resolveEnv();
-    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    // Same hole as create-task, and worse here: an approval nobody can see is
+    // indistinguishable, to the agent waiting on it, from one still pending.
+    const resolvedOrg = requireOrgForOrgScopedWrite(opts.org || env.org, env.frameworkRoot, 'approval');
+    if (!resolvedOrg.ok) {
+      console.error(resolvedOrg.message);
+      process.exit(1);
+    }
+    const paths = resolvePaths(env.agentName, env.instanceId, resolvedOrg.org);
     // await — createApproval fan-out posts to the activity channel, which
     // must complete before the CLI process exits or the post silently
     // never sends. env.frameworkRoot is passed so the activity-channel
     // orgDir resolves to where activity-channel.env actually lives (the
     // framework repo path, NOT the runtime state path — see
     // src/bus/approval.ts:postApprovalToActivityChannel for the history).
-    const id = await createApproval(paths, env.agentName, env.org, title, category as ApprovalCategory, context || '', env.frameworkRoot, env.agentDir);
+    const id = await createApproval(paths, env.agentName, resolvedOrg.org, title, category as ApprovalCategory, context || '', env.frameworkRoot, env.agentDir);
     console.log(id);
   });
 

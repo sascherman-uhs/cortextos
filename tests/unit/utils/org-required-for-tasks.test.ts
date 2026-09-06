@@ -12,9 +12,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { requireOrgForTaskWrite, listOrgNames } from '../../../src/utils/org';
+import { requireOrgForOrgScopedWrite, listOrgNames } from '../../../src/utils/org';
 
-describe('requireOrgForTaskWrite', () => {
+describe('requireOrgForOrgScopedWrite', () => {
   let root: string;
 
   beforeEach(() => {
@@ -28,22 +28,29 @@ describe('requireOrgForTaskWrite', () => {
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   it('accepts an explicit org', () => {
-    expect(requireOrgForTaskWrite('uhs', root)).toEqual({ ok: true, org: 'uhs' });
+    expect(requireOrgForOrgScopedWrite('uhs', root)).toEqual({ ok: true, org: 'uhs' });
   });
 
   it('trims an org that arrived with whitespace rather than treating it as absent', () => {
-    expect(requireOrgForTaskWrite('  uhs  ', root)).toEqual({ ok: true, org: 'uhs' });
+    expect(requireOrgForOrgScopedWrite('  uhs  ', root)).toEqual({ ok: true, org: 'uhs' });
+  });
+
+  it('reads as English for both kinds rather than "a approval"', () => {
+    const task = requireOrgForOrgScopedWrite(undefined, root, 'task');
+    const approval = requireOrgForOrgScopedWrite(undefined, root, 'approval');
+    expect(task.ok === false && task.message).toContain('create a task');
+    expect(approval.ok === false && approval.message).toContain('create an approval');
   });
 
   it('refuses an absent or blank org', () => {
     for (const value of [undefined, '', '   ']) {
-      const out = requireOrgForTaskWrite(value, root);
+      const out = requireOrgForOrgScopedWrite(value, root);
       expect(out.ok).toBe(false);
     }
   });
 
   it('says where the task would have gone and why that is useless', () => {
-    const out = requireOrgForTaskWrite(undefined, root);
+    const out = requireOrgForOrgScopedWrite(undefined, root);
     expect(out.ok).toBe(false);
     if (out.ok) return;
     expect(out.message).toMatch(/nothing reads it/);
@@ -51,12 +58,20 @@ describe('requireOrgForTaskWrite', () => {
   });
 
   it('names the organizations that would have worked', () => {
-    const out = requireOrgForTaskWrite(undefined, root);
+    const out = requireOrgForOrgScopedWrite(undefined, root);
     expect(out.ok === false && out.message).toContain('acme, uhs');
   });
 
+  it('names the right reader for an approval, which nothing else would catch', () => {
+    const out = requireOrgForOrgScopedWrite(undefined, root, 'approval');
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.message).toMatch(/Refusing to create an approval with no organization/);
+    expect(out.message).toMatch(/not any human/);
+  });
+
   it('does not claim there are no organizations when it simply cannot look', () => {
-    const out = requireOrgForTaskWrite(undefined, join(root, 'nowhere'));
+    const out = requireOrgForOrgScopedWrite(undefined, join(root, 'nowhere'));
     expect(out.ok === false && out.message).not.toMatch(/Organizations here/);
   });
 });

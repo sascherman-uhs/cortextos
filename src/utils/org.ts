@@ -90,26 +90,37 @@ export function listOrgNames(frameworkRoot: string): string[] {
 }
 
 /**
- * The org a task write must name, or the message explaining why it cannot go
- * ahead.
+ * The org an org-scoped write must name, or the message explaining why it
+ * cannot go ahead.
  *
  * `bus create-task` with no org resolved its paths to `<instance>/tasks/` —
- * a directory nothing reads. Sync walks `<instance>/orgs/<org>/tasks/` and
- * only that, so the CLI printed a task id, the caller believed the task
- * existed, and it reached no board, no projection and no agent. Silent loss.
+ * a directory nothing reads. Dashboard sync walks
+ * `<instance>/orgs/<org>/tasks/` and only that, so the CLI printed a task id,
+ * the caller believed the task existed, and it reached no board, no
+ * projection and no agent. Silent loss.
+ *
+ * `bus create-approval` had the same hole against `<instance>/approvals/`,
+ * where it is worse: an approval request for a high-stakes action that
+ * reaches no human reads, to the agent that asked, exactly like one that is
+ * merely still pending.
  */
-export function requireOrgForTaskWrite(
+export function requireOrgForOrgScopedWrite(
   org: string | undefined,
   frameworkRoot: string,
+  kind: 'task' | 'approval' = 'task',
 ): { ok: true; org: string } | { ok: false; message: string } {
   const name = (org ?? '').trim();
   if (name) return { ok: true, org: name };
   const available = listOrgNames(frameworkRoot);
+  const reader =
+    kind === 'approval'
+      ? 'not the approvals queue, not sync, not any human'
+      : 'not the board, not sync, not any agent';
   return {
     ok: false,
     message:
-      'Refusing to create a task with no organization: it would be written outside every '
-      + 'org directory, where nothing reads it — not the board, not sync, not any agent.\n'
+      `Refusing to create ${kind === 'approval' ? 'an' : 'a'} ${kind} with no organization: it would be written outside every `
+      + `org directory, where nothing reads it — ${reader}.\n`
       + 'Pass --org <name> or set CTX_ORG.'
       + (available.length ? `\nOrganizations here: ${available.join(', ')}.` : ''),
   };
