@@ -23,22 +23,25 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
   ActivationBadge,
-  ConfidenceBadge,
   CostBadges,
   EffectiveSourceBadge,
   EvalStateBadge,
+  ResolvedRouteCell,
+  RunningModelCell,
   ValidationErrors,
 } from './routing-badges';
 import { ChangeModelDialog, type ChangeModelSubmit } from './change-model-dialog';
+import { RoutingReceiptPanel } from './routing-receipt-panel';
+import { RevertControl, defaultRevertReason } from './routing-revert-control';
 import {
+  describeActivationBanner,
   describeDesiredVsRunning,
+  describeRoutingResponse,
   describeReceipt,
-  describeReceiptOutcome,
   describeRevertControl,
   humanizeRoutingError,
   isLegacyPin,
   summarizeOperations,
-  RECEIPT_STATE_ORDER,
   type OperationSummary,
 } from './model-routing-view';
 import type { Receipt, RegistrySummary, Resolution, RoutingAttempt } from '@/lib/model-routing';
@@ -99,7 +102,9 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
   const [dialogError, setDialogError] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const [receiptError, setReceiptError] = useState<string | null>(null);
-  const [revertReason, setRevertReason] = useState('');
+  // ONE pending-revert state for both surfaces — the receipt and the history —
+  // so the two controls cannot drift apart again (defect B).
+  const [pendingRevert, setPendingRevert] = useState<{ operationId: string; reason: string } | null>(null);
   // Defect L: the post-operation refresh is not the operation. Holding
   // `submitting` true across it left Revert disabled for ~3s with nothing on
   // screen saying why, and a verifier read that as a broken button.
@@ -110,8 +115,6 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
   // a reload, not one click away behind a collapsed panel.
   const [historyOpen, setHistoryOpen] = useState(true);
   const [showAllHistory, setShowAllHistory] = useState(false);
-  /** The past operation whose revert reason is being edited, and its text. */
-  const [historyRevert, setHistoryRevert] = useState<{ operationId: string; reason: string } | null>(null);
 
   const loadIndex = useCallback(async () => {
     setIndex((p) => ({ ...p, loading: true }));
@@ -191,6 +194,13 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
     return (rosterKey ? rosterKey.split(',') : []).filter((a) => !inRegistry.has(a));
   }, [index.summary, registryAgents, rosterKey]);
 
+  // One line above the table naming the activation mode the rows are in, so a
+  // reader who does not know what "shadow" means can still read a row.
+  const activationBanner = useMemo(
+    () => describeActivationBanner(rowAgents.map((a) => rows[a]?.resolution ?? null)),
+    [rowAgents, rows],
+  );
+
   const rowKey = rowAgents.join(',');
   useEffect(() => {
     for (const a of rowKey ? rowKey.split(',') : []) void loadAgent(a);
@@ -257,13 +267,14 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
           body: JSON.stringify({ op: 'model_routing', ...payload }),
         });
         const body = await res.json();
-        // A receipt in the body describes THIS operation even on a failure
-        // status (a blocked operation is a receipt, not an exception).
-        setReceipt(body.receipt ?? null);
-        if (!res.ok) {
-          const msg = humanizeRoutingError(body.error) ?? `HTTP ${res.status}`;
-          setDialogError(msg);
-          setReceiptError(msg);
+        // What the operator is shown is decided in one tested place, so the
+        // failure path can be exercised by injecting a response rather than by
+        // hoping a live registry misbehaves.
+        const outcome = describeRoutingResponse({ ok: res.ok, status: res.status, body });
+        setReceipt(outcome.receipt);
+        if (!outcome.shouldRefresh) {
+          setDialogError(outcome.dialogError);
+          setReceiptError(outcome.receiptError);
           return false;
         }
         // The operation is over the moment its receipt is final. The refresh
@@ -276,17 +287,23 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
         } finally {
           setRefreshing(false);
         }
-        if (body.success === false) {
+        if (!outcome.success) {
           // Blocked or failed: a real receipt, but not a change the operator
           // asked for. The panel above shows its state and reason.
-          setDialogError(body.receipt?.error ?? 'The routing service blocked this operation.');
+          setDialogError(outcome.dialogError);
           return false;
         }
         return true;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : 'request failed';
-        setDialogError(msg);
-        setReceiptError(msg);
+        const outcome = describeRoutingResponse({
+          ok: false,
+          status: 0,
+          body: null,
+          transportError: e instanceof Error ? e.message : 'request failed',
+        });
+        setReceipt(outcome.receipt);
+        setDialogError(outcome.dialogError);
+        setReceiptError(outcome.receiptError);
         return false;
       } finally {
         setSubmitting(false);
@@ -319,7 +336,6 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
   );
 
   const receiptDisplay = describeReceipt(receipt);
-  const outcome = describeReceiptOutcome(receipt);
   const dialogRow = dialogAgent ? rows[dialogAgent] : undefined;
   const busy = submitting || refreshing;
   const revertControl = describeRevertControl({
@@ -327,7 +343,9 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
     submitting,
     refreshing,
     mutable: index.mutable,
-    reason: revertReason,
+    // The shared control gates on an empty reason itself, so this call answers
+    // only "may this operation be reverted at all right now?".
+    reason: pendingRevert?.reason ?? 'n/a',
   });
 
   // Defect K: the durable history. Derived from the journal the page already
@@ -349,15 +367,15 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
         operation_id: op.operationId,
         reason,
       });
-      if (ok) setHistoryRevert(null);
+      if (ok) setPendingRevert(null);
     },
     [patchRouting, rowAgents],
   );
 
-  // Prefill the revert reason from whichever receipt is on screen, and let the
-  // operator replace it — a revert is an operator decision that gets recorded.
+  // A new receipt closes any revert form that was open for a different
+  // operation: the form the operator sees always belongs to what is on screen.
   useEffect(() => {
-    setRevertReason(receipt ? `Revert of ${receipt.operation_id} from the Fleet page` : '');
+    setPendingRevert((p) => (p && receipt && p.operationId === receipt.operation_id ? p : null));
   }, [receipt]);
 
   return (
@@ -384,91 +402,63 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
         </p>
       )}
 
-      {receiptDisplay && receipt && (
-        <div className="rounded-lg border border-border p-3 text-xs" role="status" aria-live="polite">
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant={receiptDisplay.applied ? 'default' : receiptDisplay.tone === 'error' ? 'destructive' : 'outline'}>
-              {receiptDisplay.label}
-            </Badge>
-            <span className="text-muted-foreground">
-              {receiptDisplay.stepIndex >= 0
-                ? `Step ${receiptDisplay.stepIndex + 1} of ${RECEIPT_STATE_ORDER.length}`
-                : 'Off the normal path'}
-            </span>
-            <span className="font-mono text-[11px] text-muted-foreground">{receipt.operation_id}</span>
-          </div>
-          <p className="mt-1 text-muted-foreground">{receiptDisplay.description}</p>
-          {receipt.error && <p className="mt-1 text-destructive">{receipt.error}</p>}
-          {outcome && <p className="mt-1 text-muted-foreground">{outcome.headline}</p>}
-          {outcome && outcome.results.length > 0 && (
-            <ul className="mt-1 space-y-0.5">
-              {outcome.results.map((r) => (
-                <li key={r.agent} className={r.ok ? 'text-muted-foreground' : 'text-destructive'}>
-                  <span className="font-mono">{r.agent}</span>: {r.ok ? 'restarted' : 'restart failed'}
-                  {r.message ? ` — ${r.message}` : ''}
-                </li>
-              ))}
-            </ul>
-          )}
-          {outcome && outcome.clearedPins.length > 0 && (
-            <p className="mt-1 text-muted-foreground">Cleared pins: {outcome.clearedPins.join(', ')}</p>
-          )}
-          {receipt.affected_consumers?.length > 0 && (
-            <p className="mt-1 text-muted-foreground">Affected: {receipt.affected_consumers.join(', ')}</p>
-          )}
+      <RoutingReceiptPanel
+        receipt={receipt}
+        receiptError={receiptError}
+        revert={{
+          editing: !!receipt && pendingRevert?.operationId === receipt.operation_id,
+          reason: pendingRevert?.reason ?? '',
+          disabled: revertControl.disabled,
+          note: revertControl.note,
+          onOpen: () =>
+            receipt &&
+            setPendingRevert({
+              operationId: receipt.operation_id,
+              reason: defaultRevertReason(receipt.operation_id),
+            }),
+          onReasonChange: (reason) =>
+            receipt && setPendingRevert({ operationId: receipt.operation_id, reason }),
+          onCancel: () => setPendingRevert(null),
+          onConfirm: () => {
+            const reason = pendingRevert?.reason.trim();
+            if (!receipt || !reason) return;
+            void patchRouting(receipt.affected_consumers?.[0] ?? rowAgents[0], {
+              action: 'revert',
+              operation_id: receipt.operation_id,
+              reason,
+            });
+          },
+        }}
+        onDismiss={() => setReceipt(null)}
+      />
 
-          {receiptDisplay.canRevert && (
-            <div className="mt-2 space-y-1">
-              <label htmlFor="revert-reason" className="block font-medium">
-                Reason for reverting <span className="text-destructive">*</span>
-              </label>
-              <input
-                id="revert-reason"
-                value={revertReason}
-                onChange={(e) => setRevertReason(e.target.value)}
-                className="w-full rounded-lg border border-border bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                placeholder="Why is this being reverted? Recorded on the revert receipt."
-              />
-            </div>
-          )}
-
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <Button
-              size="xs"
-              variant="outline"
-              disabled={revertControl.disabled}
-              onClick={() =>
-                void patchRouting(receipt.affected_consumers?.[0] ?? rowAgents[0], {
-                  action: 'revert',
-                  operation_id: receipt.operation_id,
-                  reason: revertReason.trim(),
-                })
-              }
-            >
-              Revert
-            </Button>
-            <Button size="xs" variant="ghost" onClick={() => setReceipt(null)}>
-              Dismiss
-            </Button>
-            {revertControl.note && (
-              <span className="text-muted-foreground" aria-live="polite">
-                {revertControl.note}
-              </span>
-            )}
-          </div>
-          {receiptError && <p className="mt-1 text-destructive">{receiptError}</p>}
-        </div>
-      )}
+      <p className="mb-2 rounded-lg border border-border bg-muted/30 px-2 py-1.5 text-xs text-muted-foreground">
+        {activationBanner.text}
+      </p>
 
       <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-left text-xs">
-          <caption className="sr-only">Model routing per agent</caption>
+          <caption className="sr-only">
+            Model routing per agent: the route the registry would use, the model actually running,
+            and whether that running model is the one expected.
+          </caption>
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
               <th scope="col" className="px-2 py-1.5 font-medium">Agent</th>
               <th scope="col" className="px-2 py-1.5 font-medium">Role / tier</th>
               <th scope="col" className="hidden px-2 py-1.5 font-medium sm:table-cell">Source</th>
-              <th scope="col" className="px-2 py-1.5 font-medium">Desired → running</th>
+              <th scope="col" className="px-2 py-1.5 font-medium">
+                Registry route
+                <span className="block font-normal text-[10px] normal-case text-muted-foreground">
+                  what the registry would route to
+                </span>
+              </th>
+              <th scope="col" className="px-2 py-1.5 font-medium">
+                Actually running
+                <span className="block font-normal text-[10px] normal-case text-muted-foreground">
+                  observed, vs the model we expected
+                </span>
+              </th>
               <th scope="col" className="hidden px-2 py-1.5 font-medium lg:table-cell">Billing</th>
               <th scope="col" className="hidden px-2 py-1.5 font-medium lg:table-cell">Activation</th>
               <th scope="col" className="hidden px-2 py-1.5 font-medium lg:table-cell">Eval</th>
@@ -478,7 +468,7 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
           <tbody>
             {rowAgents.length === 0 && (
               <tr className="border-t border-border">
-                <td colSpan={8} className="px-2 py-3 text-muted-foreground">
+                <td colSpan={9} className="px-2 py-3 text-muted-foreground">
                   {index.loading
                     ? 'Loading the model registry…'
                     : 'No agents are bound in the model registry.'}
@@ -507,12 +497,17 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
                       {row?.loading && !resolution ? (
                         <span className="text-muted-foreground">Loading…</span>
                       ) : (
-                        <span className="flex flex-wrap items-center gap-1">
-                          <span className="font-mono">{dvr.desired}</span>
-                          <span aria-hidden="true">→</span>
-                          <span className="font-mono">{dvr.running}</span>
-                          <ConfidenceBadge resolution={resolution} />
-                        </span>
+                        <ResolvedRouteCell resolution={resolution} />
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {row?.loading && !resolution ? (
+                        <span className="text-muted-foreground">Loading…</span>
+                      ) : (
+                        <>
+                          <RunningModelCell resolution={resolution} />
+                          <span className="sr-only">{dvr.summary}</span>
+                        </>
                       )}
                       {row?.error && (
                         <p className="mt-1 text-destructive" role="alert">
@@ -564,7 +559,7 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
                   </tr>
                   {att?.open && (
                     <tr className="border-t border-border/50 bg-muted/30">
-                      <td colSpan={8} className="px-2 py-2">
+                      <td colSpan={9} className="px-2 py-2">
                         <p className="mb-1 font-medium">Last {ATTEMPT_LIMIT} dispatch attempts — {agent}</p>
                         {att.loading && <p className="text-muted-foreground">Loading attempts…</p>}
                         {att.error && (
@@ -653,7 +648,7 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
 
             <ol className="space-y-2">
               {history.operations.map((op) => {
-                const editing = historyRevert?.operationId === op.operationId;
+                const editing = pendingRevert?.operationId === op.operationId;
                 const failedRestarts = op.restarts.filter((r) => !r.ok);
                 return (
                   <li key={op.operationId} className="rounded-lg border border-border/60 p-2 text-xs">
@@ -696,60 +691,28 @@ export function FleetModelRouting({ agents }: FleetModelRoutingProps) {
                       </p>
                     )}
 
-                    {editing ? (
-                      <div className="mt-2 space-y-1">
-                        <label htmlFor={`revert-reason-${op.operationId}`} className="block font-medium">
-                          Reason for reverting <span className="text-destructive">*</span>
-                        </label>
-                        <input
-                          id={`revert-reason-${op.operationId}`}
-                          value={historyRevert.reason}
-                          onChange={(e) =>
-                            setHistoryRevert({ operationId: op.operationId, reason: e.target.value })
-                          }
-                          className="w-full rounded-lg border border-border bg-background px-2 py-1 text-xs outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                          placeholder="Why is this being reverted? Recorded on the revert receipt."
-                        />
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            disabled={submitting || !index.mutable || historyRevert.reason.trim().length === 0}
-                            onClick={() => void revertFromHistory(op, historyRevert.reason.trim())}
-                          >
-                            Confirm revert
-                          </Button>
-                          <Button size="xs" variant="ghost" onClick={() => setHistoryRevert(null)}>
-                            Cancel
-                          </Button>
-                          {refreshing && (
-                            <span className="text-muted-foreground" aria-live="polite">
-                              Refreshing the registry…
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ) : op.revertible ? (
-                      <div className="mt-2">
-                        <Button
-                          size="xs"
-                          variant="outline"
-                          disabled={submitting || !index.mutable}
-                          onClick={() =>
-                            setHistoryRevert({
-                              operationId: op.operationId,
-                              reason: `Revert of ${op.operationId} from the Fleet page`,
-                            })
-                          }
-                        >
-                          Revert
-                        </Button>
-                      </div>
-                    ) : (
-                      op.revertBlockedReason && (
-                        <p className="mt-2 text-muted-foreground">{op.revertBlockedReason}</p>
-                      )
-                    )}
+                    <RevertControl
+                      operationId={op.operationId}
+                      editing={editing}
+                      reason={pendingRevert?.reason ?? ''}
+                      revertible={op.revertible}
+                      blockedReason={op.revertBlockedReason}
+                      disabled={submitting || !index.mutable}
+                      note={refreshing ? 'Refreshing the registry…' : null}
+                      onOpen={() =>
+                        setPendingRevert({
+                          operationId: op.operationId,
+                          reason: defaultRevertReason(op.operationId),
+                        })
+                      }
+                      onReasonChange={(reason) =>
+                        setPendingRevert({ operationId: op.operationId, reason })
+                      }
+                      onCancel={() => setPendingRevert(null)}
+                      onConfirm={() =>
+                        void revertFromHistory(op, (pendingRevert?.reason ?? '').trim())
+                      }
+                    />
                   </li>
                 );
               })}

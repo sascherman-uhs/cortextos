@@ -1422,3 +1422,133 @@ describe('DEFECT 6 — a deduped start is not a failed restart', () => {
     expect(receipt.restart_results.map((r) => r.agent)).toEqual(['jarvis-mls']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// fix9 / defect A — a revert that does not restore state is worse than none
+// ---------------------------------------------------------------------------
+
+describe('revert restores the activation mode the operation flipped', () => {
+  /**
+   * A pin and a pin-clearing switch both opt the affected consumer into
+   * `enforced` on purpose (contract §5). Nothing recorded that side effect, so
+   * `revert` put the pin back and left the agent enforced — the operator who
+   * clicked Revert believed they were back where they started while later
+   * changes had started to bite for that agent. Two agents had to be put back
+   * to shadow by hand during testing.
+   *
+   * "Byte-identical to before, including absence" is the bar: an agent that
+   * inherited `org_default` must go back to inheriting it, not to an explicit
+   * entry holding today's default value.
+   */
+  it('puts an inheriting agent back to inheriting, not to an explicit default', async () => {
+    const before = loadRegistry(ctx);
+    expect('jarvis-mls' in before.activation.consumers).toBe(false);
+    const beforeJson = JSON.stringify(before.activation);
+
+    const pinned = await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'planning week' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(pinned.state).toBe('applied');
+    // The flip is deliberate and must still happen.
+    expect(loadRegistry(ctx).activation.consumers['jarvis-mls']).toBe('enforced');
+
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: pinned.operation_id, actor: 'scott', reason: 'undo' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(reverted.state).toBe('applied');
+
+    const after = loadRegistry(ctx);
+    expect(after.agents['jarvis-mls'].pin).toBeNull();
+    // Absence restored as absence — an explicit "shadow" here would be a
+    // different state, because org_default can change afterwards.
+    expect('jarvis-mls' in after.activation.consumers).toBe(false);
+    expect(JSON.stringify(after.activation)).toBe(beforeJson);
+  });
+
+  it('leaves an agent that already had an explicit mode exactly as it was', async () => {
+    await applyOperation(
+      { kind: 'activation', consumer: 'jarvis-mls', mode: 'shadow', actor: 'scott', reason: 'hold' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(loadRegistry(ctx).activation.consumers['jarvis-mls']).toBe('shadow');
+
+    const pinned = await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'x' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(pinned.state).toBe('applied');
+    // An explicit entry is not overwritten by the opt-in — only absence is.
+    expect(loadRegistry(ctx).activation.consumers['jarvis-mls']).toBe('shadow');
+
+    await applyOperation(
+      { kind: 'revert', operation_id: pinned.operation_id, actor: 'scott', reason: 'undo' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(loadRegistry(ctx).activation.consumers['jarvis-mls']).toBe('shadow');
+  });
+
+  it('restores both the cleared pin and the activation a switch flipped', async () => {
+    const reg = loadRegistry(ctx);
+    reg.agents['jarvis-heartbeat'] = {
+      ...reg.agents['jarvis-heartbeat'],
+      pin: {
+        entry_id: 'anthropic-opus',
+        kind: 'legacy-migration',
+        reason: 'migrated from config',
+        actor: 'migrate',
+        created_at: FROZEN.toISOString(),
+        expires_at: null,
+      },
+    };
+    saveRegistryCAS(reg, reg.revision, ctx);
+
+    const before = loadRegistry(ctx);
+    const beforeActivation = JSON.stringify(before.activation);
+    const beforePin = JSON.stringify(before.agents['jarvis-heartbeat'].pin);
+    const beforeTier = before.roles.dispatcher.tier;
+
+    const switched = await applyOperation(
+      { kind: 'switch', role: 'dispatcher', tier: 'premium', actor: 'scott', reason: 'x', clearPins: true },
+      { ...ctx, skipRestart: true },
+    );
+    expect(switched.state).toBe('applied');
+    const mid = loadRegistry(ctx);
+    expect(mid.agents['jarvis-heartbeat'].pin).toBeNull();
+    for (const agent of switched.affected_consumers) {
+      expect(mid.activation.consumers[agent]).toBeDefined();
+    }
+
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: switched.operation_id, actor: 'scott', reason: 'undo' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(reverted.state).toBe('applied');
+
+    const after = loadRegistry(ctx);
+    expect(after.roles.dispatcher.tier).toBe(beforeTier);
+    expect(JSON.stringify(after.agents['jarvis-heartbeat'].pin)).toBe(beforePin);
+    // The whole activation block, not just the agents we happened to name.
+    expect(JSON.stringify(after.activation)).toBe(beforeActivation);
+  });
+
+  it('restores the pin and the activation in ONE registry write, or neither', async () => {
+    const pinned = await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'x' },
+      { ...ctx, skipRestart: true },
+    );
+    const revisionAfterPin = loadRegistry(ctx).revision;
+
+    await applyOperation(
+      { kind: 'revert', operation_id: pinned.operation_id, actor: 'scott', reason: 'undo' },
+      { ...ctx, skipRestart: true },
+    );
+    const after = loadRegistry(ctx);
+    // One revision for the revert: the pin restore and the activation restore
+    // are the same CAS write, so no reader can observe a half-reverted state.
+    expect(after.revision).toBe(revisionAfterPin + 1);
+    expect(after.agents['jarvis-mls'].pin).toBeNull();
+    expect('jarvis-mls' in after.activation.consumers).toBe(false);
+  });
+});

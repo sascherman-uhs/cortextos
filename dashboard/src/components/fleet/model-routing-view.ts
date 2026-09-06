@@ -96,29 +96,76 @@ export function describeReceipt(receipt: Receipt | null | undefined): ReceiptDis
 // Desired vs running
 // ---------------------------------------------------------------------------
 
+export type ExpectedBaseline = 'agent-config' | 'registry' | 'unknown';
+
 export interface DesiredVsRunning {
+  /** Legacy field: the model the registry resolved. Kept for compatibility. */
   desired: string;
   running: string;
   confidence: ObservedConfidence;
   confidenceLabel: string;
   tone: ReceiptTone;
-  /** True when the observed model differs from the resolved one. */
+  /** True when the running model differs from the model we expected to run. */
   drift: boolean;
   hint: string;
+
+  // --- the three facts, each separately legible -----------------------------
+
+  /** 1. What the registry WOULD route this agent to. */
+  resolved: string;
+  /** Whether that resolved model is what actually gets dispatched today. */
+  resolvedApplied: boolean;
+  /** Short chip beside the resolved model when it is not applied. */
+  resolvedNote: string | null;
+  /** 3a. The model we expected to be running, i.e. the badge's baseline. */
+  expected: string;
+  /** 3b. WHERE that baseline comes from, in plain words. */
+  expectedFrom: ExpectedBaseline;
+  expectedFromLabel: string;
+  /** Badge text that answers "is the running model the expected one?". */
+  expectationLabel: string;
+  /** True when nothing was observed, so the question is unanswered. */
+  runningKnown: boolean;
+  /** Shadow's normal, intended state: resolved ≠ running, and that is fine. */
+  shadowDivergence: boolean;
+  /** One sentence stating all three facts. Used as the row's accessible name. */
+  summary: string;
 }
 
+const EXPECTED_FROM_LABEL: Record<ExpectedBaseline, string> = {
+  'agent-config': "this agent's own config",
+  registry: 'the registry route',
+  unknown: 'nothing recorded',
+};
+
+/**
+ * Split the row into three separately-stated facts.
+ *
+ * The badge answers ONE question — "is the running model the model we expected
+ * to be running?" — and its baseline is `expected_model_id`, which in SHADOW
+ * activation is the agent's legacy config model, not the resolved one (see
+ * `expectedModelId` in src/bus/model-registry.ts). Placing that badge next to a
+ * bare `resolved → running` arrow made it read as a verdict on THAT comparison,
+ * so two rows with the same visible shape carried opposite labels and the panel
+ * taught the operator to distrust the badge. Both labels were correct; the
+ * framing was not. So the resolved model, the running model and the expectation
+ * are now stated as three separate facts, each naming its own baseline.
+ */
 export function describeDesiredVsRunning(resolution: Resolution | null | undefined): DesiredVsRunning {
+  const activation = resolution?.activation ?? 'shadow';
+  const enforced = activation === 'enforced';
+
+  const selected = resolution?.selected?.model_id ?? null;
+  const legacy = resolution?.legacy_effective?.model_id ?? null;
   // `expected_model_id` is the registry's own statement of what should run and
   // wins the comparison when the CLI emits it; `selected.model_id` is the
   // fallback on older builds.
-  const expected = resolution?.expected_model_id ?? null;
-  const selected = resolution?.selected?.model_id ?? null;
-  const desired = selected ?? expected ?? '\u2014';
-  const target = expected ?? selected;
+  const expectedId = resolution?.expected_model_id ?? null;
+  const target = expectedId ?? selected;
 
   const observedModel = resolution?.observed?.model_id ?? null;
-  const legacy = resolution?.legacy_effective?.model_id ?? null;
   const running = observedModel ?? legacy ?? 'unknown';
+  const resolved = selected ?? expectedId ?? '\u2014';
 
   let confidence: ObservedConfidence;
   if (!observedModel) {
@@ -133,6 +180,28 @@ export function describeDesiredVsRunning(resolution: Resolution | null | undefin
   const confidenceLabel =
     confidence === 'verified' ? 'verified' : confidence === 'mismatch' ? 'mismatch' : 'unconfirmed';
 
+  // Where the baseline came from. In enforced the registry route IS dispatched,
+  // so it is the baseline; in shadow the legacy config model is.
+  // Enforced dispatches the registry's route, so the route is the baseline.
+  // Shadow dispatches the agent's own config, so that is the baseline — and
+  // falls back to the route only when the agent has no config model at all.
+  const expectedFrom: ExpectedBaseline = !target
+    ? 'unknown'
+    : enforced
+      ? 'registry'
+      : legacy && target === legacy
+        ? 'agent-config'
+        : 'registry';
+
+  const expectationLabel =
+    confidence === 'verified'
+      ? 'running as expected'
+      : confidence === 'mismatch'
+        ? 'not the expected model'
+        : 'not observed';
+
+  const shadowDivergence = !enforced && !!selected && !!target && selected !== target;
+
   const provenance: string[] = [];
   const src = resolution?.observed?.source;
   if (src) provenance.push(`source: ${src}`);
@@ -141,21 +210,73 @@ export function describeDesiredVsRunning(resolution: Resolution | null | undefin
   const at = resolution?.observed?.at;
   if (at) provenance.push(`observed ${at}`);
 
+  const expectedPhrase = target
+    ? `${target} (from ${EXPECTED_FROM_LABEL[expectedFrom]})`
+    : 'nothing \u2014 no baseline was recorded';
+
   const base =
     !resolution?.observed || !observedModel
-      ? 'no observation available'
+      ? `No observation available, so it is unknown whether ${expectedPhrase} is what is running.`
       : confidence === 'mismatch'
-        ? `The agent is running ${observedModel}, not the ${target ?? 'resolved'} model the registry expects. Restart it or investigate.`
-        : 'The running model was read back from the agent session transcript.';
+        ? `Expected ${expectedPhrase}, but ${observedModel} is running. Nothing configured asks for ${observedModel} \u2014 restart the agent or investigate its runtime adapter.`
+        : `Expected ${expectedPhrase}, and that is what the agent session transcript shows running.`;
+
+  const summary = [
+    `Registry would route ${resolved}${enforced ? '' : ', not applied in shadow'}.`,
+    `Running ${running}.`,
+    base,
+  ].join(' ');
 
   return {
-    desired,
+    desired: resolved,
     running,
     confidence,
     confidenceLabel,
     tone: confidence === 'verified' ? 'success' : confidence === 'mismatch' ? 'error' : 'warning',
     drift,
     hint: provenance.length ? `${base} (${provenance.join(' \u00b7 ')})` : base,
+    resolved,
+    resolvedApplied: enforced,
+    resolvedNote: enforced ? null : 'not applied in shadow',
+    expected: target ?? '\u2014',
+    expectedFrom,
+    expectedFromLabel: EXPECTED_FROM_LABEL[expectedFrom],
+    expectationLabel,
+    runningKnown: !!observedModel,
+    shadowDivergence,
+    summary,
+  };
+}
+
+/**
+ * One line above the table explaining the activation mode the rows are in, so
+ * the reader does not need to know what "shadow" means to read a row.
+ */
+export function describeActivationBanner(
+  resolutions: (Resolution | null | undefined)[],
+): { mode: 'shadow' | 'enforced' | 'mixed'; text: string } {
+  const modes = new Set<string>();
+  for (const r of resolutions) {
+    if (r) modes.add(r.activation ?? 'shadow');
+  }
+  const shadowText =
+    'Routing is in SHADOW mode: the registry computes a route but does not change what runs, ' +
+    'so agents keep running the model in their own config. A resolved model that differs from ' +
+    'the running one is expected here \u2014 what matters is the running model matching the one ' +
+    "we expected (the agent's own config in shadow).";
+  const enforcedText =
+    'Routing is ENFORCED: the resolved model is passed to the runtime on spawn, so the resolved ' +
+    'model is also the one we expect to be running.';
+  if (modes.size === 0 || (modes.size === 1 && modes.has('shadow'))) {
+    return { mode: 'shadow', text: shadowText };
+  }
+  if (modes.size === 1 && modes.has('enforced')) return { mode: 'enforced', text: enforcedText };
+  return {
+    mode: 'mixed',
+    text:
+      'Agents below are in a MIX of activation modes \u2014 see each row\u2019s Activation column. ' +
+      'In shadow the agent keeps running the model in its own config, so a resolved model that ' +
+      'differs from the running one is expected; in enforced the resolved model is the one that runs.',
   };
 }
 
@@ -198,6 +319,72 @@ export function describeReceiptOutcome(receipt: Receipt | null | undefined): Res
   }
 
   return { headline, results, clearedPins, restartsPerformed: results.length > 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Routing response → what the operator is shown
+// ---------------------------------------------------------------------------
+
+/**
+ * The panel's decision about one routing response, as data.
+ *
+ * This lives here, not inline in the component, so the FAILURE path can be
+ * exercised by injecting a response at the adapter boundary. The failure path
+ * had never been seen to render: the restart bug that used to trigger it is
+ * fixed, so no live registry can be made to fail, and "the code sets both error
+ * states" was the only evidence an operator would see anything at all.
+ *
+ * The rules it encodes:
+ *   - a receipt in the body describes THIS operation even on a failure status —
+ *     a blocked operation is a receipt, not an exception — so it is kept and
+ *     shown rather than discarded;
+ *   - a transport-level failure has no receipt to keep, and the previous
+ *     operation's receipt must not be left standing in its place;
+ *   - nothing reports success unless the service reported success.
+ */
+export interface RoutingResponseOutcome {
+  /** The receipt to display, or null when the response carried none. */
+  receipt: Receipt | null;
+  /** True only when the service actually applied the operation. */
+  success: boolean;
+  /** Message for the change-model dialog. Null when there is nothing wrong. */
+  dialogError: string | null;
+  /** Message shown on the receipt panel itself. */
+  receiptError: string | null;
+  /** Whether to re-read the registry. A failed write changed nothing. */
+  shouldRefresh: boolean;
+}
+
+export interface RoutingResponseInput {
+  ok: boolean;
+  status: number;
+  body: { receipt?: Receipt | null; error?: string | null; success?: boolean } | null;
+  /** Set when the request never produced a response at all. */
+  transportError?: string | null;
+}
+
+export function describeRoutingResponse(input: RoutingResponseInput): RoutingResponseOutcome {
+  if (input.transportError) {
+    const msg = humanizeRoutingError(input.transportError) ?? input.transportError;
+    return { receipt: null, success: false, dialogError: msg, receiptError: msg, shouldRefresh: false };
+  }
+  const receipt = input.body?.receipt ?? null;
+  if (!input.ok) {
+    const msg = humanizeRoutingError(input.body?.error) ?? `HTTP ${input.status}`;
+    return { receipt, success: false, dialogError: msg, receiptError: msg, shouldRefresh: false };
+  }
+  if (input.body?.success === false) {
+    // Blocked or failed with a 2xx: a real receipt, but not the change that was
+    // asked for. The receipt panel states which, so only the dialog is flagged.
+    return {
+      receipt,
+      success: false,
+      dialogError: receipt?.error ?? 'The routing service blocked this operation.',
+      receiptError: null,
+      shouldRefresh: true,
+    };
+  }
+  return { receipt, success: true, dialogError: null, receiptError: null, shouldRefresh: true };
 }
 
 /** Turn a shell-level failure string into something an operator can act on. */
