@@ -1583,6 +1583,50 @@ function validateOperation(reg: ModelRegistry, op: ModelOperation, at: Date): vo
   }
 }
 
+/**
+ * Opt a consumer into validated routing, recording what its activation was
+ * BEFORE the flip so a later revert can put it back.
+ *
+ * The flip itself is contract §5 ("Explicit switch during shadow"): an explicit
+ * human switch opts that consumer into enforced routing immediately, and that
+ * is deliberate. The bug was the asymmetry — the flip was a side effect nobody
+ * recorded, so `revert` restored the pin and left the agent enforced. A person
+ * who clicked Revert believed they were back where they started while later
+ * changes had started to bite for that agent.
+ *
+ * `null` in the snapshot means the key was ABSENT, i.e. the consumer inherited
+ * `org_default`. That is a different state from an explicit entry that happens
+ * to hold the same value today, because org_default can change afterwards, so
+ * absence is recorded as absence and restored as absence.
+ */
+function enforceConsumers(
+  next: ModelRegistry,
+  agents: string[],
+): Record<string, ModelActivationMode | null> {
+  const prior: Record<string, ModelActivationMode | null> = {};
+  for (const agent of agents) {
+    if (agent in prior) continue;
+    prior[agent] = next.activation.consumers[agent] ?? null;
+    if (!next.activation.consumers[agent]) next.activation.consumers[agent] = 'enforced';
+  }
+  return prior;
+}
+
+/** Put `activation.consumers` back exactly as the snapshot recorded it. */
+function restoreActivationConsumers(next: ModelRegistry, snapshot: unknown): void {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return;
+  for (const [agent, mode] of Object.entries(snapshot as Record<string, unknown>)) {
+    if (mode === null) {
+      // Absent before, absent after. Writing the literal org_default here would
+      // pin the consumer to today's default and silently survive a later change
+      // to it — a different state wearing the same value.
+      delete next.activation.consumers[agent];
+    } else if (mode === 'shadow' || mode === 'enforced') {
+      next.activation.consumers[agent] = mode;
+    }
+  }
+}
+
 function mutateRegistry(
   next: ModelRegistry,
   op: ModelOperation,
@@ -1604,16 +1648,27 @@ function mutateRegistry(
           }
         }
       }
-      const from = { role: op.role, tier: next.roles[op.role].tier, cleared_pins: cleared };
+      const priorTier = next.roles[op.role].tier;
       next.roles[op.role] = { ...next.roles[op.role], tier: op.tier };
       // Explicit switches opt the affected consumers into validated routing
-      // immediately (contract §5 "Explicit switch during shadow").
-      for (const agent of receipt.affected_consumers) {
-        if (!next.activation.consumers[agent]) next.activation.consumers[agent] = 'enforced';
-      }
+      // immediately (contract §5 "Explicit switch during shadow"). The prior
+      // activation goes into `from` so revert can undo the side effect too.
+      const priorActivation = enforceConsumers(next, receipt.affected_consumers);
       return {
-        from,
-        to: { role: op.role, tier: op.tier, cleared_pins: cleared.map((c) => c.agent) },
+        from: {
+          role: op.role,
+          tier: priorTier,
+          cleared_pins: cleared,
+          activation_consumers: priorActivation,
+        },
+        to: {
+          role: op.role,
+          tier: op.tier,
+          cleared_pins: cleared.map((c) => c.agent),
+          activation_consumers: Object.fromEntries(
+            Object.keys(priorActivation).map((a) => [a, next.activation.consumers[a] ?? null]),
+          ),
+        },
       };
     }
     case 'pin': {
@@ -1628,12 +1683,16 @@ function mutateRegistry(
         ...(op.fallback?.length ? { fallback: op.fallback } : {}),
       };
       next.agents[op.agent].pin = pin;
-      if (!next.activation.consumers[op.agent]) next.activation.consumers[op.agent] = 'enforced';
+      const priorActivation = enforceConsumers(next, [op.agent]);
       // `target_agent` is what makes this revertible: a bare pin object does
       // not say whose pin it was, which is why revert used to refuse.
       return {
-        from: { target_agent: op.agent, pin: priorPin },
-        to: { target_agent: op.agent, pin },
+        from: { target_agent: op.agent, pin: priorPin, activation_consumers: priorActivation },
+        to: {
+          target_agent: op.agent,
+          pin,
+          activation_consumers: { [op.agent]: next.activation.consumers[op.agent] ?? null },
+        },
       };
     }
     case 'unpin': {
@@ -1695,6 +1754,11 @@ function applyRevertDetail(
 ): void {
   if (!from || typeof from !== 'object') throw new Error('Operation has no revertible prior state');
   const f = from as Record<string, unknown>;
+  // Applied FIRST, and never with an early return, because an activation flip
+  // is a side effect that rides along with a pin or a tier switch rather than
+  // being an operation of its own. It happens in the same `next` object as the
+  // pin restore below, so both land in one CAS write or neither does.
+  restoreActivationConsumers(next, f.activation_consumers);
   // Checked BEFORE the tier branch: a role-capability snapshot also carries a
   // `role`, and falling through would try to read a tier that is not there.
   if (typeof f.role === 'string' && Array.isArray(f.role_capabilities)) {
