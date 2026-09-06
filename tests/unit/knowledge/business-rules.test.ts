@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { checkBusinessRules, violations } from '../../../src/knowledge/business-rules';
+import { checkBusinessRules, violations, BUSINESS_RULES } from '../../../src/knowledge/business-rules';
+import sharedCases from '../../../src/knowledge/business-rule-cases.json';
 
 function ids(text: string): string[] {
   return violations(checkBusinessRules(text)).map((v) => v.ruleId);
@@ -68,5 +69,29 @@ describe('deterministic business-rule checks on the context packet', () => {
     const v = violations(checkBusinessRules('We are renting staging furniture.'))[0];
     expect(v.evidence).toMatch(/renting/);
     expect(v.remedy).toMatch(/service period/);
+  });
+});
+
+
+/**
+ * The SAME case file uhsJARVIS scripts/agent-os/knowledge_business_rules.py is
+ * tested against. A rule that passes in TypeScript and fails in Python (or the
+ * reverse) is a fleet that disagrees with itself about what it is allowed to
+ * say, so both sides answer to one list.
+ */
+describe('shared rule cases (identical to the JARVIS side)', () => {
+  for (const c of sharedCases.cases) {
+    it(`${c.rule_id}: ${c.should_violate ? 'violates' : 'passes'} — ${c.text}`, () => {
+      expect(ids(c.text).includes(c.rule_id)).toBe(c.should_violate);
+    });
+  }
+
+  it('covers every rule with both a violating and a passing case', () => {
+    const positive = new Set(sharedCases.cases.filter((c) => c.should_violate).map((c) => c.rule_id));
+    const negative = new Set(sharedCases.cases.filter((c) => !c.should_violate).map((c) => c.rule_id));
+    for (const rule of BUSINESS_RULES) {
+      expect(positive.has(rule.id), `no violating case for ${rule.id}`).toBe(true);
+      expect(negative.has(rule.id), `no passing case for ${rule.id}`).toBe(true);
+    }
   });
 });

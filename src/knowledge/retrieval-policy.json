@@ -9,24 +9,28 @@
       "id": "registry",
       "order": 1,
       "authority": "canonical-registry",
+      "min_score": 0.5,
       "description": "Capability/vendor/project registry lookup. Answers 'do we have X?' with a path, never from memory."
     },
     {
       "id": "structured",
       "order": 2,
       "authority": "authoritative-record",
+      "min_score": 0.5,
       "description": "Structured authoritative business data (Supabase uhsMLS/uhs-jarvis, Assessor). Current facts come from records, not prose."
     },
     {
       "id": "documents",
       "order": 3,
       "authority": "approved-document",
+      "min_score": 0.5,
       "description": "Scoped source documents and wiki: deterministic lookup over registered document roots."
     },
     {
       "id": "semantic",
       "order": 4,
       "authority": "semantic-retrieval",
+      "min_score": 0.0,
       "description": "Semantic retrieval over the federated permitted collections. Always cited, never authoritative on its own."
     }
   ],
@@ -100,6 +104,13 @@
       "all": ["org", "own_agent", "other_agent"]
     },
     "note": "The requested scope is intersected with the caller's role grants. A scope can never widen a grant."
+  },
+
+  "ranking": {
+    "primary": "score_band",
+    "band_size": 0.1,
+    "tiebreak": "layer_order",
+    "note": "Layer order is AUTHORITY, not display order. A weak registry keyword match must not bury a strong semantic hit, so results rank by score band first and layer order only inside a band. Each layer also has a min_score: a deterministic keyword layer that barely matched contributes nothing."
   },
 
   "dedupe": {

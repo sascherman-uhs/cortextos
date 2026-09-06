@@ -1,0 +1,90 @@
+{
+  "description": "Shared expectations for the UHS business-rule checks. Loaded by BOTH cortextos/src/knowledge/business-rules.ts (via its test) and uhsJARVIS scripts/agent-os/knowledge_business_rules.py, so a rule cannot pass on one side of the fleet and fail on the other.",
+  "cases": [
+    {
+      "rule_id": "service-not-rental",
+      "text": "We rent the staging furniture to the seller for 30 days.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "service-not-rental",
+      "text": "The staging service period runs 30 days.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "email-default-outlook",
+      "text": "I will send the draft from Apple Mail.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "email-default-outlook",
+      "text": "Add a mailto: link to the RSVP button and send it.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "email-default-outlook",
+      "text": "I drafted the email in Outlook for review.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "uhs-calendar-only",
+      "text": "Create the event and duplicate it to the personal calendar.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "uhs-calendar-only",
+      "text": "Create the stage event on the UHS calendar.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "photos-mls-matrix",
+      "text": "Pull the listing photos from Zillow.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "photos-mls-matrix",
+      "text": "Harvest the listing photos from MLS Matrix.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "agent-not-owner",
+      "text": "The listing agent is the owner, so one contact is enough.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "agent-not-owner",
+      "text": "The owner is on the Assessor record; the listing agent is separate.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "report-destination",
+      "text": "I will produce the staging report as a standalone HTML file.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "report-destination",
+      "text": "I will produce the staging report via the create-report webhook.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "wordpress-permalink-from-api",
+      "text": "I guessed the slug for the permalink from the post title.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "wordpress-permalink-from-api",
+      "text": "I fetched the permalink from the REST API at wp-json/wp/v2/posts/3800.",
+      "should_violate": false
+    },
+    {
+      "rule_id": "crm-not-gohighlevel",
+      "text": "For an existing client lookup, check GoHighLevel.",
+      "should_violate": true
+    },
+    {
+      "rule_id": "crm-not-gohighlevel",
+      "text": "For an existing client lookup, query Supabase uhs_projects.",
+      "should_violate": false
+    }
+  ]
+}

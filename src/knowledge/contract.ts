@@ -43,7 +43,8 @@ import policyJson from './retrieval-policy.json';
 export interface RetrievalPolicy {
   policy_version: string;
   org: string;
-  layers: Array<{ id: LayerId; order: number; authority: string; description: string }>;
+  layers: Array<{ id: LayerId; order: number; authority: string; min_score: number; description: string }>;
+  ranking: { primary: string; band_size: number; tiebreak: string };
   collections: {
     org: Array<{ name: string; authority: string; description: string }>;
     agent_prefix: string;
@@ -759,10 +760,16 @@ export function retrieve(opts: RetrieveOptions): RetrievalResponse {
     }
   }
 
+  // --- per-layer minimum relevance -----------------------------------------
+  // A deterministic keyword layer that barely matched contributes nothing; it
+  // is noise wearing an authoritative label.
+  const minScore = new Map(policy.layers.map((l) => [l.id, l.min_score ?? 0]));
+  const relevant = raw.filter((h) => h.citation.score >= (minScore.get(h.citation.layer) ?? 0));
+
   // --- document-level restricted scope -------------------------------------
   const grants = policy.authorization.roles[opts.caller.role];
   const visible: RetrievalHit[] = [];
-  for (const hit of raw) {
+  for (const hit of relevant) {
     if (!grants.restricted_documents) {
       const pattern = isRestrictedSource(hit.citation.canonicalSource, policy);
       if (pattern) {
@@ -796,7 +803,15 @@ export function retrieve(opts: RetrieveOptions): RetrievalResponse {
     }
   }
 
+  // Layer order is AUTHORITY, not display order. Ranking by layer first would
+  // let a weak registry keyword match bury a strong semantic hit, which is
+  // exactly how a "layered" retriever starts returning noise. Rank by score
+  // band, and let authority decide only inside a band.
+  const band = policy.ranking?.band_size || 0.1;
   const merged = Array.from(byKey.values()).sort((a, b) => {
+    const ba = Math.floor(a.citation.score / band);
+    const bb = Math.floor(b.citation.score / band);
+    if (ba !== bb) return bb - ba;
     const ra = authorityRank.get(a.citation.layer) ?? 99;
     const rb = authorityRank.get(b.citation.layer) ?? 99;
     if (ra !== rb) return ra - rb;
