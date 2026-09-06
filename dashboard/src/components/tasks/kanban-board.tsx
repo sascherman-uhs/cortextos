@@ -59,15 +59,27 @@ export function KanbanBoard({ tasks, completedTodayTasks, onTaskClick, renderCar
       label: 'Completed',
       tasks: sortTasks(completedTodayTasks),
     },
+    // Failed and cancelled work had no column at all: a task that failed
+    // vanished from the default view of the page whose job is to show what
+    // needs attention, and only reappeared if you switched to List. Terminal
+    // outcomes are outcomes, not deletions — they stay on the board.
+    {
+      status: 'failed',
+      label: 'Failed / cancelled',
+      tasks: sortTasks(tasks.filter((t) => t.status === 'failed' || t.status === 'cancelled')),
+    },
   ];
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-5">
       {columns.map((col) => (
         <div key={col.status} className="flex flex-col gap-2">
           <div className="flex items-center justify-between px-1">
             <div className="flex items-center gap-2">
               <StatusBadge status={col.status} />
+              {col.status === 'failed' && (
+                <span className="text-xs text-muted-foreground">/ cancelled</span>
+              )}
               <span className="text-xs text-muted-foreground">
                 {col.tasks.length}
               </span>
