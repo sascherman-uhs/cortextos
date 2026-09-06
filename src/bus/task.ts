@@ -14,6 +14,7 @@ import {
   LeaseHeldError,
   type TaskContractMeta,
 } from './task-store.js';
+import { supersedeMessagesForTask, type SupersedeCause } from './inbox-supersede.js';
 import { toCanonical, toNative, guardTransition, checkTransition, effectiveMode, ContractViolation, loadContract, missingContractFields, isLegacyItem, type CanonicalState, type Evidence, type GrandfatherRequest, type TransitionOrigin } from './task-contract.js';
 
 /**
@@ -520,6 +521,49 @@ export function transitionTask(
   );
 
   const task = result.task as unknown as Task;
+
+  // fix8 — work that is over must not still be sitting in somebody's inbox as
+  // an instruction.
+  //
+  // Every door into a native task transition lands here: the bus CLI, the
+  // agent fleet, the shell wrappers, and the dashboard (which spawns the CLI).
+  // So this is the one place that has to know a task has just ended, and the
+  // one place a cancelled assignment stops reading as live work.
+  //
+  // Best-effort by design: the transition itself is already durable on disk.
+  // Failing the move now would report a cancel that did not happen, which is a
+  // worse lie than a pointer we failed to sweep. The failure is loud on stderr
+  // and the swept count is journalled, so neither outcome is silent.
+  if (produced.canonicalState === 'done'
+    || produced.canonicalState === 'cancelled'
+    || produced.canonicalState === 'failed_terminal') {
+    try {
+      const swept = supersedeMessagesForTask(paths, {
+        taskId,
+        cause: produced.canonicalState as SupersedeCause,
+        actor: options.actor ?? task.assigned_to ?? 'unknown',
+        reason: options.reason ?? null,
+        title: task.title ?? null,
+      });
+      if (swept.length > 0) {
+        appendTaskEvent(paths, filePath, taskId, {
+          version: produced.version,
+          event: 'messages_superseded',
+          actor: options.actor ?? task.assigned_to ?? 'unknown',
+          payload: {
+            cause: produced.canonicalState,
+            count: swept.length,
+            messages: swept.map((m) => ({ agent: m.agent, queue: m.queue, id: m.messageId, moved_to: m.movedTo })),
+          },
+        });
+      }
+    } catch (err) {
+      console.error(
+        `[bus/task] ${taskId} reached ${produced.canonicalState} but its inbox pointers could not be superseded: ${err}`,
+      );
+    }
+  }
+
   if (options.suppressLegacyAudit) return produced;
   appendTaskAudit(paths, taskId, {
     event: 'update',
@@ -1166,6 +1210,23 @@ export function archiveTasks(paths: BusPaths, dryRun: boolean = false): ArchiveR
 
         // Move to archive
         renameSync(srcPath, join(archiveDir, `${task.id}.json`));
+
+        // fix8 — archiving moves the record out of the active list, so any
+        // message still naming it points at work nobody is going to pick up.
+        // Most of these were already superseded when the task completed; this
+        // catches whatever was sent in the seven days since, including the
+        // dashboard's own completion notice.
+        try {
+          supersedeMessagesForTask(paths, {
+            taskId: task.id,
+            cause: 'archived',
+            actor: 'archive-tasks',
+            reason: 'the task was archived out of the active list',
+            title: task.title ?? null,
+          });
+        } catch (err) {
+          console.error(`[bus/task] archive ${task.id}: inbox pointers not superseded: ${err}`);
+        }
       }
       archived++;
     }
@@ -1290,6 +1351,22 @@ export function compactTasks(
       try {
         appendFileSync(archivePath, JSON.stringify(entry) + '\n', { encoding: 'utf-8', mode: 0o600 });
         unlinkSync(join(taskDir, `${task.id}.json`));
+        // fix8 — compaction unlinks the record on purpose. Anything still
+        // naming the id is now a pointer into nothing, which is exactly the
+        // ghost fix7 documented. Superseded rather than deleted: `deleteTask`
+        // would take the audit log with it, and compaction preserves that log
+        // deliberately so the lifecycle history survives.
+        try {
+          supersedeMessagesForTask(paths, {
+            taskId: task.id,
+            cause: 'compacted',
+            actor: 'compact-tasks',
+            reason: `summarised into ${archiveFile} and removed from the active list`,
+            title: task.title ?? null,
+          });
+        } catch (err) {
+          console.error(`[bus/task] compact ${task.id}: inbox pointers not superseded: ${err}`);
+        }
       } catch (err) {
         report.skipped.push({ id: task.id, reason: `archive write failed: ${err}` });
         continue;

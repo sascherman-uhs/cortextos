@@ -15,7 +15,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, transitionTask } from '../../../src/bus/task';
+import { transitionTask } from '../../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, cleanupTaskFixtures } from '../../helpers/task-fixture';
 import type { BusPaths } from '../../../src/types';
 
 function makePaths(dir: string): BusPaths {
@@ -47,7 +52,7 @@ describe('native transitions and the version the caller read', () => {
       priority: 'low',
     });
   });
-  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
+  afterEach(() => { cleanupTaskFixtures(); rmSync(testDir, { recursive: true, force: true }); });
 
   const read = () => JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
 

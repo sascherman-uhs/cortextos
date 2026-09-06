@@ -12,7 +12,6 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
-  createTask,
   claimTask,
   claimTaskWithLease,
   completeTask,
@@ -20,6 +19,11 @@ import {
   canonicalStateOf,
   findTaskFile,
 } from '../../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, seedTaskFile, cleanupTaskFixtures } from '../../helpers/task-fixture';
 import {
   readTaskEvents,
   reportRun,
@@ -65,6 +69,7 @@ describe('OS-02 task contract', () => {
     paths = makePaths(testDir);
   });
   afterEach(() => {
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
     delete process.env.AGENTIC_OS_TASK_CONTRACT;
     delete process.env.AGENTIC_OS_TASK_CONTRACT__CORTEXOS_TASKS;
@@ -468,8 +473,7 @@ describe('OS-02 task contract', () => {
         created_at: '2025-11-14T00:00:00Z', updated_at: '2025-11-14T00:00:00Z',
         completed_at: '2025-11-14T01:00:00Z', due_date: null, archived: false,
       };
-      require('fs').mkdirSync(paths.taskDir, { recursive: true });
-      writeFileSync(join(paths.taskDir, `${legacy.id}.json`), JSON.stringify(legacy));
+      seedTaskFile(paths, legacy);
       const task = JSON.parse(readFileSync(join(paths.taskDir, `${legacy.id}.json`), 'utf-8'));
       // The board must be able to tell a historical completion from a verified
       // one, and the only honest answer for a legacy row is "no evidence".

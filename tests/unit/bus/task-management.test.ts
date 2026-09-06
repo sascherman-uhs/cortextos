@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, checkStaleTasks, archiveTasks, checkHumanTasks } from '../../../src/bus/task';
+import { updateTask, completeTask, checkStaleTasks, archiveTasks, checkHumanTasks } from '../../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, seedTaskFile, cleanupTaskFixtures } from '../../helpers/task-fixture';
 import { atomicWriteSync } from '../../../src/utils/atomic';
 import type { BusPaths, Task } from '../../../src/types';
 
@@ -34,7 +39,7 @@ function createBackdatedTask(
     due_date: overrides.due_date ?? null,
     archived: overrides.archived ?? false,
   };
-  atomicWriteSync(join(paths.taskDir, `${task.id}.json`), JSON.stringify(task));
+  seedTaskFile(paths, task as unknown as Record<string, unknown> & { id: string });
 }
 
 function hoursAgo(hours: number): string {
@@ -67,6 +72,7 @@ describe('Advanced Task Management', () => {
   });
 
   afterEach(() => {
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
   });
 

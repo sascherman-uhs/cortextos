@@ -22,7 +22,12 @@ require('tsx/cjs');
 
 // Import bus functions via tsx
 const { sendMessage } = require('../../src/bus/message');
-const { createTask, updateTask, completeTask, listTasks } = require('../../src/bus/task');
+const { updateTask, completeTask, listTasks } = require('../../src/bus/task');
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+const { createTask, cleanupTaskFixtures } = require('../helpers/task-fixture');
 const { logEvent } = require('../../src/bus/event');
 const { updateHeartbeat } = require('../../src/bus/heartbeat');
 const { createApproval } = require('../../src/bus/approval');
@@ -55,6 +60,7 @@ test.beforeEach(() => {
 });
 
 test.afterEach(() => {
+  cleanupTaskFixtures();
   rmSync(testDir, { recursive: true, force: true });
 });
 
