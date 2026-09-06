@@ -10,6 +10,7 @@ import { auth } from '@/lib/auth';
 import { transitionTask } from '@/lib/task-transition';
 import { sourceForTaskId, toCanonical, type CanonicalState } from '@/lib/data/transition-contract';
 import { offeredActions } from '@/lib/tasks/offered-actions';
+import { signedInActor } from '@/lib/actor';
 
 export const dynamic = 'force-dynamic';
 
@@ -234,23 +235,63 @@ export async function DELETE(
     }
   }
 
-  // Delete the task file directly
-  const fs = await import('fs/promises');
-  const path = await import('path');
-  const ctxRoot = getCTXRoot();
-  const taskDir = task.org
-    ? path.default.join(ctxRoot, 'orgs', task.org, 'tasks')
-    : path.default.join(ctxRoot, 'tasks');
-  const taskFile = path.default.join(taskDir, `${id}.json`);
-
-  try {
-    await fs.default.unlink(taskFile);
-    try { syncAll(); } catch { /* best-effort */ }
-    return Response.json({ success: true });
-  } catch (err) {
-    console.error('[api/tasks/[id]] DELETE error:', err);
-    return Response.json({ error: 'Failed to delete task' }, { status: 500 });
+  // fix7 — a delete goes through `bus delete-task`, not through unlink.
+  //
+  // Unlinking the task JSON left the audit log, the event journal, the claim
+  // lock, the deliverables tree and — the part that actually hurt — unacked
+  // messages in live agents' inboxes saying "Task status updated to
+  // in_progress: [task_…]" about a task that no longer existed. Thirteen of
+  // those were found in real inboxes. The CLI command sweeps all of it and
+  // writes a tombstone naming who deleted what and why.
+  //
+  // `--force` is passed because this button cannot yet surface a refusal: the
+  // page ignores a non-ok response, so a contract refusal would read as a
+  // delete that silently did nothing. The deletion log records the forcing and
+  // the person. Surfacing the "cancel it instead" refusal in the UI is the
+  // follow-up; it needs an error path on the button first.
+  if (!task.org) {
+    return Response.json(
+      { error: 'Task has no organization; refusing to delete it by guessing which org owns it.' },
+      { status: 409 },
+    );
   }
+
+  const frameworkRoot = getFrameworkRoot();
+  const actor = (await signedInActor()) ?? 'dashboard';
+
+  const result = spawnSync(
+    'bash',
+    [
+      path.join(frameworkRoot, 'bus', 'delete-task.sh'),
+      id,
+      `deleted from the dashboard by ${actor}`,
+      '--force',
+      '--org',
+      task.org,
+    ],
+    {
+      timeout: 15000,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        CTX_FRAMEWORK_ROOT: frameworkRoot,
+        CTX_ROOT: getCTXRoot(),
+        CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default',
+        CTX_AGENT_NAME: 'dashboard',
+        CTX_ORG: task.org,
+      },
+    },
+  );
+
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || '').toString().trim();
+    console.error('[api/tasks/[id]] DELETE failed:', detail);
+    return Response.json({ error: 'Failed to delete task', detail }, { status: 500 });
+  }
+
+  try { syncAll(); } catch { /* the SQLite projection also self-heals on the next sync */ }
+  return Response.json({ success: true });
 }
 
 // ---------------------------------------------------------------------------
