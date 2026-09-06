@@ -20,12 +20,6 @@ interface AgentConfig {
   runtime?: 'claude-code' | 'codex-app-server' | 'hermes';
 }
 
-const MODEL_PLACEHOLDER: Record<NonNullable<AgentConfig['runtime']>, string> = {
-  'claude-code': 'claude-sonnet-4-5',
-  'codex-app-server': 'gpt-5-codex',
-  hermes: 'hermes-1',
-};
-
 interface SettingsTabProps {
   agentName: string;
 }
@@ -148,7 +142,6 @@ export function SettingsTab({ agentName }: SettingsTabProps) {
   const saveAgConfig = () =>
     saveSection(
       {
-        model: config.model,
         max_session_seconds: config.max_session_seconds,
         max_crashes_per_day: config.max_crashes_per_day,
         startup_delay: config.startup_delay,
@@ -295,15 +288,12 @@ export function SettingsTab({ agentName }: SettingsTabProps) {
           <CardTitle className="text-sm font-medium">Agent Config</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div>
-            <label className="text-xs text-muted-foreground">Model</label>
-            <input
-              type="text"
-              value={config.model || ''}
-              onChange={e => setConfig(p => ({ ...p, model: e.target.value }))}
-              placeholder={MODEL_PLACEHOLDER[config.runtime ?? 'claude-code']}
-              className="mt-1 block w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
-            />
+          {/* Model is no longer edited here: it is resolved by the model
+              routing registry (contract §5) and changed from the Fleet page's
+              "Model routing" panel, which records a reason and a receipt. */}
+          <div className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
+            Model is set by model routing, not here. Change it from the Model routing panel on the
+            Agents page so the switch is validated, recorded and revertable.
           </div>
 
           <div className="grid grid-cols-3 gap-3">

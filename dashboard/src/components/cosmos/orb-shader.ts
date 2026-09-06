@@ -72,9 +72,12 @@ ${SIMPLEX_GLSL}
 void main(){
   vec3 p = position;
   // Two drifting octaves of noise displace the surface along its normal.
-  float n1 = snoise(normalize(position) * uFreq + uTime * 0.25);
-  float n2 = snoise(normalize(position) * uFreq * 2.1 + uTime * 0.4);
-  float disp = (n1 + 0.5 * n2) * uAmp;
+  // MOD #73: the field drifts ~2x faster and the second octave carries more
+  // weight, so the surface visibly re-forms over a few seconds instead of
+  // presenting one frozen silhouette that merely rotates.
+  float n1 = snoise(normalize(position) * uFreq + uTime * 0.5);
+  float n2 = snoise(normalize(position) * uFreq * 2.1 + uTime * 0.85);
+  float disp = (n1 + 0.65 * n2) * uAmp;
   vDisp = disp;
   p += normal * disp;
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
@@ -112,17 +115,27 @@ void main(){
 }
 `;
 
+// === JARVIS MOD #57 (2026-08-03): uPower makes the falloff a parameter so ONE
+// factory can produce all three spec'd layers — a wide soft atmospheric bloom
+// (low power = broad), a medium halo, and a tight bright inner core. uCore
+// flips the profile: 0 = brightest at the silhouette rim (shells), 1 =
+// brightest at the center (the core layer). ===
 const GLOW_FRAG = /* glsl */ `
 uniform vec3 uColor;
 uniform float uStrength;
+uniform float uPower;
+uniform float uCore;
 varying vec3 vNormalW;
 varying vec3 vViewDir;
 void main(){
-  // Inverse-fresnel on a back-side shell → soft halo brightest at the rim.
-  float rim = pow(1.0 - clamp(dot(vViewDir, vNormalW), 0.0, 1.0), 3.0);
-  gl_FragColor = vec4(uColor, rim * uStrength);
+  float facing = clamp(dot(vViewDir, vNormalW), 0.0, 1.0);
+  float rim = pow(1.0 - facing, uPower);
+  float core = pow(facing, uPower);
+  float a = mix(rim, core, uCore);
+  gl_FragColor = vec4(uColor, a * uStrength);
 }
 `;
+// === END JARVIS MOD #57 ===
 
 export interface OrbUniforms {
   uTime: { value: number };
@@ -153,19 +166,37 @@ export function createOrbMaterial(color: string, rim: string): THREE.ShaderMater
   });
 }
 
-/** Translucent additive back-side glow shell around the orb. */
-export function createGlowMaterial(color: string): THREE.ShaderMaterial {
+// === JARVIS MOD #57: glow-layer options (2026-08-03) ===
+export interface GlowOptions {
+  /** Falloff exponent — lower = broader/softer, higher = tighter. */
+  power?: number;
+  /** Base opacity multiplier (also driven per-frame from voice brightness). */
+  strength?: number;
+  /** 0 = rim-bright shell, 1 = center-bright core. */
+  core?: number;
+  /** Core layers render front-side; shells render back-side. */
+  side?: THREE.Side;
+}
+
+/** Translucent additive glow layer around the orb (bloom / halo / core). */
+export function createGlowMaterial(
+  color: string,
+  { power = 3, strength = 0.55, core = 0, side = THREE.BackSide }: GlowOptions = {},
+): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
       uColor: { value: new THREE.Color(color) },
-      uStrength: { value: 0.55 },
+      uStrength: { value: strength },
+      uPower: { value: power },
+      uCore: { value: core },
     },
     vertexShader: GLOW_VERT,
     fragmentShader: GLOW_FRAG,
-    side: THREE.BackSide,
+    side,
     transparent: true,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
   });
 }
+// === END JARVIS MOD #57 ===
 // === END JARVIS MOD #29 ===

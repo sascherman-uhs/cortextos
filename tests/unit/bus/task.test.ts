@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+import { updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, seedTaskFile, cleanupTaskFixtures } from '../../helpers/task-fixture';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -26,6 +31,7 @@ describe('Task Management', () => {
   });
 
   afterEach(() => {
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
   });
 
@@ -49,6 +55,12 @@ describe('Task Management', () => {
       mkdirSync(paths.taskDir, { recursive: true });
       // Safe filename, but the internal id carries traversal that would resolve
       // to testDir/escaped.json (outside the task tree) on archive write/rename.
+      // Seeded under its (safe) FILENAME id, so teardown can address it: the
+      // internal `id` field is deliberately traversal and is not a handle.
+      seedTaskFile(paths, {
+        id: 'task_evil_1', status: 'completed', completed_at: '2020-01-01T00:00:00Z',
+        assigned_to: 'boris', org: 'acme',
+      });
       writeFileSync(join(paths.taskDir, 'task_evil_1.json'), JSON.stringify({
         id: '../escaped', status: 'completed', completed_at: '2020-01-01T00:00:00Z',
         assigned_to: 'boris', org: 'acme',
@@ -216,6 +228,7 @@ describe('Cross-org task lifecycle', () => {
 
   afterEach(() => {
     console.warn = originalWarn;
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
   });
 
@@ -242,7 +255,7 @@ describe('Cross-org task lifecycle', () => {
       archived: false,
       ...overrides,
     };
-    writeFileSync(join(orgBTaskDir, `${taskId}.json`), JSON.stringify(task), 'utf-8');
+    seedTaskFile(orgAPaths, task as unknown as Record<string, unknown> & { id: string }, orgBTaskDir);
   }
 
   it('updateTask same-org happy path: still works via the fast path', () => {
@@ -398,7 +411,7 @@ describe('claimTask — atomic claim (beads-inspired)', () => {
     };
   });
 
-  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+  afterEach(() => { cleanupTaskFixtures(); rmSync(testDir, { recursive: true, force: true }); });
 
   it('happy path: claims a pending task, flips status + assignee, writes lock file', () => {
     const id = createTask(paths, 'alice', 'acme', 'Claimable work');
@@ -475,7 +488,7 @@ describe('Task audit log (append-only JSONL)', () => {
     };
   });
 
-  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+  afterEach(() => { cleanupTaskFixtures(); rmSync(testDir, { recursive: true, force: true }); });
 
   it('createTask writes one "create" audit entry', () => {
     const id = createTask(paths, 'alice', 'acme', 'First task', { description: 'd' });
@@ -564,7 +577,7 @@ describe('Task dependency DAG (blocks / blocked_by)', () => {
     };
   });
 
-  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+  afterEach(() => { cleanupTaskFixtures(); rmSync(testDir, { recursive: true, force: true }); });
 
   function readTask(id: string) {
     return JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
@@ -691,7 +704,7 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     };
   });
 
-  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+  afterEach(() => { cleanupTaskFixtures(); rmSync(testDir, { recursive: true, force: true }); });
 
   // Helper: age a completed task's completed_at by overwriting the JSON.
   function backdateCompletion(id: string, daysAgo: number) {

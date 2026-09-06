@@ -6,6 +6,7 @@ import {
   IconChevronRight,
   IconCircleCheck,
   IconUser,
+  IconHandStop,
 } from '@tabler/icons-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
@@ -14,6 +15,7 @@ interface ActionRequiredProps {
   blockedTasks: number;
   staleAgents: number;
   humanTasks?: number;
+  skillRunBlockers?: number;
 }
 
 interface ActionItem {
@@ -28,8 +30,9 @@ export function ActionRequired({
   blockedTasks,
   staleAgents,
   humanTasks = 0,
+  skillRunBlockers = 0,
 }: ActionRequiredProps) {
-  const totalActions = pendingApprovals + blockedTasks + staleAgents + humanTasks;
+  const totalActions = pendingApprovals + blockedTasks + staleAgents + humanTasks + skillRunBlockers;
 
   const items: ActionItem[] = [
     {
@@ -49,6 +52,12 @@ export function ActionRequired({
       label: 'blocked task',
       count: blockedTasks,
       href: '/tasks?status=blocked',
+    },
+    {
+      icon: <IconHandStop size={18} className="text-destructive" />,
+      label: 'blocked skill run',
+      count: skillRunBlockers,
+      href: '/#skill-runs',
     },
     {
       icon: <IconHeartOff size={18} className="text-destructive" />,

@@ -80,6 +80,30 @@ describe('identity assembler (B1)', () => {
     expect(b).not.toBe(a);
   });
 
+  // === JARVIS MOD #46: org-wide VOICE.md in Block 1 ===
+  it('org VOICE.md loads first in Block 1 and re-reads on change', () => {
+    const orgDir = path.join(tmpRoot, 'framework', 'orgs', 'uhs');
+    fs.mkdirSync(orgDir, { recursive: true });
+    fs.writeFileSync(path.join(orgDir, 'VOICE.md'), '# Voice v1\nBanned openers: "Great question".');
+    writeIdentity('SOUL.md', '# Soul');
+    const a = assembleStableIdentity(AGENT, 'uhs');
+    expect(a).toContain('<!-- org VOICE.md -->');
+    expect(a.indexOf('Voice v1')).toBeLessThan(a.indexOf('# Soul'));
+    expect(a).toBe(assembleStableIdentity(AGENT, 'uhs')); // still byte-stable
+    // mtime invalidation on the ORG file
+    fs.writeFileSync(path.join(orgDir, 'VOICE.md'), '# Voice v2-changed');
+    fs.utimesSync(path.join(orgDir, 'VOICE.md'), new Date(), new Date(Date.now() + 5000));
+    expect(assembleStableIdentity(AGENT, 'uhs')).toContain('v2-changed');
+  });
+
+  it('missing org VOICE.md is a clean no-op', () => {
+    writeIdentity('SOUL.md', '# Soul only');
+    const a = assembleStableIdentity(AGENT, 'uhs');
+    expect(a).not.toContain('org VOICE.md');
+    expect(a).toContain('# Soul only');
+  });
+  // === END MOD #46 ===
+
   it('assembleSystem marks only Block 1 as ephemeral-cached', () => {
     writeIdentity('SOUL.md', '# Soul');
     const sys = assembleSystem(AGENT, 'uhs');
@@ -151,5 +175,46 @@ describe('conversation window (B3)', () => {
     logLine('inbound-messages.jsonl', { text: '[Cosmos] hi', timestamp: '2026-07-06T10:00:00Z' });
     const w = buildWindow(AGENT);
     expect(w[0].role).toBe('user');
+  });
+});
+
+// === JARVIS MOD #64 — prompt-cache split: personality cached, checkpoint not ==
+describe('prompt-cache split (MOD #64)', () => {
+  it('personality sits in the CACHED block, the tonal checkpoint in the UNCACHED one', () => {
+    const orgDir = path.join(tmpRoot, 'framework', 'orgs', 'uhs');
+    fs.mkdirSync(orgDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(orgDir, 'VOICE.md'),
+      '# Voice\nBanned openers: "Great question".\nAffectionate, never cruel.',
+    );
+    writeIdentity('IDENTITY.md', '# Identity\nVibe: dry.');
+
+    const sys = assembleSystem(AGENT, 'uhs');
+    const [cached, volatile_] = sys;
+
+    // Block ordering: cached identity first, volatile second.
+    expect(cached.cache_control).toEqual({ type: 'ephemeral' });
+    expect(volatile_.cache_control).toBeUndefined();
+    expect(cached.text).toContain('Affectionate, never cruel');
+    expect(cached.text).toContain('Vibe: dry.');
+
+    // The per-turn check must NOT be amortized into the cached prefix.
+    expect(cached.text).not.toContain('TONAL CHECKPOINT before you answer');
+    expect(volatile_.text).toContain('TONAL CHECKPOINT before you answer');
+  });
+
+  it('the uncached block carries the spoken caps and the banned openers', () => {
+    const b = assembleVolatileBlock(new Date());
+    expect(b).toContain('40 words MAX, 2 sentences MAX');
+    expect(b).toContain('6 seconds');
+    for (const opener of ['Great question', 'Let me', 'Based on', 'Absolutely']) {
+      expect(b).toContain(opener);
+    }
+    expect(b).toContain('STYLE, never data');
+  });
+
+  it('the ESCALATE contract survives in the cached block', () => {
+    writeIdentity('SOUL.md', '# Soul');
+    expect(assembleStableIdentity(AGENT, 'uhs')).toContain('<<ESCALATE>>');
   });
 });

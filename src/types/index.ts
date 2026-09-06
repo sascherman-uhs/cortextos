@@ -122,6 +122,129 @@ export type ApprovalCategory =
 
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
+// ---------------------------------------------------------------------------
+// ApprovalV2 — additive structured action specification (WP-5B, 2026-09-06
+// CortexOS V4 safety review, plan-r01.md §5.1).
+//
+// Every field below is OPTIONAL on `Approval`. An approval record with no
+// `action_spec` is a legacy/"decision_only" record: it can be approved or
+// denied exactly as before, but it can never be read as authorizing a new
+// structured executable action — free text never supplies execution
+// arguments. Only a record carrying `execution_kind: 'provider_action'` and
+// a populated `action_spec` is an executable approval, and even then no real
+// provider adapter exists yet (Stage 2 of the plan is inert by design: this
+// schema, its hashing, and the shared decision boundary — no live executor).
+// ---------------------------------------------------------------------------
+
+export type ExecutionKind = 'decision_only' | 'provider_action';
+
+export interface RecipientV1 {
+  role: 'to' | 'cc' | 'bcc' | 'chat' | 'payee' | 'other';
+  provider_id: string | null;
+  address: string | null;
+}
+
+/** `minor_units` is a nonnegative-integer decimal STRING — never a float. */
+export interface AmountV1 {
+  currency: string;
+  minor_units: string;
+  currency_exponent: number;
+}
+
+export interface TargetV1 {
+  resource_type: string;
+  resource_id: string | null;
+  parent_id: string | null;
+  create_key: string | null;
+}
+
+export interface ContentV1 {
+  subject: string | null;
+  body: string;
+  format: 'plain' | 'html' | 'json';
+  /** sha256 of the exact UTF-8 body bytes. */
+  sha256: string;
+}
+
+export interface AttachmentV1 {
+  artifact_id: string;
+  immutable_version: string;
+  sha256: string;
+  byte_length: number;
+  filename: string;
+  media_type: string;
+}
+
+/** Stable provider principal + server-side credential mapping. Never a token value. */
+export interface AccountV1 {
+  provider_account_id: string;
+  tenant_id: string | null;
+  credential_binding_id: string;
+}
+
+export interface ActorV1 {
+  requester_id: string;
+  executor_principal_id: string;
+  policy_id: string;
+  policy_version: string;
+}
+
+export interface PreconditionV1 {
+  resource_type: string;
+  resource_id: string;
+  version_kind: 'etag' | 'version' | 'sha256';
+  expected: string;
+}
+
+/** All effect-bearing request fields the operation will send, excluding transport auth. */
+export interface ProviderRequestV1 {
+  method: string;
+  endpoint_id: string;
+  path_params: Record<string, unknown>;
+  query: Record<string, unknown>;
+  headers: Record<string, unknown>;
+  body: Record<string, unknown> | null;
+}
+
+export interface ActionSpecV1 {
+  schema_version: 1;
+  /** Immutable action UUID. Retries retain this ID; a changed operation is a new action. */
+  action_id: string;
+  provider: string;
+  operation: string;
+  adapter_version: string;
+  account: AccountV1;
+  actor: ActorV1;
+  recipients: RecipientV1[];
+  target: TargetV1;
+  amount: AmountV1 | null;
+  content: ContentV1 | null;
+  attachments: AttachmentV1[];
+  provider_request: ProviderRequestV1;
+  preconditions: PreconditionV1[];
+  max_observation_age_seconds: number;
+  idempotency_key: string;
+  not_before: string;
+  expires_at: string;
+}
+
+export interface ApprovalDecisionV2 {
+  decision_id: string;
+  outcome: 'approved' | 'rejected';
+  decider_id: string;
+  route: string;
+  decided_at: string;
+  approved_version: number;
+  action_hash: string | null;
+  presentation_hash: string;
+}
+
+export interface ApprovalRevocationV2 {
+  revoked_at: string;
+  revoked_by: string;
+  reason: string;
+}
+
 export interface Approval {
   id: string;
   title: string;
@@ -134,6 +257,20 @@ export interface Approval {
   updated_at: string;
   resolved_at: string | null;
   resolved_by: string | null;
+
+  // --- Pre-existing additive fields (OS-02 approval binding). ---
+  version?: number;
+  payload_hash?: string;
+
+  // --- ApprovalV2 additive fields (WP-5B). Absent `action_spec` = legacy
+  //     decision_only record; see block comment above. ---
+  schema_version?: 2;
+  execution_kind?: ExecutionKind;
+  action_spec?: ActionSpecV1 | null;
+  action_hash?: string | null;
+  presentation_hash?: string;
+  decision?: ApprovalDecisionV2 | null;
+  revocation?: ApprovalRevocationV2 | null;
 }
 
 // Agent Config Types (config.json)
@@ -213,6 +350,33 @@ export interface AgentConfig {
    * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
+  /**
+   * Runtime capability isolation for the codex-app-server runtime only.
+   * Defaults/absent = 'full' = today's behaviour, byte-for-byte unchanged
+   * (approvalPolicy 'never' + danger-full-access sandbox on every thread/turn,
+   * both org secrets.env and the agent's own .env loaded unfiltered).
+   * 'read_only' restricts the codex-app-server sandbox to the most
+   * restrictive mode the installed protocol supports — `sandbox: 'read-only'`
+   * at the thread level, `sandboxPolicy: { type: 'readOnly', networkAccess: false }`
+   * per turn — which blocks filesystem writes and outbound network at the
+   * codex-enforced OS sandbox layer. approvalPolicy stays 'never' even in
+   * 'read_only' because this adapter has no handler for inbound approval
+   * requests (any unrecognized app-server request is answered with a JSON-RPC
+   * error), so leaving approvals on would just fail every action rather than
+   * gate it — isolation here comes from the sandbox, not from an approval
+   * prompt. 'read_only' also drops both unfiltered env-file loads (org
+   * secrets.env and the agent's .env) — see `capability_env_allowlist`.
+   */
+  capability_profile?: 'full' | 'read_only';
+  /**
+   * Only consulted when `capability_profile === 'read_only'`. Names of env
+   * vars to allow through from `orgs/<org>/secrets.env` and `<agentDir>/.env`
+   * — e.g. a read-only Supabase key. Absent/empty = no credentials at all are
+   * injected for a read_only-profile agent (safer default than trying to
+   * filter an existing secrets file line-by-line). Ignored entirely when
+   * `capability_profile` is 'full'/absent.
+   */
+  capability_env_allowlist?: string[];
 }
 
 export interface CronEntry {
@@ -376,6 +540,19 @@ export interface CronDefinition {
    * Absent (or 0) when the cron has never fired.
    */
   fire_count?: number;
+
+  /**
+   * Optional pre-fire gate. When set to `"inbox"`, the daemon only injects the
+   * cron prompt if the agent's bus inbox ({CTX_ROOT}/inbox/{agentName}/) holds
+   * at least one pending message file. An empty inbox counts as a successful
+   * fire (schedule advances, fire_count untouched) with a `[cron-gate]` log
+   * line and NO PTY injection — so recurring "check inbox" crons stop burning
+   * an LLM turn just to discover there is nothing to do (2026-08-18: the three
+   * 10-minute task-check crons alone were ~432 idle sessions/day on API billing).
+   *
+   * @example "inbox"
+   */
+  gate?: 'inbox';
 
   /**
    * ISO 8601 UTC timestamp for one-shot crons — when the cron should fire once
@@ -641,7 +818,8 @@ export type IPCCommandType =
   | 'add-cron'
   | 'update-cron'
   | 'remove-cron'
-  | 'fleet-health';
+  | 'fleet-health'
+  | 'ingress-transfer';
 
 // ---------------------------------------------------------------------------
 // Execution log pagination response — Subtask 4.3
@@ -800,3 +978,344 @@ export interface AgentStatus {
   crashCount?: number;
   model?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Model routing registry (OS-02b-core)
+// ---------------------------------------------------------------------------
+//
+// Implements `.planning/agentic-os/model-routing-contract.md`. The registry is
+// the single authority for "which model does this consumer run on". Agent
+// config.json keeps `runtime`; its `model` field becomes LEGACY — imported as a
+// pin by `cortextos model migrate --bootstrap`, never edited by this system.
+//
+// All types here are ADDITIVE. The `AgentConfig.runtime` union is unchanged;
+// the adapter map (below) is what actually decides which adapters exist, so a
+// new adapter can be registered without a code change to that union.
+
+/** Activation mode for one consumer (agent name or JARVIS call-site id). */
+export type ModelActivationMode = 'shadow' | 'enforced';
+
+/** How a model entry is billed. Drives the cost preview on a switch. */
+export type ModelBillingMode = 'subscription_quota' | 'api_cash' | 'local';
+
+export type ModelEntryStatus = 'active' | 'deprecated' | 'unavailable';
+
+/** A bounded, non-billing health probe descriptor. */
+export interface ModelHealthProbe {
+  /**
+   * `cli-print`  — a CLI login/credential presence check (never a billed call).
+   * `env-key`    — presence of the named environment variable.
+   * `http-tags`  — a local HTTP GET (ollama `/api/tags`).
+   * `none`       — no probe is possible for this entry.
+   */
+  kind: 'cli-print' | 'env-key' | 'http-tags' | 'none';
+  timeout_ms?: number;
+  url?: string;
+}
+
+export interface ModelEntry {
+  model_id: string;
+  provider: string;
+  runtime_adapter: string;
+  capability_tags: string[];
+  context_window: number;
+  billing_mode: ModelBillingMode;
+  cost_class: number;
+  auth_source: string | null;
+  status: ModelEntryStatus;
+  health_probe?: ModelHealthProbe;
+  /** Optional human note (e.g. why an entry is marked unavailable). */
+  note?: string;
+}
+
+export interface ModelAdapterDescriptor {
+  version: number;
+  /**
+   * How this adapter is told which model to run. `null` means the adapter has
+   * no explicit-selection mechanism — it can be described but never enforced.
+   */
+  selection: string | null;
+  /** Where a runtime-observed model id can be read back, or null if nowhere. */
+  observed_source: string | null;
+  supports: string[];
+  auth_source: string | null;
+  /**
+   * Agent `runtime` values this adapter can host. Absent = the adapter id is
+   * itself the runtime name (the common case).
+   */
+  hosts_runtimes?: string[];
+}
+
+export type ModelPinKind = 'explicit' | 'legacy-migration' | 'proposed-invalid';
+
+export interface ModelPin {
+  entry_id: string;
+  kind: ModelPinKind;
+  reason: string;
+  actor: string;
+  created_at: string;
+  expires_at: string | null;
+  fallback?: string[];
+  /**
+   * Human task raised for a `proposed-invalid` pin. Carried here so `resolve()`
+   * can hand the UI a remediation item instead of only an error code — a
+   * non-dispatchable pin is a work item, not a failed command.
+   */
+  task_id?: string;
+}
+
+export interface ModelRoleAssignment {
+  tier: string;
+  /**
+   * Capability tags the MODEL must carry. Matched against a registry entry's
+   * `capability_tags` during resolution (`validateCandidate`), so every value
+   * here has to exist on some entry or the role becomes unresolvable.
+   */
+  required_capabilities: string[];
+  /**
+   * Properties of the ROLE itself — what this role participates in, e.g.
+   * `continuous-improvement` (weekly Kaizen enrollment). Deliberately a
+   * SEPARATE field from `required_capabilities`: it is never matched against
+   * a model entry, so declaring one here can never make a role unresolvable.
+   * Absent means the empty list.
+   */
+  role_capabilities?: string[];
+  min_context: number;
+  data_scope: string;
+}
+
+export interface ModelAgentAssignment {
+  role: string;
+  pin: ModelPin | null;
+}
+
+export interface ModelCallsiteAssignment {
+  role: string;
+  pin?: ModelPin | null;
+}
+
+export interface ModelRegistry {
+  schema_version: number;
+  revision: number;
+  updated_at: string;
+  updated_by: string;
+  activation: {
+    org_default: ModelActivationMode;
+    consumers: Record<string, ModelActivationMode>;
+  };
+  adapters: Record<string, ModelAdapterDescriptor>;
+  entries: Record<string, ModelEntry>;
+  tiers: Record<string, string[]>;
+  org_default_tier: string;
+  roles: Record<string, ModelRoleAssignment>;
+  agents: Record<string, ModelAgentAssignment>;
+  callsites: Record<string, ModelCallsiteAssignment>;
+}
+
+export interface ModelValidationError {
+  code: string;
+  message: string;
+}
+
+export interface ModelResolveOverride {
+  tier?: string;
+  entry_id?: string;
+  actor: string;
+  reason: string;
+}
+
+export interface ModelResolveInput {
+  agent?: string;
+  callsite?: string;
+  role?: string;
+  override?: ModelResolveOverride;
+  /**
+   * Attach the newest attempt record for this consumer as `observed`.
+   * Defaults to true. The spawn path passes `false` because it costs a
+   * directory scan it does not need — everything else (CLI, dashboard) wants
+   * desired-vs-running, so the honest answer is the default.
+   */
+  withObserved?: boolean;
+}
+
+export interface ModelSelection {
+  entry_id: string;
+  model_id: string;
+  provider: string;
+  runtime_adapter: string;
+  billing_mode: string;
+  cost_class: number;
+}
+
+export interface ModelResolution {
+  registry_revision: number;
+  activation: ModelActivationMode;
+  requested: {
+    source: 'override' | 'pin' | 'role' | 'org_default';
+    tier?: string;
+    entry_id?: string;
+  };
+  /** Ordered eligible entry ids remaining after validation filtering. */
+  candidates: string[];
+  selected: ModelSelection | null;
+  validation: { ok: boolean; errors: ModelValidationError[]; warnings: string[] };
+  /** What the agent config literally says today (shadow reporting only). */
+  legacy_effective?: { model_id?: string; runtime?: string };
+  /** Resolved role id, when one could be determined. */
+  role?: string;
+  /**
+   * The model a spawn from this resolution would ACTUALLY dispatch: the legacy
+   * config model in shadow, the resolved model in enforced. This — not
+   * `selected.model_id` — is the "desired" half of desired-vs-running.
+   */
+  expected_model_id: string | null;
+  /**
+   * Newest runtime observation for this consumer, read from the attempt
+   * journal. `null` means no attempt has been recorded yet (genuinely
+   * unknown), which is different from an attempt that came back unconfirmed.
+   */
+  observed: ModelObservedSummary | null;
+  /**
+   * A validation failure a human can act on, surfaced as a work item rather
+   * than only an error code. Present when the consumer carries a
+   * `proposed-invalid` pin awaiting a routing decision.
+   */
+  remediation?: ModelRemediation;
+}
+
+export interface ModelObservedSummary {
+  model_id: string | null;
+  source: string | null;
+  binding: ModelObservationBinding | null;
+  confidence: ModelObservedConfidence;
+  at: string | null;
+  attempt_id: string;
+}
+
+export interface ModelRemediation {
+  kind: 'proposed-invalid-pin';
+  /** Consumer the pin sits on. */
+  agent?: string;
+  /** Entry the invalid pin names. */
+  entry_id?: string;
+  /** Human task raised when the pin was created, when one exists. */
+  task_id?: string;
+  /** Why it cannot dispatch, and what a human should decide. */
+  detail: string;
+}
+
+export type ModelOperationKind = 'switch' | 'pin' | 'unpin' | 'revert' | 'activation' | 'role_capability';
+
+export type ModelOperationState =
+  | 'requested'
+  | 'validated'
+  | 'desired_written'
+  | 'draining'
+  | 'applied'
+  | 'blocked'
+  | 'failed';
+
+export interface ModelRestartResult {
+  agent: string;
+  ok: boolean;
+  detail: string;
+  observed_after?: string | null;
+  /** PID the agent was running under BEFORE the restart, when known. */
+  pid_before?: number | null;
+  /** PID read back AFTER the restart — proof a fresh process exists. */
+  pid?: number | null;
+  /** `sessionStart` read back after the restart. */
+  session_start?: string | null;
+  /** Newest attempt id recorded for this agent after the restart, if any. */
+  attempt_id?: string | null;
+  /**
+   * True when the daemon answered the start with DEDUPED / "already in
+   * registry" and a fresh session was nevertheless confirmed within the drain
+   * window. The restart happened; the response was just the wrong shape.
+   */
+  deduped_but_restarted?: boolean;
+}
+
+export interface ModelOperationReceipt {
+  operation_id: string;
+  kind: ModelOperationKind;
+  actor: string;
+  reason: string;
+  from: unknown;
+  to: unknown;
+  affected_consumers: string[];
+  registry_revision_before: number;
+  registry_revision_after: number;
+  state: ModelOperationState;
+  restart_results: ModelRestartResult[];
+  /**
+   * Whether this operation needed any agent restarted at all. `false` with
+   * state `applied` is the "no restart needed" case — an empty
+   * `restart_results` then means nothing was owed, not that something failed
+   * to run.
+   */
+  restart_required: boolean;
+  /** Operation id this receipt reverts, for `kind: 'revert'`. */
+  revert_of?: string;
+  created_at: string;
+  applied_at: string | null;
+  error: string | null;
+}
+
+export interface ModelEventRecord {
+  operation_id: string;
+  state: ModelOperationState | 'revert';
+  kind: ModelOperationKind;
+  actor: string;
+  reason: string;
+  at: string;
+  registry_revision: number;
+  detail?: Record<string, unknown>;
+}
+
+export type ModelObservedConfidence = 'verified' | 'unconfirmed' | 'mismatch';
+
+/**
+ * How an observed model id was tied to a specific spawn. `session-id` and
+ * `thread-id` are exact; `prompt-correlated` matches the boot prompt on a
+ * transcript newer than the spawn. Anything else is a guess and must leave the
+ * attempt `unconfirmed`.
+ */
+export type ModelObservationBinding = 'session-id' | 'thread-id' | 'prompt-correlated' | 'unbound';
+
+export interface ModelAttemptRecord {
+  attempt_id: string;
+  consumer: string;
+  role: string | null;
+  requested: ModelResolution['requested'];
+  selected_entry: string | null;
+  model_id: string | null;
+  runtime_adapter: string | null;
+  billing_mode: string | null;
+  registry_revision: number;
+  session_ref: string | null;
+  activation: ModelActivationMode;
+  /**
+   * The model this spawn actually dispatches, and therefore the only baseline
+   * an observation may be compared against: the legacy config model in shadow
+   * mode, the resolved model in enforced mode. Optional for records written
+   * before the field existed.
+   */
+  expected_model_id?: string | null;
+  at: string;
+  observed: {
+    model_id: string | null;
+    source: string | null;
+    confidence: ModelObservedConfidence;
+    at: string | null;
+    /** How the transcript was attributed to this spawn (absent = legacy record). */
+    binding?: ModelObservationBinding;
+  };
+  fallback?: { from: string; reason: string };
+}
+
+/**
+ * Error classes that may trigger an automatic fallback to the next candidate.
+ * Quality / refusal / policy failures MUST NOT — see contract §3.
+ */
+export type ModelFallbackClass = 'spawn' | 'auth' | 'quota' | 'outage';

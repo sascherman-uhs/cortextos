@@ -249,6 +249,78 @@ tr:hover td {
   --sidebar-ring: oklch(0.762 0.125 82);
 }
 
+/* ============================================
+   === JARVIS MOD #55/#56/#62 — Cosmos (/jarvis) motion system (2026-08-03)
+   Scoped to [data-cosmos] so nothing here can leak into the rest of the
+   dashboard. Trillion rubric item 1: ONE easing curve, app-wide, never
+   ease-in-out — enforced here rather than by hand-editing every Tailwind
+   `transition-*` in the scene.
+   ============================================ */
+[data-cosmos],
+[data-cosmos] *,
+[data-cosmos] *::before,
+[data-cosmos] *::after {
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* MOD #56: the listening pulse ring — 1.4s expanding gold halo on the mic
+   button. Only ever rendered while the mic is actually hot. */
+@keyframes cosmosPulseRing {
+  0% { transform: scale(1); opacity: 0.75; }
+  100% { transform: scale(1.75); opacity: 0; }
+}
+.cosmos-pulse-ring {
+  position: absolute;
+  inset: -2px;
+  border-radius: 9999px;
+  border-width: 1.5px;
+  border-style: solid;
+  pointer-events: none;
+  animation: cosmosPulseRing 1.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+/* MOD #60: status dot breathes while listening (idle is never static). */
+@keyframes cosmosDotPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.86); }
+}
+.cosmos-dot-pulse {
+  animation: cosmosDotPulse 1.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+/* MOD #59: the mobile stat strip scrolls, but never shows a scrollbar. */
+[data-cosmos] .snap-x::-webkit-scrollbar { display: none; }
+
+/* MOD #59: the perf toggle is pinned bottom-right, which on a phone lands on
+   top of the message input + Send button. Below md it moves to the top-right,
+   under the stat strip, where nothing else lives. */
+@media (max-width: 767px) {
+  [data-cosmos] button[aria-label^="Performance mode"] {
+    bottom: auto !important;
+    top: calc(7.75rem + env(safe-area-inset-top));
+    padding: 0.25rem 0.75rem;
+    font-size: 10px;
+  }
+}
+
+/* MOD #62: reduced motion — the scene's WebGL loop drops to 'demand' in
+   scene.tsx; these kill the remaining DOM animation. Transitions are kept but
+   made near-instant so state changes still read, they just don't travel. */
+@media (prefers-reduced-motion: reduce) {
+  [data-cosmos] .cosmos-pulse-ring,
+  [data-cosmos] .cosmos-dot-pulse {
+    animation: none;
+  }
+  [data-cosmos],
+  [data-cosmos] * {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+/* === END JARVIS MOD #55/#56/#62 === */
+
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }

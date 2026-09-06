@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
+import type { AgentConfig, AgentStatus, CtxEnv, ModelObservationBinding } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
@@ -12,6 +12,14 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import {
+  observeClaudeModel,
+  observeCodexModel,
+  recordAttempt,
+  resolve as resolveModelRouting,
+  spawnDecision,
+  updateAttemptObserved,
+} from '../bus/model-registry.js';
 
 type LogFn = (msg: string) => void;
 
@@ -24,6 +32,10 @@ export class AgentProcess {
   private env: CtxEnv;
   private config: AgentConfig;
   private pty: AgentPTY | CodexAppServerPTY | KimiPTY | null = null;
+  // Model routing (OS-02b-core): path of the attempt record written at spawn,
+  // updated once a runtime observation of the model arrives.
+  private modelAttemptPath: string | null = null;
+  private modelObserveTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private crashCount: number = 0;
   private maxCrashesPerDay: number = 10;
@@ -126,6 +138,22 @@ export class AgentProcess {
     // handleExit, preventing spurious crash recovery on the new agent.
     const myGeneration = ++this.lifecycleGeneration;
 
+    // ------------------------------------------------------------------
+    // Model routing (OS-02b-core). Resolve BEFORE the PTY exists so an
+    // enforced-mode validation failure refuses the spawn instead of silently
+    // running the legacy config model.
+    // ------------------------------------------------------------------
+    const routing = this.resolveModelRouting();
+    if (routing?.decision.refuse) {
+      this.log(
+        `[model-routing] REFUSED spawn agent=${this.name} ${routing.decision.reason} — ` +
+        `fix the route with: cortextos model resolve --agent ${this.name}`,
+      );
+      this.status = 'halted';
+      this.notifyStatusChange();
+      return;
+    }
+
     // Create PTY — runtime-specific subclass handles binary, args, bootstrap detection
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
     ensureDir(join(this.env.ctxRoot, 'logs', this.name));
@@ -137,6 +165,14 @@ export class AgentProcess {
         : this.config.runtime === 'kimi'
           ? new KimiPTY(this.env, this.config, logPath)
           : new AgentPTY(this.env, this.config, logPath);
+
+    // Enforced mode: pass the resolved model explicitly to the adapter.
+    // Shadow mode leaves the override null, so the legacy dispatch is unchanged.
+    if (routing?.decision.modelOverride && this.pty && 'setModelOverride' in this.pty) {
+      (this.pty as { setModelOverride(m: string | null): void }).setModelOverride(
+        routing.decision.modelOverride,
+      );
+    }
 
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
@@ -184,6 +220,10 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Provenance: one attempt record per spawn, then a bounded poll for the
+      // runtime-observed model id (never a config-derived label).
+      if (routing) this.recordModelAttempt(routing.resolution, prompt);
 
       // Issue #392: codex-app-server does not reliably execute the inline
       // "Send a Telegram message saying you are back online" instruction the
@@ -424,6 +464,123 @@ export class AgentProcess {
    */
   getConfig(): AgentConfig {
     return this.config;
+  }
+
+  // --- Model routing (OS-02b-core) ---
+
+  /**
+   * Resolve this agent's route against the model registry.
+   *
+   * Never throws: a missing or unreadable registry means routing is simply not
+   * installed yet, and the daemon must keep booting agents exactly as before.
+   */
+  private resolveModelRouting(): {
+    resolution: ReturnType<typeof resolveModelRouting>;
+    decision: ReturnType<typeof spawnDecision>;
+  } | null {
+    try {
+      const resolution = resolveModelRouting(
+        // `withObserved: false` — the spawn path pays a journal scan for an
+        // answer it never reads. Every other consumer wants desired-vs-running.
+        { agent: this.name, withObserved: false },
+        {
+          org: this.env.org,
+          frameworkRoot: this.env.frameworkRoot || this.env.projectRoot,
+          ctxRoot: this.env.ctxRoot,
+          instanceId: this.env.instanceId,
+        },
+      );
+      const decision = spawnDecision(resolution);
+      const errors = resolution.validation.errors.map((e) => e.code).join(',') || 'none';
+      this.log(
+        `[model-routing] ${decision.mode} agent=${this.name} ` +
+        `resolved=${resolution.selected?.model_id ?? 'none'} ` +
+        `entry=${resolution.selected?.entry_id ?? 'none'} ` +
+        `source=${resolution.requested.source} ` +
+        `legacy=${resolution.legacy_effective?.model_id ?? 'none'}/${resolution.legacy_effective?.runtime ?? 'claude-code'} ` +
+        `validation=${resolution.validation.ok ? 'ok' : errors} rev=${resolution.registry_revision}`,
+      );
+      return { resolution, decision };
+    } catch (err) {
+      // RegistryNotFoundError on a machine that has not bootstrapped yet is
+      // expected and must not stop an agent from starting.
+      this.log(`[model-routing] skipped: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Write the spawn-time attempt record, then poll (bounded) for a
+   * runtime-observed model id and update the record in place.
+   */
+  private recordModelAttempt(resolution: ReturnType<typeof resolveModelRouting>, bootPrompt: string): void {
+    const ctx = {
+      org: this.env.org,
+      frameworkRoot: this.env.frameworkRoot || this.env.projectRoot,
+      ctxRoot: this.env.ctxRoot,
+      instanceId: this.env.instanceId,
+    };
+    const sessionId = this.pty && 'getSessionId' in this.pty
+      ? (this.pty as { getSessionId(): string | null }).getSessionId()
+      : null;
+    try {
+      const written = recordAttempt({ consumer: this.name, resolution, sessionRef: sessionId }, ctx);
+      this.modelAttemptPath = written.path;
+    } catch (err) {
+      this.log(`[model-routing] attempt record failed: ${(err as Error).message}`);
+      return;
+    }
+
+    const runtime = this.config.runtime || 'claude-code';
+    const cwd = this.config.working_directory || this.env.agentDir || process.cwd();
+    const since = this.sessionStart ?? new Date();
+    const attemptPath = this.modelAttemptPath;
+    let tries = 0;
+
+    // Bounded poll — 6 attempts, 10s apart, then give up and leave the record
+    // `unconfirmed`. No busy loop, and the timer is cleared on stop().
+    const poll = (): void => {
+      tries += 1;
+      let observed: { model_id: string; source: string; binding: ModelObservationBinding } | null = null;
+      try {
+        if (runtime === 'claude-code') {
+          // Bind to the session this PTY launched. Without a session id (a
+          // `--continue` spawn) fall back to prompt correlation on a
+          // transcript newer than the spawn — several agents share a cwd, so
+          // "newest file in the slug dir" is not evidence of anything.
+          observed = observeClaudeModel({ cwd, sessionId, since, bootPrompt });
+        } else if (runtime === 'codex-app-server') {
+          const threadId = this.pty && 'getThreadId' in this.pty
+            ? (this.pty as { getThreadId(): string | null }).getThreadId()
+            : null;
+          if (threadId) observed = observeCodexModel({ threadId, since });
+        }
+        // kimi / hermes have no established observer — the attempt stays
+        // `unconfirmed`, which is the honest label.
+      } catch { /* observation is best-effort */ }
+
+      if (observed) {
+        try {
+          const rec = updateAttemptObserved(attemptPath, observed, ctx);
+          this.log(
+            `[model-routing] observed agent=${this.name} model=${observed.model_id} ` +
+            `source=${observed.source} binding=${observed.binding} ` +
+            `expected=${rec?.expected_model_id ?? 'none'} confidence=${rec?.observed.confidence ?? 'unknown'}`,
+          );
+        } catch { /* best-effort */ }
+        this.modelObserveTimer = null;
+        return;
+      }
+      if (tries >= 6) {
+        this.modelObserveTimer = null;
+        return;
+      }
+      this.modelObserveTimer = setTimeout(poll, 10_000);
+      this.modelObserveTimer.unref?.();
+    };
+
+    this.modelObserveTimer = setTimeout(poll, 10_000);
+    this.modelObserveTimer.unref?.();
   }
 
   // --- Private methods ---
@@ -866,6 +1023,12 @@ export class AgentProcess {
     if (this.sessionTimer) {
       clearTimeout(this.sessionTimer);
       this.sessionTimer = null;
+    }
+    // The model-observation poll belongs to the same session — a stopped agent
+    // must not leave a timer looking for a transcript that will never grow.
+    if (this.modelObserveTimer) {
+      clearTimeout(this.modelObserveTimer);
+      this.modelObserveTimer = null;
     }
   }
 

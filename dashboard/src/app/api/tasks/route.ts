@@ -33,6 +33,7 @@ export async function GET(request: NextRequest) {
     status: searchParams.get('status') || undefined,
     project: searchParams.get('project') || undefined,
     search: searchParams.get('search') || undefined,
+    date: searchParams.get('date') === 'today' ? ('today' as const) : undefined,
   };
 
   try {

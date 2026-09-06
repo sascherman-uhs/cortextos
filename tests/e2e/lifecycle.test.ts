@@ -6,7 +6,12 @@ import { execSync } from 'child_process';
 
 // Import bus functions for verification
 import { sendMessage, checkInbox, ackInbox } from '../../src/bus/message';
-import { createTask, updateTask, completeTask, listTasks } from '../../src/bus/task';
+import { updateTask, completeTask, listTasks } from '../../src/bus/task';
+// Task fixtures go through tests/helpers/task-fixture.ts: it registers every id
+// it creates and tears it down through the same deleteTask the CLI uses, so a
+// fixture can never again leave an audit log, an event journal or an unacked
+// inbox message pointing at a task that no longer exists.
+import { createTask, cleanupTaskFixtures } from '../helpers/task-fixture';
 import { logEvent } from '../../src/bus/event';
 import { updateHeartbeat, readAllHeartbeats } from '../../src/bus/heartbeat';
 import { createApproval } from '../../src/bus/approval';
@@ -39,6 +44,7 @@ describe('E2E Lifecycle', () => {
   });
 
   afterEach(() => {
+    cleanupTaskFixtures();
     rmSync(testDir, { recursive: true, force: true });
   });
 
@@ -260,12 +266,36 @@ describe('E2E Lifecycle', () => {
 
       const task = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
 
-      const expectedFields = [
+      // The 17 bash-compatible fields must all be present with their original
+      // names — bash consumers read them positionally by key.
+      const requiredFields = [
         'id', 'title', 'description', 'type', 'needs_approval', 'status',
         'assigned_to', 'created_by', 'org', 'priority', 'project',
         'kpi_key', 'created_at', 'updated_at', 'completed_at', 'due_date', 'archived',
       ];
-      expect(Object.keys(task).sort()).toEqual(expectedFields.sort());
+      const keys = Object.keys(task);
+      expect(requiredFields.every((f) => keys.includes(f))).toBe(true);
+
+      // OS-02 adds the accountable-work-contract fields additively. Anything
+      // outside this allowlist is unintended drift and should fail here.
+      const contractFields = [
+        'acceptance_criteria', 'agent_role_id', 'attempt_limit', 'author',
+        'authorization_scope', 'canonical_state', 'checkpoint', 'dependency_ids',
+        'evidence', 'fence_token', 'human_accountable_id', 'lease_expires_at',
+        'lease_owner', 'next_action_at', 'not_before', 'outcome', 'requestor',
+        'source_id', 'source_ref', 'source_system', 'version', 'waiting_subtype',
+        'impact_class', 'work_type', 'evidence_recorded',
+        // fix5: the stamp that says this record was created UNDER the contract.
+        // Its absence on old records is how legacy work is identified, so a new
+        // task must always carry it. Also allowed: the marks a legacy record
+        // picks up if a person ever advances it without its required fields.
+        'contract_version', 'legacy_grandfathered', 'legacy_grandfather',
+        'transition_reason',
+      ];
+      const unexpected = keys.filter(
+        (k) => !requiredFields.includes(k) && !contractFields.includes(k),
+      );
+      expect(unexpected).toEqual([]);
     });
 
     it('filename format matches bash convention', () => {

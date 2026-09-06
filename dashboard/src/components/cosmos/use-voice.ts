@@ -46,6 +46,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 // zero utterances reach STT — exactly Scott's 2026-07-08 silent phone test.
 // Same lesson as MOD #25/#28; PwaBoot's first-gesture unlock now heals the mic.
 import { getSharedAudioContext, resumeSharedAudio } from './audio-unlock';
+// === JARVIS MOD #88: same barge-in bookkeeping the TTS side uses (MOD #85),
+// applied to the reply lane — see the replyGuard block in useVoice(). ===
+import { TurnGuard } from './turn-guard';
 import {
   SPEECH_THRESHOLD,
   FOLLOW_UP_MS,
@@ -110,6 +113,11 @@ const AGENT = 'jarvis-telegram';
 const OPEN_MIC_KEY = 'cosmos-open-mic-v3';
 /** Tap mode: ms of post-speech silence before the turn auto-sends. */
 const TAP_AUTOSTOP_SILENCE_MS = 1100;
+/** MOD #39h: ms of post-transcript quiet before an accepted turn ships to the
+ *  agent. VAD chunks arriving inside this window MERGE into one turn, so a
+ *  natural mid-sentence pause no longer splits (or truncates) the thought.
+ *  Effective pause tolerance ≈ VAD hangover (950ms) + STT (~700ms) + this. */
+const MERGE_WINDOW_MS = 1200;
 
 // MOD #39e: whisper emits literal non-speech tokens for silent/ambient audio —
 // "[BLANK_AUDIO]", "[MUSIC]", "(silence)", "♪♪" — which are NOT the user
@@ -143,6 +151,12 @@ export interface TtsBridge {
   interrupt: () => void;
   isSpeaking: () => boolean;
   speakLocal: (text: string) => void;
+  // === JARVIS MOD #45 (Phase 3): streaming reply surface ===
+  /** Open a stream-fed TTS turn (sentences append, never interrupt). */
+  beginStreamReply?: () => { push: (sentence: string) => void; end: () => void };
+  /** Mark a reply id as already spoken so voice-panel's log effect skips it. */
+  markSpoken?: (id: string) => void;
+  // === END MOD #45 ===
 }
 // === END MOD #36 ===
 
@@ -173,6 +187,13 @@ export interface UseVoiceResult {
   /** voice-panel mirrors useTts.speaking here; falling edge opens follow-up window. */
   notifyTtsSpeaking: (speaking: boolean) => void;
   // === END MOD #36 ===
+  // === JARVIS MOD #88: cancel the in-flight reply (audio-side barge-in is
+  // useTts.interrupt). Already wired into the bridge and the mic press; exposed
+  // so a stop control can call it directly.
+  // OPTIONAL because use-realtime-voice.ts satisfies this same interface and has
+  // no reply stream to cancel — OpenAI's realtime API handles barge-in itself. ===
+  interruptReply?: () => void;
+  // === END MOD #88 ===
   // === JARVIS MOD #38: outbound ids already delivered synchronously by the
   // fast lane — the SSE/backfill consumers must mark-seen-and-skip these so
   // the same reply is never spoken twice. ===
@@ -270,6 +291,27 @@ export function useVoice(): UseVoiceResult {
   const utterInterruptedRef = useRef(false);
   const lastVoiceActivityMsRef = useRef(0);
   const sttBusyRef = useRef(false);
+  // === JARVIS MOD #89 (2026-08-03): transcription lifetime ====================
+  // Both /api/uhs/stt calls were un-abortable and un-gated, so a transcription
+  // that landed after teardown still called setState and — worse, on the tap
+  // path — still called sendText(), shipping a turn the user had already
+  // walked away from. Whisper can take seconds; unmounting the panel or
+  // flipping open-mic off in that window left the request running and its
+  // continuation live.
+  //
+  // Scope is deliberately narrow: this guard is advanced on TEARDOWN only
+  // (unmount / engine stop), NEVER on barge-in. MOD #39g exists precisely
+  // because dropping captured audio reads as "it's removing some of the
+  // transcript" — the user's own speech is the one thing a barge-in must
+  // preserve. Cancelling here would re-introduce that bug wearing a new hat.
+  const sttGuardRef = useRef<TurnGuard | null>(null);
+  if (!sttGuardRef.current) sttGuardRef.current = new TurnGuard();
+  const sttGuard = sttGuardRef.current;
+  // === END MOD #89 ===
+  // MOD #39g: engine STT is SERIALIZED through this chain, never dropped — a
+  // chunk that landed while the previous Whisper call was in flight used to be
+  // discarded wholesale (heard live 2026-07-12 as "missing transcript").
+  const sttChainRef = useRef<Promise<void>>(Promise.resolve());
   // Turn-taking
   const followUpUntilMsRef = useRef(0);
   const hadAgentTurnRef = useRef(false);
@@ -280,6 +322,29 @@ export function useVoice(): UseVoiceResult {
   // === END MOD #38 ===
   const signoffIdxRef = useRef(0);
   const wakeStatsRef = useRef({ accepted: 0, discarded: 0 });
+  // === JARVIS MOD #88 (2026-08-03): the reply lane needs its own turn guard ====
+  // The barge-in path stopped at the TTS boundary: ttsBridge.interrupt() cut the
+  // audio, but the POST to /api/messages/send that PRODUCED that audio had no
+  // AbortController at all, and its NDJSON reader kept looping. Three real
+  // consequences, worst first:
+  //
+  //   1. AUDIBLE. `handle` is created lazily on the first {"t":"s"} line. Barge
+  //      in during the think-time before that line and the next sentence to
+  //      arrive called beginStreamReply() — which begins a NEW TTS turn. JARVIS
+  //      started speaking the reply the user had just interrupted.
+  //   2. STATE. `setState('responding')` / pushAgentReply()'s restState() fire
+  //      when the stream finally ends, overwriting the 'listening' the barge-in
+  //      established — the spinner-limbo the rubric calls out.
+  //   3. TOKENS + BYTES. The generation kept streaming and the escalation ack
+  //      ("On it — give me a minute") still spoke, for a turn already abandoned.
+  //
+  // replyGuard owns one generation per user turn. begin() aborts the previous
+  // reply, so a new turn supersedes the old one for free; every resume point
+  // after an await re-checks isCurrent before touching TTS or state.
+  const replyGuardRef = useRef<TurnGuard | null>(null);
+  if (!replyGuardRef.current) replyGuardRef.current = new TurnGuard();
+  const replyGuard = replyGuardRef.current;
+  // === END MOD #88 ===
   // ===========================================================================
 
   useEffect(() => {
@@ -410,10 +475,20 @@ export function useVoice(): UseVoiceResult {
     setLog((prev) => [...prev, { id, role: 'user', text: trimmed, ts: Date.now() }]);
     setInterim('');
     setState('processing');
+    // === JARVIS MOD #88: one generation per user turn. begin() aborts whatever
+    // reply was still streaming, so asking a second question mid-answer cancels
+    // the first answer instead of racing it. ===
+    const gen = replyGuard.begin();
+    const ac = new AbortController();
+    replyGuard.track(gen, ac);
+    // === END MOD #88 ===
     fetch('/api/messages/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent: AGENT, text: `[Cosmos] ${trimmed}` }),
+      // === JARVIS MOD #45: stream opt-in — the server only streams when
+      // CTX_COSMOS_STREAM=1 is ALSO set, so this flag alone changes nothing. ===
+      body: JSON.stringify({ agent: AGENT, text: `[Cosmos] ${trimmed}`, stream: true }),
+      signal: ac.signal, // === MOD #88 ===
     })
       // === JARVIS MOD #38: consume the synchronous fast-lane reply. The POST
       // response now carries replyText/replyId on a fast-path hit — speak it
@@ -421,10 +496,101 @@ export function useVoice(): UseVoiceResult {
       // instead of waiting up to ~1s for the SSE tail to notice the file.
       // On escalation, speak a local ack so the full-agent wait isn't silent.
       .then(async (r) => {
+        // === JARVIS MOD #88: every early-return below is gated on the turn
+        // still being live. A superseded turn must leave state ALONE — the
+        // barge-in already put the machine in 'listening', and stomping it with
+        // restState()/'responding' is what produced the stuck spinner. ===
+        if (!replyGuard.isCurrent(gen)) return;
         if (!r.ok) {
           setState(restState());
           return;
         }
+
+        // === JARVIS MOD #45 (Phase 3): NDJSON sentence stream ================
+        // {"t":"s",...} lines are spoken the moment they arrive (via the TTS
+        // stream turn, which QUEUES segments instead of interrupting); the
+        // {"t":"final",...} line carries the same payload as the classic JSON
+        // response. The full text lands in the log once, marked already-spoken
+        // so voice-panel's effect never re-speaks it.
+        if (r.headers.get('content-type')?.includes('application/x-ndjson') && r.body) {
+          let handle: { push: (s: string) => void; end: () => void } | null = null;
+          let spokenWords = 0;
+          let sentencesPushed = 0;
+          let final: {
+            fastpath?: boolean; replyText?: string; replyId?: string;
+            escalated?: boolean; streamed?: number;
+          } | null = null;
+          try {
+            const reader = r.body.getReader();
+            const dec = new TextDecoder();
+            let buf = '';
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              // === JARVIS MOD #88: an aborted reader still hands back whatever
+              // was already buffered before it rejects, so the loop must check
+              // the generation itself rather than trusting abort to end it. ===
+              if (!replyGuard.isCurrent(gen)) {
+                try { await reader.cancel(); } catch { /* already closed */ }
+                return;
+              }
+              buf += dec.decode(value, { stream: true });
+              let nl: number;
+              while ((nl = buf.indexOf('\n')) !== -1) {
+                const line = buf.slice(0, nl).trim();
+                buf = buf.slice(nl + 1);
+                if (!line) continue;
+                let obj: {
+                  t?: string; text?: string; fastpath?: boolean; replyText?: string;
+                  replyId?: string; escalated?: boolean; streamed?: number;
+                };
+                try { obj = JSON.parse(line); } catch { continue; }
+                if (obj.t === 's' && typeof obj.text === 'string') {
+                  // MOD #44 parity: cumulative 50-word safety cap (speak() is
+                  // not the entry point on this path).
+                  if (spokenWords >= 50) continue;
+                  // === JARVIS MOD #88: THE audible barge-in bug. beginStreamReply()
+                  // calls beginTurn() — it does not merely queue, it OPENS a turn.
+                  // Reached from a superseded generation it restarted speech for
+                  // the very reply the user interrupted, seconds after they cut
+                  // it off. Never open a turn for a dead generation. ===
+                  if (!replyGuard.isCurrent(gen)) return;
+                  spokenWords += obj.text.split(/\s+/).length;
+                  if (!handle) handle = ttsBridgeRef.current?.beginStreamReply?.() ?? null;
+                  handle?.push(obj.text);
+                  sentencesPushed += 1;
+                } else if (obj.t === 'final') {
+                  final = obj;
+                }
+              }
+            }
+          } finally {
+            handle?.end();
+          }
+
+          // === JARVIS MOD #88: the stream ended (or was cut). Anything below
+          // speaks or moves the state machine, so a dead generation stops here. ===
+          if (!replyGuard.isCurrent(gen)) return;
+          if (final?.fastpath && final.replyText && final.replyId) {
+            fastReplyIdsRef.current.add(final.replyId);
+            mergeStats({ fastReplies: fastReplyIdsRef.current.size });
+            if (sentencesPushed > 0 && handle) {
+              // Already spoken incrementally — log it without re-speaking.
+              ttsBridgeRef.current?.markSpoken?.(final.replyId);
+            }
+            pushAgentReply(final.replyText, final.replyId);
+            return;
+          }
+          if (final?.escalated) {
+            escalationsRef.current += 1;
+            mergeStats({ escalations: escalationsRef.current });
+            ttsBridgeRef.current?.speakLocal(nextAck());
+          }
+          setState('responding');
+          return;
+        }
+        // === END MOD #45 =====================================================
+
         let payload: {
           fastpath?: boolean;
           replyText?: string;
@@ -435,6 +601,7 @@ export function useVoice(): UseVoiceResult {
           payload = await r.json();
         } catch { /* body optional — fall through to SSE behavior */ }
 
+        if (!replyGuard.isCurrent(gen)) return; // === MOD #88 ===
         if (payload.fastpath && payload.replyText && payload.replyId) {
           fastReplyIdsRef.current.add(payload.replyId);
           mergeStats({ fastReplies: fastReplyIdsRef.current.size });
@@ -450,8 +617,58 @@ export function useVoice(): UseVoiceResult {
         setState('responding');
       })
       // === END MOD #38 ===
-      .catch(() => setState(restState()));
-  }, [restState, pushAgentReply]);
+      // === JARVIS MOD #88: an AbortError here is the barge-in doing its job,
+      // not a failure — restoring rest state would fight the interrupt. ===
+      .catch(() => {
+        if (!replyGuard.isCurrent(gen)) return;
+        setState(restState());
+      })
+      .finally(() => replyGuard.release(ac));
+  }, [restState, pushAgentReply, replyGuard]);
+
+  // === JARVIS MOD #88: barge-in for the reply lane =============================
+  // Aborts the in-flight reply and advances the generation, so nothing that was
+  // already in flight can speak, log, or move the state machine afterwards.
+  // Deliberately does NOT touch TTS — the callers below pair it with the TTS
+  // interrupt, and keeping them separate means muting never cancels a reply.
+  const interruptReply = useCallback(() => {
+    replyGuard.begin();
+  }, [replyGuard]);
+  // === END MOD #88 =============================================================
+
+  // === JARVIS MOD #39h: turn aggregation ======================================
+  // VAD chunk boundaries are STT boundaries, NOT message boundaries. The engine
+  // cuts audio after ~950ms of silence (good: fast transcription, fast wake
+  // detection), but shipping each chunk to the agent made every natural pause
+  // split the thought — "definitely not a normal dialogue" (Scott, 2026-07-12).
+  // Accepted content buffers here and only ships after MERGE_WINDOW_MS of
+  // post-transcript quiet; anything said in the meantime merges into one turn.
+  const pendingTurnRef = useRef('');
+  const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const shipPendingTurn = useCallback(() => {
+    pendingTimerRef.current = null;
+    if (utterSpeechSeenRef.current) {
+      // Mid-speech again — hold the buffer until the next quiet window.
+      pendingTimerRef.current = setTimeout(shipPendingTurn, MERGE_WINDOW_MS);
+      return;
+    }
+    const text = pendingTurnRef.current.trim();
+    pendingTurnRef.current = '';
+    if (text) sendText(text);
+  }, [sendText]);
+
+  const queueTurn = useCallback(
+    (content: string) => {
+      pendingTurnRef.current = pendingTurnRef.current
+        ? `${pendingTurnRef.current} ${content}`
+        : content;
+      if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = setTimeout(shipPendingTurn, MERGE_WINDOW_MS);
+    },
+    [shipPendingTurn],
+  );
+  // ===========================================================================
 
   // === JARVIS MOD #36: the wake gate — every SPOKEN utterance lands here ======
   const handleUtterance = useCallback(
@@ -487,7 +704,17 @@ export function useVoice(): UseVoiceResult {
         } else {
           decision = 'accepted';
           wakeStatsRef.current.accepted += 1;
-          sendText(content);
+          // MOD #39g: an accepted turn OPENS the follow-up window — the VAD
+          // splits long sentences at natural pauses (~950ms), and the tail
+          // chunk arrives with no wake word. Before this, that tail was
+          // discarded as ambient speech (heard live 2026-07-12 as "it's
+          // removing some of the transcript"). Now it rides through as a
+          // follow-up, same as speech within 8s after a TTS reply.
+          followUpUntilMsRef.current = now + FOLLOW_UP_MS;
+          // MOD #39h: buffer + merge instead of send-per-chunk — the agent
+          // gets ONE coherent turn after you actually stop talking.
+          queueTurn(content);
+          setState('listening');
         }
       } else {
         // Not for us — ambient speech without the wake word. No send, but show
@@ -511,13 +738,18 @@ export function useVoice(): UseVoiceResult {
         followUpUntilMs: followUpUntilMsRef.current,
       });
     },
-    [restState, sendText],
+    [restState, queueTurn],
   );
   // ===========================================================================
 
   // === JARVIS MOD #36: open-mic engine ========================================
   const stopOpenMicEngine = useCallback(() => {
     engineRunningRef.current = false;
+    // === JARVIS MOD #89: the engine is going away — abort any Whisper call it
+    // owns and advance the generation so a late transcript can't restart state
+    // on a torn-down engine. ===
+    sttGuard.begin();
+    // === END MOD #89 ===
     cancelAnimationFrame(engineFrameRef.current);
     if (engineRecogRestartRef.current) {
       clearTimeout(engineRecogRestartRef.current);
@@ -542,7 +774,7 @@ export function useVoice(): UseVoiceResult {
     engineCtxRef.current = null;
     setAmplitude(0);
     setInterim('');
-  }, []);
+  }, [sttGuard]);
 
   /** Desktop leg: one continuous recognition session, auto-restarted. */
   const startEngineRecognition = useCallback(() => {
@@ -662,42 +894,56 @@ export function useVoice(): UseVoiceResult {
         startEngineRecorder(engineStreamRef.current);
       }
       // …then transcribe what we captured (unless it was an idle-bound restart).
-      if (discarded || sttBusyRef.current) return;
+      if (discarded) return;
       const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
       if (blob.size < 1000) return;
-      sttBusyRef.current = true;
-      setInterim('Transcribing…');
-      try {
-        const form = new FormData();
-        form.append(
-          'audio',
-          blob,
-          'audio.' + ((recorder.mimeType || '').includes('mp4') ? 'm4a' : 'webm'),
-        );
-        const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
-        const data = (await res.json()) as { transcript?: string };
-        setInterim('');
-        const engineText = meaningfulTranscript(data.transcript); // MOD #39e
-        if (engineText) {
-          // Whisper path has no interim — barge-in check happens here instead.
-          if (ttsBridgeRef.current?.isSpeaking() && containsWakeWord(engineText)) {
-            ttsBridgeRef.current.interrupt();
+      // MOD #39g: queue behind any in-flight Whisper call instead of dropping —
+      // the old `if (sttBusyRef.current) return` silently threw the audio away.
+      sttChainRef.current = sttChainRef.current.then(async () => {
+        sttBusyRef.current = true;
+        // === JARVIS MOD #89: stamp + abortable. `gen` is captured before the
+        // await so a teardown mid-Whisper makes everything below inert. ===
+        const gen = sttGuard.current();
+        const ac = new AbortController();
+        if (!sttGuard.track(gen, ac)) return;
+        // === END MOD #89 ===
+        setInterim('Transcribing…');
+        try {
+          const form = new FormData();
+          form.append(
+            'audio',
+            blob,
+            'audio.' + ((recorder.mimeType || '').includes('mp4') ? 'm4a' : 'webm'),
+          );
+          const res = await fetch('/api/uhs/stt', { method: 'POST', body: form, signal: ac.signal });
+          const data = (await res.json()) as { transcript?: string };
+          if (!sttGuard.isCurrent(gen)) return; // === MOD #89: torn down mid-flight ===
+          setInterim('');
+          const engineText = meaningfulTranscript(data.transcript); // MOD #39e
+          if (engineText) {
+            // Whisper path has no interim — barge-in check happens here instead.
+            if (ttsBridgeRef.current?.isSpeaking() && containsWakeWord(engineText)) {
+              ttsBridgeRef.current.interrupt();
+            }
+            handleUtterance(engineText);
+          } else {
+            setState(restState());
           }
-          handleUtterance(engineText);
-        } else {
+        } catch {
+          // === MOD #89: an abort here is teardown, not a transcription failure. ===
+          if (!sttGuard.isCurrent(gen)) return;
+          setInterim('');
           setState(restState());
+        } finally {
+          sttGuard.release(ac);
+          sttBusyRef.current = false;
         }
-      } catch {
-        setInterim('');
-        setState(restState());
-      } finally {
-        sttBusyRef.current = false;
-      }
+      });
     };
     engineRecorderRef.current = recorder;
     engineRecorderStartedMsRef.current = performance.now();
     recorder.start(1000); // 1s timeslices keep chunks flowing (bounded memory)
-  }, [handleUtterance, restState]);
+  }, [handleUtterance, restState, sttGuard]);
 
   const startOpenMicEngine = useCallback(async () => {
     if (engineRunningRef.current) return;
@@ -773,8 +1019,11 @@ export function useVoice(): UseVoiceResult {
             utterSpeechSeenRef.current = false;
             if (ios) {
               // Utterance boundary: stop → transcribe → auto-restart (onstop).
+              // MOD #39g: no sttBusy guard — the boundary must ALWAYS cut. The
+              // old skip-while-busy left the utterance in the standing blob,
+              // where the 20s idle restart could silently discard it.
               const rec = engineRecorderRef.current;
-              if (rec?.state === 'recording' && !sttBusyRef.current) {
+              if (rec?.state === 'recording') {
                 setState('processing');
                 rec.stop();
               }
@@ -879,8 +1128,23 @@ export function useVoice(): UseVoiceResult {
   const toggleOpenMic = useCallback(() => setOpenMic((v) => !v), []);
 
   const bindTts = useCallback((bridge: TtsBridge) => {
-    ttsBridgeRef.current = bridge;
-  }, []);
+    // === JARVIS MOD #88: decorate rather than store raw, so barge-in is ONE
+    // concept at ONE choke point. Every existing caller of bridge.interrupt()
+    // — the wake-word barge-in in the recognizer, the Whisper-path barge-in,
+    // and anything voice-panel routes through the bridge — now cancels the
+    // in-flight reply as well as the audio. Cutting only the audio left the
+    // generation running: JARVIS went quiet, then spoke the tail of the answer
+    // the user had already talked over. Decorating here keeps the fix inside
+    // this hook (voice-panel belongs to another agent this wave). ===
+    ttsBridgeRef.current = {
+      ...bridge,
+      interrupt: () => {
+        interruptReply();
+        bridge.interrupt();
+      },
+    };
+    // === END MOD #88 ===
+  }, [interruptReply]);
 
   const notifyTtsSpeaking = useCallback(
     (speaking: boolean) => {
@@ -930,11 +1194,19 @@ export function useVoice(): UseVoiceResult {
         }
         setState('processing');
         setInterim('Transcribing…');
+        // === JARVIS MOD #89: the tap path is the dangerous one — a late
+        // transcript here reaches sendText(), which POSTs a real turn to the
+        // agent. Unmount mid-Whisper used to ship it anyway. ===
+        const gen = sttGuard.current();
+        const ac = new AbortController();
+        if (!sttGuard.track(gen, ac)) return;
+        // === END MOD #89 ===
         try {
           const form = new FormData();
           form.append('audio', blob, 'audio.' + (mimeType.includes('mp4') ? 'm4a' : 'webm'));
-          const res = await fetch('/api/uhs/stt', { method: 'POST', body: form });
+          const res = await fetch('/api/uhs/stt', { method: 'POST', body: form, signal: ac.signal });
           const data = (await res.json()) as { transcript?: string; error?: string };
+          if (!sttGuard.isCurrent(gen)) return; // === MOD #89 ===
           setInterim('');
           const tapText = meaningfulTranscript(data.transcript); // MOD #39e
           if (tapText) {
@@ -943,8 +1215,11 @@ export function useVoice(): UseVoiceResult {
             setState(restState());
           }
         } catch {
+          if (!sttGuard.isCurrent(gen)) return; // === MOD #89: abort is teardown ===
           setInterim('');
           setState(restState());
+        } finally {
+          sttGuard.release(ac); // === MOD #89 ===
         }
       };
 
@@ -957,9 +1232,15 @@ export function useVoice(): UseVoiceResult {
     } catch {
       setState(restState());
     }
-  }, [startAmplitude, stopAmplitude, sendText, restState]);
+  }, [startAmplitude, stopAmplitude, sendText, restState, sttGuard]);
 
   const startListening = useCallback(() => {
+    // === JARVIS MOD #88: pressing the mic is a barge-in. voice-panel already
+    // cuts the AUDIO at this site (its own useTts.interrupt() call, which this
+    // hook cannot intercept); the reply that is producing that audio has to go
+    // with it, or the answer keeps generating and lands on top of the new turn. ===
+    interruptReply();
+    // === END MOD #88 ===
     // === JARVIS MOD #36: with open mic ON, the mic button is an attention tap —
     // equivalent to saying "Jarvis": opens the follow-up window, no second
     // stream, no second recognizer (the engine already owns the mic). ===
@@ -1016,9 +1297,17 @@ export function useVoice(): UseVoiceResult {
     recognition.start();
     setState('listening');
     startAmplitude();
-  }, [startAmplitude, stopAmplitude, sendText, startListeningMediaRecorder, restState]);
+  }, [startAmplitude, stopAmplitude, sendText, startListeningMediaRecorder, restState, interruptReply]);
 
   const stopListening = useCallback(() => {
+    // === JARVIS MOD #88: the OTHER half of the mic press. handleMicPress routes
+    // to stopListening whenever the machine is already 'listening' — which, with
+    // open mic on, is the normal state while JARVIS is answering. Wiring only
+    // startListening left that branch un-cancelled: the exact case a live test
+    // caught (the send kept streaming after the tap). Both branches are the user
+    // taking the turn, so both cancel the reply. ===
+    interruptReply();
+    // === END MOD #88 ===
     // === JARVIS MOD #36: attention-tap mode has nothing to stop — close the window. ===
     if (openMicRef.current && engineRunningRef.current) {
       followUpUntilMsRef.current = 0;
@@ -1034,7 +1323,7 @@ export function useVoice(): UseVoiceResult {
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     stopAmplitude();
-  }, [stopAmplitude]);
+  }, [stopAmplitude, interruptReply]);
   // MOD #39c: late-bind for the amplitude tick (defined above stopListening).
   useEffect(() => {
     stopListeningRef.current = stopListening;
@@ -1065,8 +1354,14 @@ export function useVoice(): UseVoiceResult {
       // === JARVIS MOD #36: tear the open-mic engine down with the component ===
       stopOpenMicEngine();
       // === END MOD #36 ===
+      // === JARVIS MOD #88/#89: nothing may outlive the component. Aborts the
+      // in-flight reply POST and any tap-path Whisper call, and advances both
+      // generations so their continuations cannot setState after unmount. ===
+      replyGuard.begin();
+      sttGuard.begin();
+      // === END MOD #88/#89 ===
     };
-  }, [stopAmplitude, stopOpenMicEngine]);
+  }, [stopAmplitude, stopOpenMicEngine, replyGuard, sttGuard]);
 
   return {
     state,
@@ -1087,6 +1382,7 @@ export function useVoice(): UseVoiceResult {
     bindTts,
     notifyTtsSpeaking,
     // === END MOD #36 ===
+    interruptReply, // === MOD #88 ===
     // === JARVIS MOD #38: sync fast-reply dedupe set ===
     fastReplyIdsRef,
     // === END MOD #38 ===

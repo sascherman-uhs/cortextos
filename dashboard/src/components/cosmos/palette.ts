@@ -14,6 +14,23 @@ export const INDIGO = '#6366f1'; // node-web variety
 export const RED = '#f87171'; // error / down status
 export const GREEN = '#34d399'; // online status pulse
 
+// === JARVIS MOD #56 — the ONE warm accent (2026-08-03) ===
+// Trillion rubric item 3: a cool palette with a single warm accent RESERVED for
+// "listening". UHS gold is that accent — it may appear ONLY while the mic is
+// actually hot. Every other piece of idle chrome in this scene stays cool
+// (see COOL_* below); per-agent identity accents in AGENT_ACCENTS are exempt.
+export const GOLD = '#CFB383';
+export const GOLD_DEEP = '#9E7331';
+/** rgba() form for glows/shadows where a hex + alpha is awkward. */
+export const GOLD_RGB = '207, 179, 131';
+
+// Cool chrome: what idle UI used to spend gold on.
+export const COOL_TEXT = '#dbeff2'; // primary text on glass
+export const COOL_DIM = '#8fb8bd'; // secondary/label text
+export const COOL_SURFACE = '#101a22'; // glass fill (Trillion #16171D, cooled)
+export const COOL_LINE = 'rgba(148, 214, 216, 0.22)'; // hairline borders
+// === END JARVIS MOD #56 ===
+
 // Deep-space backdrop. Very dark blue-teal so additive glow reads.
 export const SPACE = '#050b14';
 export const SPACE_2 = '#0a1420';

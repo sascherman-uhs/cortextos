@@ -1,99 +1,33 @@
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { BusPaths } from '../types/index.js';
 import { normalizeOrgName } from '../utils/org.js';
+import {
+  resolveIngestCollection,
+  resolveStore,
+  retrieve,
+  type CallerRole,
+  type RetrievalScope,
+} from '../knowledge/contract.js';
 
 /**
- * Knowledge base integration — calls mmrag.py directly (cross-platform,
- * no bash dependency).  Previously wrapped kb-*.sh bash scripts.
- */
-
-/**
- * Resolve the Python interpreter inside the knowledge-base venv,
- * accounting for Windows vs Unix layout.
- */
-function getVenvPython(frameworkRoot: string): string {
-  const isWin = process.platform === 'win32';
-  const venvBin = isWin ? 'Scripts' : 'bin';
-  const pythonExe = isWin ? 'python.exe' : 'python3';
-  return join(frameworkRoot, 'knowledge-base', 'venv', venvBin, pythonExe);
-}
-
-/**
- * Load .env and secrets.env files the same way the bash scripts did
- * (`set -o allexport && source …`).  Returns a flat key→value map.
- */
-function loadSecretsEnv(frameworkRoot: string, org: string): Record<string, string> {
-  const secretsPath = join(frameworkRoot, 'orgs', org, 'secrets.env');
-  const dotenvPath = join(frameworkRoot, '.env');
-  const vars: Record<string, string> = {};
-  for (const p of [dotenvPath, secretsPath]) {
-    if (existsSync(p)) {
-      for (const line of readFileSync(p, 'utf-8').split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const idx = trimmed.indexOf('=');
-        if (idx > 0) {
-          let val = trimmed.slice(idx + 1);
-          // Strip surrounding quotes (single or double) that some .env files use
-          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-            val = val.slice(1, -1);
-          }
-          vars[trimmed.slice(0, idx)] = val;
-        }
-      }
-    }
-  }
-  return vars;
-}
-
-/**
- * Check whether the knowledge base config file exists for a given env.
+ * Knowledge base integration for the fleet CLI.
  *
- * The Python MMRAG tool loads its config from env.MMRAG_CONFIG
- * (`knowledge-base/config.json` under the org's state dir) and exits with
- * "Config not found. Run setup first" if the file is absent. When that
- * happens, execFileSync throws a non-zero-exit error which — if not caught
- * — produces a user-facing unhandled-throw stack dump on top of the
- * already-printed Python error. This helper lets callers detect the
- * missing-config state UP FRONT and respond gracefully (warn + return)
- * instead of relying on brittle stderr string matching after the throw.
+ * This file used to decide FOR ITSELF which ChromaDB collections a question
+ * should search: a fixed `shared-<org>` (+ `agent-<name>`) list. The dashboard
+ * decided separately, by listing every collection on disk. The two answers
+ * disagreed — the CLI could not reach the `uhs` collection that holds all of
+ * JARVIS's business knowledge, so an agent asking a business question got
+ * nothing the dashboard could answer, and the dashboard handed out private
+ * persona collections to anyone who said `scope=all`.
+ *
+ * Neither decision lives here any more. Collection selection, authorization and
+ * federation are resolved once in `src/knowledge/contract.ts` from
+ * `retrieval-policy.json`. This module is a thin caller that adapts the
+ * contract's response to the CLI's long-standing result shape.
  */
-function kbConfigured(env: Record<string, string>): boolean {
-  return existsSync(env.MMRAG_CONFIG);
-}
-
-/**
- * Build the full env object needed by mmrag.py calls.
- */
-function buildKBEnv(
-  frameworkRoot: string,
-  org: string,
-  instanceId: string,
-  agent?: string,
-): Record<string, string> {
-  // Normalize org to its canonical filesystem casing BEFORE touching any
-  // paths. Without this, a lowercase --org arg produces a ghost state dir
-  // (~/.cortextos/<instance>/orgs/<lowercase>/knowledge-base/) with its own
-  // MMRAG config.json, splitting KB state across two directories and
-  // polluting dashboard sync with hits against a non-existent org.
-  const canonicalOrg = normalizeOrgName(frameworkRoot, org);
-  const kbRoot = join(homedir(), '.cortextos', instanceId, 'orgs', canonicalOrg, 'knowledge-base');
-  const secrets = loadSecretsEnv(frameworkRoot, canonicalOrg);
-  return {
-    ...process.env as Record<string, string>,
-    ...secrets,
-    CTX_ORG: canonicalOrg,
-    CTX_AGENT_NAME: agent || '',
-    CTX_INSTANCE_ID: instanceId,
-    CTX_FRAMEWORK_ROOT: frameworkRoot,
-    MMRAG_DIR: kbRoot,
-    MMRAG_CHROMADB_DIR: join(kbRoot, 'chromadb'),
-    MMRAG_CONFIG: join(kbRoot, 'config.json'),
-  };
-}
 
 export interface KBQueryResult {
   content: string;
@@ -112,8 +46,12 @@ export interface KBQueryResponse {
 }
 
 /**
- * Query the knowledge base.
- * Returns parsed JSON results when --json is used internally.
+ * Query the knowledge base through the ONE retrieval contract.
+ *
+ * `role` defaults defensively: a process running as an agent (CTX_AGENT_NAME
+ * set, which the daemon does for every persona worker) gets the `agent` role
+ * and can never read another persona's private collection. An interactive
+ * terminal with no agent identity is the operator.
  */
 export function queryKnowledgeBase(
   paths: BusPaths,
@@ -121,121 +59,107 @@ export function queryKnowledgeBase(
   options: {
     org: string;
     agent?: string;
-    scope?: 'shared' | 'private' | 'all';
+    scope?: RetrievalScope;
     topK?: number;
     threshold?: number;
     frameworkRoot: string;
     instanceId: string;
+    role?: CallerRole;
+    /** JARVIS repo root, enabling the registry and document layers. */
+    jarvisRoot?: string;
   },
 ): KBQueryResponse {
   const { agent, scope = 'all', topK = 5, threshold = 0.5, frameworkRoot, instanceId } = options;
   // Normalize once at the top so every downstream path join, env var, and
   // ChromaDB collection name uses the canonical filesystem casing. Without
-  // this, `shared-acmecorp` and `shared-AcmeCorp` become two
-  // distinct ChromaDB collections and a case-drifted query silently hits
-  // the wrong one.
+  // this, `shared-acmecorp` and `shared-AcmeCorp` become two distinct
+  // ChromaDB collections and a case-drifted query silently hits the wrong one.
   const org = normalizeOrgName(frameworkRoot, options.org);
 
-  const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
-
-  // UX safety net: if the KB is not configured for this org (no config.json
-  // on disk yet), skip the python probe entirely and return empty results
-  // with a visible warning. Previously the inner runQuery() try/catch would
-  // swallow the Config-not-found error silently and the operator would see
-  // "0 results" with no hint about WHY — indistinguishable from a legitimate
-  // empty query against a configured KB. The warn-and-empty shape makes the
-  // distinction obvious and actionable.
-  if (!kbConfigured(env)) {
+  const store = { frameworkRoot, instanceId, org, agent };
+  const resolved = resolveStore(store);
+  if (!resolved.configured) {
+    // UX safety net: distinguish "the KB is not set up" from "the KB is set up
+    // and this question genuinely has no answer". Both used to print 0 results.
     console.warn(
-      `[kb] Knowledge base not configured for org ${org}. Returning empty results — run setup to enable.`,
+      `[kb] Knowledge base not available for org ${org}: ${resolved.reason}. `
+      + `Returning empty results — run setup to enable.`,
     );
     return { results: [], total: 0, query: question, collection: `shared-${org}` };
   }
 
-  const pythonPath = getVenvPython(frameworkRoot);
-  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+  const role: CallerRole =
+    options.role ?? (process.env.CTX_AGENT_NAME ? 'agent' : 'operator');
 
-  // Determine which collections to query based on scope
-  const collections: string[] = [];
-  switch (scope) {
-    case 'shared':
-      collections.push(`shared-${org}`);
-      break;
-    case 'private':
-      collections.push(agent ? `agent-${agent}` : `shared-${org}`);
-      break;
-    case 'all':
-      collections.push(`shared-${org}`);
-      if (agent) collections.push(`agent-${agent}`);
-      break;
-  }
+  const response = retrieve({
+    question,
+    caller: { surface: 'cli', role, org, agent },
+    scope,
+    topK,
+    threshold,
+    store,
+    roots: { jarvisRoot: options.jarvisRoot ?? process.env.UHS_JARVIS_ROOT },
+    // The CLI answer stays semantic-only so its result shape is unchanged for
+    // existing consumers; `cortextos bus kb-context` exposes the full contract.
+    layers: ['semantic'],
+  });
 
-  const runQuery = (col: string): string | null => {
-    try {
-      return execFileSync(pythonPath, [
-        mmragPath, 'query', question,
-        '--collection', col,
-        '--top-k', String(topK),
-        '--threshold', String(threshold),
-        '--json',
-      ], {
-        encoding: 'utf-8',
-        timeout: 30000,
-        env,
-      });
-    } catch {
-      return null;
-    }
+  return {
+    results: response.results.map((hit) => ({
+      content: hit.content,
+      source_file: hit.citation.canonicalSource,
+      org,
+      agent_name: agent,
+      score: hit.citation.score,
+      doc_type: hit.citation.layer === 'semantic' ? 'markdown' : hit.citation.layer,
+    })),
+    total: response.total,
+    query: question,
+    collection:
+      response.collectionsSearched.length === 1
+        ? response.collectionsSearched[0]
+        : `shared-${org}`,
   };
+}
 
-  const parseOutput = (output: string | null): KBQueryResult[] => {
-    if (!output) return [];
-    // mmrag.py --json outputs pretty-printed JSON; find and parse the JSON block
-    const trimmed = output.trim();
-    const jsonStart = trimmed.indexOf('{');
-    if (jsonStart === -1) return [];
-    try {
-      const raw = JSON.parse(trimmed.slice(jsonStart)) as {
-        results?: Array<{ content?: string; result?: string; similarity?: number; source?: string; type?: string }>;
-        result_count?: number;
-        query?: string;
-        collection?: string;
-      };
-      return (raw.results || []).map((r) => ({
-        content: r.content || r.result || '',
-        source_file: r.source || '',
-        org,
-        agent_name: agent,
-        score: r.similarity ?? 0,
-        doc_type: r.type || 'markdown',
-      }));
-    } catch {
-      return [];
-    }
-  };
-
-  try {
-    let allResults: KBQueryResult[] = [];
-    let lastCollection = `shared-${org}`;
-    for (const col of collections) {
-      const output = runQuery(col);
-      allResults = allResults.concat(parseOutput(output));
-      lastCollection = col;
-    }
-
-    if (allResults.length > 0) {
-      return {
-        results: allResults,
-        total: allResults.length,
-        query: question,
-        collection: collections.length === 1 ? lastCollection : `shared-${org}`,
-      };
-    }
-  } catch {
-    // Failed — return empty
-  }
-
-  return { results: [], total: 0, query: question, collection: `shared-${org}` };
+/**
+ * Query the knowledge base and return the FULL contract response — ordered
+ * layers, citations, denied collections, retired-guidance warnings and an
+ * explicit uncertainty statement when nothing was found. This is what skills
+ * and interactive agents should use; `queryKnowledgeBase` is the legacy shape.
+ */
+export function retrieveKnowledge(options: {
+  question: string;
+  org: string;
+  agent?: string;
+  role?: CallerRole;
+  scope?: RetrievalScope;
+  topK?: number;
+  threshold?: number;
+  frameworkRoot: string;
+  instanceId: string;
+  jarvisRoot?: string;
+}) {
+  const org = normalizeOrgName(options.frameworkRoot, options.org);
+  return retrieve({
+    question: options.question,
+    caller: {
+      surface: 'cli',
+      role: options.role ?? (process.env.CTX_AGENT_NAME ? 'agent' : 'operator'),
+      org,
+      agent: options.agent,
+    },
+    scope: options.scope ?? 'all',
+    topK: options.topK ?? 10,
+    threshold: options.threshold ?? 0.5,
+    store: {
+      frameworkRoot: options.frameworkRoot,
+      instanceId: options.instanceId,
+      org,
+      agent: options.agent,
+    },
+    roots: { jarvisRoot: options.jarvisRoot ?? process.env.UHS_JARVIS_ROOT },
+  });
 }
 
 /**
@@ -256,17 +180,15 @@ export function ingestKnowledgeBase(
   // Normalize once (see queryKnowledgeBase for rationale).
   const org = normalizeOrgName(frameworkRoot, options.org);
 
-  const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+  const resolved = resolveStore({ frameworkRoot, instanceId, org, agent });
 
   // Correctness fix: if the KB is not configured for this org, the underlying
   // python MMRAG tool exits with "Config not found. Run setup first" and
   // execFileSync (below, stdio: inherit) throws a non-zero-exit error. That
   // throw used to bubble up through the CLI action handler as an unhandled
   // exception, dumping a full Node stack trace on top of the python error
-  // message — ugly and alarming for operators who were just running ingest
-  // without setting up the KB first. Detect the missing-config state
-  // up-front and warn-and-skip instead of letting execFileSync crash.
-  if (!kbConfigured(env)) {
+  // message. Detect the missing-config state up-front and warn-and-skip.
+  if (!resolved.configured) {
     console.warn(
       `[kb] Knowledge base not configured for org ${org}. Skipping ingest — ` +
       `run setup to enable (see HEARTBEAT.md step 10 for the config path).`,
@@ -274,17 +196,14 @@ export function ingestKnowledgeBase(
     return;
   }
 
-  const pythonPath = getVenvPython(frameworkRoot);
-  const mmragPath = join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
+  const pythonPath = resolved.python;
+  const mmragPath = resolved.mmrag;
+  const env = resolved.env;
 
-  // Determine collection name (same logic as kb-ingest.sh)
-  let collection: string;
-  if (scope === 'private') {
-    if (!agent) throw new Error('--agent or CTX_AGENT_NAME required for --scope private');
-    collection = `agent-${agent}`;
-  } else {
-    collection = `shared-${org}`;
-  }
+  // Collection naming is policy, resolved in the contract — never spelled out
+  // here, so ingest and retrieval can never disagree about what a collection
+  // is called.
+  const collection = resolveIngestCollection({ org, agent }, scope);
 
   // Ensure chromadb dir exists
   const kbRoot = join(homedir(), '.cortextos', instanceId, 'orgs', org, 'knowledge-base');

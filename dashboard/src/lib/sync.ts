@@ -4,6 +4,7 @@
 import fs from 'fs';
 import path from 'path';
 import { db } from './db';
+import { recordSourceHealth } from './data/source-health';
 import {
   CTX_ROOT,
   getOrgs,
@@ -44,16 +45,25 @@ function markSynced(filePath: string): void {
 
 export function syncTasks(org: string): number {
   const taskDir = getTaskDir(org);
+  const source = `cortexos://tasks?org=${org}`;
   console.log(`[sync] syncTasks org=${org} dir=${taskDir} exists=${fs.existsSync(taskDir)}`);
-  if (!fs.existsSync(taskDir)) return 0;
+  if (!fs.existsSync(taskDir)) {
+    // A missing directory is an unreadable source, not an empty one. Reporting
+    // it as 0 synced rows is how a vanished mount reads as "no work today".
+    recordSourceHealth(source, 'unavailable', {
+      error: `task dir missing: ${taskDir}`,
+    });
+    return 0;
+  }
 
   let synced = 0;
+  let failed = 0;
 
   const upsert = db.prepare(`
     INSERT OR REPLACE INTO tasks
-      (id, title, description, status, priority, assignee, org, project, needs_approval, created_at, updated_at, completed_at, notes, source_file)
+      (id, title, description, status, priority, assignee, org, project, needs_approval, created_at, updated_at, completed_at, notes, source_file, version)
     VALUES
-      (@id, @title, @description, @status, @priority, @assignee, @org, @project, @needs_approval, @created_at, @updated_at, @completed_at, @notes, @source_file)
+      (@id, @title, @description, @status, @priority, @assignee, @org, @project, @needs_approval, @created_at, @updated_at, @completed_at, @notes, @source_file, @version)
   `);
 
   const files = fs.readdirSync(taskDir).filter((f) => f.endsWith('.json'));
@@ -85,10 +95,16 @@ export function syncTasks(org: string): number {
           completed_at: task.completed_at ?? null,
           notes: task.notes ?? null,
           source_file: filePath,
+          // OS-02: carry the record's version through to the cache so the board
+          // can send expectedVersion and get a 409 instead of a blind write.
+          version: Number.isFinite(Number(task.version)) ? Number(task.version) : 1,
         });
         markSynced(filePath);
         synced++;
       } catch (err) {
+        // The file exists but could not be parsed. It stays in activePaths, so
+        // the prune below does NOT treat it as deleted.
+        failed++;
         console.error(`[sync] Failed to sync task ${file}:`, err);
       }
     }
@@ -110,7 +126,20 @@ export function syncTasks(org: string): number {
     }
   });
 
-  run();
+  try {
+    run();
+  } catch (err) {
+    // The whole transaction rolled back: no upserts, and critically no prune.
+    // Last-good rows survive and the source is reported unavailable.
+    recordSourceHealth(source, 'unavailable', { error: String(err) });
+    console.error('[sync] syncTasks transaction failed:', err);
+    return 0;
+  }
+
+  recordSourceHealth(source, failed > 0 ? 'partial' : 'fresh', {
+    rowCount: files.length,
+    error: failed > 0 ? `${failed} of ${files.length} task files could not be parsed` : null,
+  });
   return synced;
 }
 

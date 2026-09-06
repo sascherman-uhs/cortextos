@@ -94,6 +94,13 @@ export const dashboardCommand = new Command('dashboard')
     const supaUrl = process.env.SUPABASE_URL || dashCreds['SUPABASE_URL'];
     const supaKey = process.env.SUPABASE_KEY || dashCreds['SUPABASE_KEY'];
 
+    // OpenAI Realtime Voice (MOD #50): env > dashboard.env — same drop-on-restart
+    // failure mode as AUTH_URL/SUPABASE_* above, so persist the same way.
+    const openaiApiKey = process.env.OPENAI_API_KEY || dashCreds['OPENAI_API_KEY'];
+    const openaiRealtimeModel = process.env.OPENAI_REALTIME_MODEL || dashCreds['OPENAI_REALTIME_MODEL'];
+    const openaiRealtimeVoice = process.env.OPENAI_REALTIME_VOICE || dashCreds['OPENAI_REALTIME_VOICE'];
+    const realtimeVoiceFlag = process.env.NEXT_PUBLIC_CTX_REALTIME_VOICE || dashCreds['NEXT_PUBLIC_CTX_REALTIME_VOICE'];
+
     // ─── Install dashboard deps ───────────────────────────────────────────────
 
     if (options.install || !existsSync(join(dashboardDir, 'node_modules'))) {
@@ -137,6 +144,10 @@ export const dashboardCommand = new Command('dashboard')
       ...(authUrl ? [`AUTH_URL=${authUrl}`] : []),
       ...(supaUrl ? [`SUPABASE_URL=${supaUrl}`] : []),
       ...(supaKey ? [`SUPABASE_KEY=${supaKey}`] : []),
+      ...(openaiApiKey ? [`OPENAI_API_KEY=${openaiApiKey}`] : []),
+      ...(openaiRealtimeModel ? [`OPENAI_REALTIME_MODEL=${openaiRealtimeModel}`] : []),
+      ...(openaiRealtimeVoice ? [`OPENAI_REALTIME_VOICE=${openaiRealtimeVoice}`] : []),
+      ...(realtimeVoiceFlag ? [`NEXT_PUBLIC_CTX_REALTIME_VOICE=${realtimeVoiceFlag}`] : []),
     ];
     writeFileSync(nextEnvPath, nextEnvLines.join('\n') + '\n', 'utf-8');
     try { chmodSync(nextEnvPath, 0o600); } catch { /* ignore on Windows */ }

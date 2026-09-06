@@ -47,7 +47,20 @@ export interface Heartbeat {
 
 // -- Task Types --
 
-export type TaskStatus = 'pending' | 'in_progress' | 'blocked' | 'completed';
+// Native statuses the cache actually holds. 'failed' and 'cancelled' were
+// missing here even though both the Supabase source and the SQLite cache carry
+// them, so every consumer that switched on TaskStatus silently ignored them.
+// The string fallback is deliberate: the projector preserves unrecognised
+// source statuses rather than flattening them, and the type must not lie about
+// that. See lib/data/task-projection.ts.
+export type TaskStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'blocked'
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+  | (string & {});
 export type TaskPriority = 'critical' | 'urgent' | 'high' | 'normal' | 'low';
 
 export interface TaskOutput {
@@ -72,6 +85,13 @@ export interface Task {
   notes?: string;
   source_file?: string;
   outputs?: TaskOutput[];
+  /** OS-02 optimistic concurrency. Echo it back as `expectedVersion` on a
+   *  write; a mismatch is a 409 carrying the current record, never a silent
+   *  overwrite. */
+  version?: number;
+  /** Which store owns this record — the canonical source identity the contract
+   *  and the transition service route on. */
+  source?: 'cortexos_tasks' | 'jarvis_tasks';
 }
 
 // -- Approval Types --
@@ -195,10 +215,17 @@ export interface SSEEvent {
 export interface TaskFilters {
   org?: string;
   agent?: string;
+  /** Ownership filter for a named human, resolved via the shared person map. */
+  person?: 'scott' | 'angelic' | 'raquel';
   priority?: string;
-  status?: string;
+  /** A single native status, or several (e.g. the waiting lane's blocked+failed). */
+  status?: string | string[];
+  /** Restrict to rows with no routable owner (unassigned recovery). */
+  unassignedOnly?: boolean;
   project?: string;
   search?: string;
+  /** 'today' scopes completed_at to the current UTC day — same window as getTasksCompletedToday(). */
+  date?: 'today';
 }
 
 // -- Health Summary --

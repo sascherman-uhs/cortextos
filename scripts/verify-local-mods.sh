@@ -336,6 +336,39 @@ check "quota exhaustion message says quota not rate limit (MOD #12)" \
 
 echo ""
 
+# ─── MOD #13: Deepgram Nova-3 primary transcriber, whisper.cpp fallback ───────
+echo "── MOD #13: Deepgram speech-in with whisper fallback"
+check "transcribe.ts has Deepgram helper (MOD #13)" \
+  "$CORTEXTOS_ROOT/src/telegram/transcribe.ts" \
+  "transcribeViaDeepgram"
+check "transcribe.ts calls Deepgram before whisper (MOD #13)" \
+  "$CORTEXTOS_ROOT/src/telegram/transcribe.ts" \
+  "UHS MOD #13"
+
+echo ""
+
+# ─── MOD #42: Deepgram Nova-3 primary for /jarvis web STT, whisper.cpp fallback ─
+echo "── MOD #42: Deepgram speech-in for Cosmos web voice (/api/uhs/stt)"
+check "stt route has Deepgram helper (MOD #42)" \
+  "$DASHBOARD_ROOT/src/app/api/uhs/stt/route.ts" \
+  "transcribeViaDeepgram"
+check "stt route tries Deepgram before whisper (MOD #42)" \
+  "$DASHBOARD_ROOT/src/app/api/uhs/stt/route.ts" \
+  "JARVIS MOD #42"
+
+echo ""
+
+# ─── MOD #43: KB read paths must not create phantom empty collections ────────
+echo "── MOD #43: mmrag read paths no longer auto-create collections"
+check "cortextos mmrag.py has create= param (MOD #43)" \
+  "$CORTEXTOS_ROOT/knowledge-base/scripts/mmrag.py" \
+  "def get_chroma_collection(collection_name=\"default\", create=True)"
+check "skill mmrag.py has create= param (MOD #43)" \
+  "$HOME/.claude/skills/multimodal-rag/scripts/mmrag.py" \
+  "def get_chroma_collection(collection_name=\"default\", create=True)"
+
+echo ""
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════════════════╗"
 if [[ $FAIL -eq 0 ]]; then

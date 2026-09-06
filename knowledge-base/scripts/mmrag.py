@@ -333,13 +333,25 @@ def describe_media(client, config, file_path, media_type="video"):
 # ---------------------------------------------------------------------------
 # ChromaDB
 # ---------------------------------------------------------------------------
-def get_chroma_collection(collection_name="default"):
+def get_chroma_collection(collection_name="default", create=True):
+    """Fetch a ChromaDB collection.
+
+    create=True (ingest paths) creates the collection if missing.
+    create=False (read paths: query/status/list/delete) returns None if the
+    collection doesn't exist — merely reading must never materialize an empty
+    phantom collection (e.g. agent-<name> scopes queried before first ingest).
+    """
     import chromadb
     client = chromadb.PersistentClient(path=str(CHROMADB_DIR))
-    return client.get_or_create_collection(
-        name=collection_name,
-        metadata={"hnsw:space": "cosine"},
-    )
+    if create:
+        return client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+    try:
+        return client.get_collection(name=collection_name)
+    except Exception:
+        return None
 
 
 def get_chroma_client():
@@ -1199,9 +1211,9 @@ def cmd_query(args):
     config = load_config()
     client = get_genai_client(get_api_key(config))
     collection_name = args.collection or config.get("default_collection", "default")
-    collection = get_chroma_collection(collection_name)
+    collection = get_chroma_collection(collection_name, create=False)
 
-    if collection.count() == 0:
+    if collection is None or collection.count() == 0:
         print("Knowledge base is empty. Ingest some files first.")
         return
 
@@ -1424,8 +1436,8 @@ def cmd_status(args):
     collection_name = args.collection or config.get("default_collection", "default")
 
     try:
-        collection = get_chroma_collection(collection_name)
-        count = collection.count()
+        collection = get_chroma_collection(collection_name, create=False)
+        count = collection.count() if collection is not None else 0
     except Exception:
         count = 0
 
@@ -1462,8 +1474,10 @@ def cmd_list(args):
     collection_name = args.collection or config.get("default_collection", "default")
 
     try:
-        collection = get_chroma_collection(collection_name)
+        collection = get_chroma_collection(collection_name, create=False)
     except Exception:
+        collection = None
+    if collection is None:
         print("No data found.")
         return
 
@@ -1506,7 +1520,10 @@ def cmd_collections(args):
 def cmd_delete(args):
     config = load_config()
     collection_name = args.collection or config.get("default_collection", "default")
-    collection = get_chroma_collection(collection_name)
+    collection = get_chroma_collection(collection_name, create=False)
+    if collection is None:
+        print(f"Collection not found: {collection_name}")
+        return
 
     source_path = str(Path(args.path).resolve())
     all_data = collection.get(include=["metadatas"])

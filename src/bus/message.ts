@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, renameSync, statSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { createHmac, timingSafeEqual } from 'crypto';
 import type { InboxMessage, Priority, BusPaths } from '../types/index.js';
 import { PRIORITY_MAP } from '../types/index.js';
@@ -7,6 +7,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { acquireLock, releaseLock } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateAgentName, validatePriority } from '../utils/validate.js';
+import { supersedeMessageFile, supersedeNotice } from './inbox-supersede.js';
 
 // ---------------------------------------------------------------------------
 // Security (H10): HMAC-SHA256 message signing
@@ -125,6 +126,40 @@ export function checkInbox(paths: BusPaths): InboxMessage[] {
       try {
         const content = readFileSync(srcPath, 'utf-8');
         const msg: InboxMessage = JSON.parse(content);
+
+        // fix8: a superseded message is not work.
+        //
+        // `supersedeMessagesForTask` normally moves these out of the queue
+        // entirely, so this branch should never fire in the ordinary flow. It
+        // exists for the case that flow cannot cover: a file copied back into
+        // an inbox by hand, restored from a backup, or delivered by a writer
+        // that predates the sweep. Delivering it would put an instruction about
+        // finished work back in front of an agent, which is the whole defect.
+        // It is moved to `superseded/<agent>/` rather than dropped — the record
+        // of it having been sent survives, and a human can still read it.
+        const marker = (msg as unknown as { superseded?: Record<string, unknown> }).superseded;
+        if (marker && typeof marker === 'object') {
+          const agent = basename(inbox);
+          const dest = join(paths.ctxRoot, 'superseded', agent);
+          supersedeMessageFile(
+            srcPath,
+            dest,
+            marker,
+            typeof msg.text === 'string' && msg.text.startsWith('SUPERSEDED')
+              ? msg.text
+              : supersedeNotice(
+                  {
+                    taskId: String(marker.task_id ?? 'unknown'),
+                    cause: (marker.cause as never) ?? 'cancelled',
+                    actor: String(marker.actor ?? 'unknown'),
+                    reason: (marker.reason as string) ?? null,
+                    title: (marker.title as string) ?? null,
+                  },
+                  String(marker.at ?? new Date().toISOString()),
+                ),
+          );
+          continue;
+        }
 
         // Security (H10): Verify HMAC signature if key is available and message has sig.
         if (signingKey && msg.sig) {

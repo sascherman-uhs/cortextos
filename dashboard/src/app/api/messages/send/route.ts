@@ -2,8 +2,10 @@ import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getCTXRoot, getAllAgents } from '@/lib/config';
-import { tryFastReply } from '@/lib/fastpath/fast-reply';
+import { tryFastReply, tryFastReplyStream } from '@/lib/fastpath/fast-reply';
 import { buildWindow } from '@/lib/fastpath/conversation-window';
+// === JARVIS MOD #53 — shared deterministic goodbye detector ===
+import { isSignoff, signoffLine } from '@/lib/voice/signoff';
 
 export const dynamic = 'force-dynamic';
 
@@ -52,6 +54,67 @@ function appendOutbound(ctxRoot: string, agent: string, text: string): string {
   fs.appendFileSync(path.join(logDir, 'outbound-messages.jsonl'), entry + '\n');
   return messageId;
 }
+
+// === JARVIS MOD #45 (Phase 3): shared inbox delivery + escalation recap ======
+// Pulled out of POST so the streaming (NDJSON) branch and the classic JSON
+// branch deliver to the agent inbox through the exact same code.
+
+function deliverToInbox(
+  ctxRoot: string,
+  agent: string,
+  from: string,
+  messageId: string,
+  inboxText: string,
+  epochMs: number,
+  rand: string,
+): void {
+  // Priority 2 = normal (matches bus/send-message.sh mapping)
+  const filename = `2-${epochMs}-from-${from}-${rand}.json`;
+  const inboxDir = path.join(ctxRoot, 'inbox', agent);
+  const tmpPath = path.join(inboxDir, `.tmp.${filename}`);
+  const finalPath = path.join(inboxDir, filename);
+  try {
+    if (!fs.existsSync(inboxDir)) fs.mkdirSync(inboxDir, { recursive: true });
+    const message = {
+      id: messageId,
+      from,
+      to: agent,
+      priority: 'normal',
+      timestamp: new Date().toISOString(),
+      text: inboxText,
+      reply_to: null,
+    };
+    // Atomic write: temp file then rename (same pattern as send-message.sh)
+    fs.writeFileSync(tmpPath, JSON.stringify(message) + '\n');
+    fs.renameSync(tmpPath, finalPath);
+  } catch (err) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    throw err;
+  }
+  // Wake the target agent's fast-checker instantly via SIGUSR1
+  const pidFile = path.join(ctxRoot, 'state', agent, '.fast-checker.pid');
+  if (fs.existsSync(pidFile)) {
+    try {
+      const pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
+      if (pid > 0) process.kill(pid, 'SIGUSR1');
+    } catch { /* Fast-checker may not be running */ }
+  }
+}
+
+/** Recent fast-path exchange, given to the full agent on escalation (plan B4). */
+function buildEscalationRecap(agent: string): string {
+  try {
+    const recent = buildWindow(agent, 6).slice(0, -1); // exclude the current turn
+    if (recent.length) {
+      return (
+        '\nRecent voice exchange (some replies were answered by the fast path, not you):\n' +
+        recent.map((t) => `${t.role === 'user' ? 'Scott' : 'Reply'}: ${t.content}`).join('\n')
+      );
+    }
+  } catch { /* recap is best-effort */ }
+  return '';
+}
+// === END MOD #45 =============================================================
 
 export async function POST(request: NextRequest) {
   let body: Record<string, unknown>;
@@ -113,6 +176,111 @@ export async function POST(request: NextRequest) {
     } catch { /* logging failure must not block the message */ }
 
     const userText = text.slice(COSMOS_PREFIX.length).trim();
+
+    // === JARVIS MOD #53 — server-side goodbye gate (defense in depth) ========
+    // The open-mic client already runs this detector before sending (MOD #36),
+    // so in the normal path this never fires. It exists for the turns that skip
+    // that check entirely — typed input, the test seams, and any future client —
+    // where a "thanks" would otherwise buy a full Haiku call for nothing.
+    // `hadAgentTurn` is derived from the conversation window rather than trusted
+    // from the client, so the very first thing said is still never swallowed.
+    let hadAgentTurn = false;
+    try {
+      hadAgentTurn = buildWindow(agent, 6).some((t) => t.role === 'assistant');
+    } catch { /* window read is best-effort; false keeps us on the reply path */ }
+    if (isSignoff(userText, hadAgentTurn)) {
+      const line = signoffLine(Date.now());
+      let replyId: string | undefined;
+      try {
+        replyId = appendOutbound(ctxRoot, agent, line);
+      } catch (err) {
+        console.error('[api/messages/send] signoff outbound append failed:', err);
+      }
+      return Response.json(
+        { success: true, messageId, fastpath: true, signoff: true, latencyMs: 0, replyText: line, replyId },
+        { status: 200 },
+      );
+    }
+    // === END MOD #53 =========================================================
+
+    // === JARVIS MOD #45 (Phase 3): sentence-streaming fast path ==============
+    // Gated by CTX_COSMOS_STREAM=1 (server env, no code deploy to toggle) AND
+    // the client opting in with body.stream === true — old clients get the
+    // classic JSON response untouched. Response is NDJSON:
+    //   {"t":"s","text":"<sentence>"}   zero or more, as boundaries land
+    //   {"t":"final", ...}              exactly once; same fields as the JSON
+    //                                   response, plus streamed:<n>
+    // History is unchanged: exactly one full-text line lands in
+    // outbound-messages.jsonl, so SSE/backfill/Telegram views stay identical.
+    const wantStream =
+      process.env.CTX_COSMOS_STREAM === '1' && (body as { stream?: boolean }).stream === true;
+    if (wantStream) {
+      const encoder = new TextEncoder();
+      const org = agentEntry.org;
+      const ndjson = new ReadableStream({
+        async start(ctrl) {
+          let closed = false;
+          // Guard: if the client disconnects mid-stream the controller goes
+          // invalid — wrap every enqueue so we never throw into the catch-falls
+          // that would incorrectly route a successful fast reply to the inbox.
+          const send = (obj: Record<string, unknown>) => {
+            if (closed) return;
+            try {
+              ctrl.enqueue(encoder.encode(JSON.stringify(obj) + '\n'));
+            } catch { /* client gone — ignore, reply is in outbound-messages.jsonl */ }
+          };
+          const close = () => {
+            if (closed) return;
+            closed = true;
+            try { ctrl.close(); } catch { /* already closed */ }
+          };
+          let streamed = 0;
+          const result = await tryFastReplyStream(agent, org, userText, (sentence) => {
+            streamed += 1;
+            send({ t: 's', text: sentence });
+          });
+
+          if (result.kind === 'reply') {
+            // appendOutbound first — reply is durable even if client is gone.
+            let replyId: string | undefined;
+            try {
+              replyId = appendOutbound(ctxRoot, agent, result.text);
+            } catch (err) {
+              console.error('[api/messages/send] stream outbound append failed:', err);
+            }
+            send({
+              t: 'final', success: true, messageId, fastpath: true,
+              latencyMs: result.latencyMs, replyText: result.text, replyId, streamed,
+            });
+            close();
+            return;
+          }
+          // escalate / unavailable / error → inbox path so the user still gets
+          // an answer (slower, never silent). Only reached on non-reply outcomes.
+          let fallbackText = text;
+          if (result.kind === 'escalate') {
+            fallbackText =
+              `${text}\n\n[fastpath: escalated — this turn needs tools/data/action; ` +
+              `answer via your normal channel routing]${buildEscalationRecap(agent)}`;
+          }
+          try {
+            deliverToInbox(ctxRoot, agent, from, messageId, fallbackText, epochMs, rand);
+            send({ t: 'final', success: true, messageId, escalated: true, streamed });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error('[api/messages/send] Error:', message);
+            send({ t: 'final', success: false, error: 'Failed to send message', streamed });
+          }
+          close();
+        },
+      });
+      return new Response(ndjson, {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+      });
+    }
+    // === END MOD #45 =========================================================
+
     const result = await tryFastReply(agent, agentEntry.org, userText);
 
     if (result.kind === 'reply') {
@@ -141,16 +309,7 @@ export async function POST(request: NextRequest) {
     }
     if (result.kind === 'escalate') {
       // Give the agent the recent fast-path exchange as context (plan B4).
-      let recap = '';
-      try {
-        const recent = buildWindow(agent, 6).slice(0, -1); // exclude the current turn
-        if (recent.length) {
-          recap =
-            '\nRecent voice exchange (some replies were answered by the fast path, not you):\n' +
-            recent.map((t) => `${t.role === 'user' ? 'Scott' : 'Reply'}: ${t.content}`).join('\n');
-        }
-      } catch { /* recap is best-effort */ }
-      inboxText = `${text}\n\n[fastpath: escalated — this turn needs tools/data/action; answer via your normal channel routing]${recap}`;
+      inboxText = `${text}\n\n[fastpath: escalated — this turn needs tools/data/action; answer via your normal channel routing]${buildEscalationRecap(agent)}`;
     }
     // 'unavailable' (no key) / 'error' / failed append → normal path, untouched text.
   }
@@ -162,46 +321,9 @@ export async function POST(request: NextRequest) {
   const escalated = isCosmos;
   // === END MOD #38 ===
 
-  // Priority 2 = normal (matches bus/send-message.sh mapping)
-  const filename = `2-${epochMs}-from-${from}-${rand}.json`;
-
-  const inboxDir = path.join(ctxRoot, 'inbox', agent);
-  const tmpPath = path.join(inboxDir, `.tmp.${filename}`);
-  const finalPath = path.join(inboxDir, filename);
-
   try {
-    // Ensure inbox directory exists
-    if (!fs.existsSync(inboxDir)) {
-      fs.mkdirSync(inboxDir, { recursive: true });
-    }
-
-    // Build message JSON (same schema as bus/send-message.sh)
-    const message = {
-      id: messageId,
-      from: from,
-      to: agent,
-      priority: 'normal',
-      timestamp: new Date().toISOString(),
-      text: inboxText,
-      reply_to: null,
-    };
-
-    // Atomic write: temp file then rename (same pattern as send-message.sh)
-    fs.writeFileSync(tmpPath, JSON.stringify(message) + '\n');
-    fs.renameSync(tmpPath, finalPath);
-
-    // Wake the target agent's fast-checker instantly via SIGUSR1
-    const pidFile = path.join(ctxRoot, 'state', agent, '.fast-checker.pid');
-    if (fs.existsSync(pidFile)) {
-      try {
-        const pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
-        if (pid > 0) {
-          process.kill(pid, 'SIGUSR1');
-        }
-      } catch {
-        // Fast-checker may not be running
-      }
-    }
+    // === JARVIS MOD #45: shared with the streaming branch ===
+    deliverToInbox(ctxRoot, agent, from, messageId, inboxText, epochMs, rand);
 
     // Log the inbound message for history (Cosmos turns were logged above,
     // before the fast-path attempt — don't double-log them).
@@ -224,11 +346,6 @@ export async function POST(request: NextRequest) {
       { status: 200 },
     );
   } catch (err: unknown) {
-    // Clean up temp file on error
-    try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch { /* ignore */ }
-
     const message = err instanceof Error ? err.message : String(err);
     console.error('[api/messages/send] Error:', message);
     return Response.json(

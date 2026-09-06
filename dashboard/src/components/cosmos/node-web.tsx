@@ -11,6 +11,11 @@ import { useMemo, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { NODE_COLORS } from './palette';
+// === JARVIS MOD #70: frozen scene clock ===
+import { sceneTime } from './reduced-motion';
+// === JARVIS MOD #78: shared soft-dot alpha map ===
+import { getSoftDotTexture } from './dot-texture';
+// === END JARVIS MOD #70 ===
 
 interface WebGeometry {
   nodePositions: Float32Array;
@@ -141,6 +146,7 @@ export function NodeWeb({
 }: NodeWebProps) {
   const groupRef = useRef<THREE.Group>(null);
   const nodeMatRef = useRef<THREE.PointsMaterial>(null);
+  const dot = useMemo(() => getSoftDotTexture(), []); // MOD #78
 
   const geo = useMemo(
     () => buildWeb(nodeCount, clusters, radiusMin, radiusMax, linkDist, seed),
@@ -148,14 +154,13 @@ export function NodeWeb({
   );
 
   useFrame((state) => {
+    const t = sceneTime(state.clock.elapsedTime); // MOD #70
     if (groupRef.current) {
-      groupRef.current.rotation.y = state.clock.elapsedTime * driftSpeed;
-      groupRef.current.rotation.x =
-        Math.sin(state.clock.elapsedTime * driftSpeed * 0.5) * 0.08;
+      groupRef.current.rotation.y = t * driftSpeed;
+      groupRef.current.rotation.x = Math.sin(t * driftSpeed * 0.5) * 0.08;
     }
     if (pulse && nodeMatRef.current) {
-      nodeMatRef.current.opacity =
-        nodeOpacity + Math.sin(state.clock.elapsedTime * 0.8) * 0.15;
+      nodeMatRef.current.opacity = nodeOpacity + Math.sin(t * 0.8) * 0.15;
     }
   });
 
@@ -181,6 +186,8 @@ export function NodeWeb({
           opacity={nodeOpacity}
           depthWrite={false}
           blending={THREE.AdditiveBlending}
+          // MOD #78: soft round nodes, not squares.
+          map={dot ?? undefined}
         />
       </points>
       {geo.linePositions.length > 0 && (

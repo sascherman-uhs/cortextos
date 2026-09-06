@@ -6,6 +6,8 @@ import { usePathname } from 'next/navigation';
 import { useOrg } from '@/hooks/use-org';
 import {
   IconLayoutDashboard,
+  IconLayoutKanban,
+  IconSunrise,
   IconListCheck,
   IconShieldCheck,
   IconChartDots3,
@@ -26,13 +28,17 @@ import {
 import { cn } from '@/lib/utils';
 
 const mainTabs = [
-  { label: 'Overview', href: '/', icon: IconLayoutDashboard },
+  // === OS-03 (2026-09-05): Today is the phone's first tab; the board is the
+  // second, because on a phone those are the two screens Scott actually uses. ===
+  { label: 'Today', href: '/', icon: IconSunrise },
+  { label: 'Board', href: '/board', icon: IconLayoutKanban },
   { label: 'Tasks', href: '/tasks', icon: IconListCheck },
-  { label: 'Approvals', href: '/approvals', icon: IconShieldCheck },
-  { label: 'Analytics', href: '/analytics', icon: IconChartDots3 },
 ];
 
 const morePages = [
+  { label: 'Overview', href: '/overview', icon: IconLayoutDashboard },
+  { label: 'Approvals', href: '/approvals', icon: IconShieldCheck },
+  { label: 'Analytics', href: '/analytics', icon: IconChartDots3 },
   { label: 'Agents', href: '/agents', icon: IconRobot },
   { label: 'Comms', href: '/comms', icon: IconMessages },
   { label: 'Activity', href: '/activity', icon: IconActivity },

@@ -1,7 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { Canvas, useThree } from '@react-three/fiber';
+import * as THREE from 'three';
 import { Orb } from './orb';
 import { Particles } from './particles';
 import { PerfToggle, readStoredPerfMode, type PerfMode } from './perf-toggle';
@@ -16,8 +17,15 @@ import { DataPanels } from './data-panels';
 // === JARVIS MOD #29: Trillion cosmic-orb scene layers + palette ===
 import { NebulaBackground, GlowPool } from './nebula';
 import { NodeWeb } from './node-web';
-import { TEAL, CYAN, AQUA, MINT, PURPLE, SPACE } from './palette';
+import { TEAL, CYAN, AQUA, MINT, PURPLE, SPACE, GOLD } from './palette';
 // === END JARVIS MOD #29 ===
+// === JARVIS MOD #58/#62: responsive framing + degradation ===
+import { cameraZForAspect } from './framing';
+import { prefersReducedMotion } from './motion';
+// === JARVIS MOD #70: the frozen-clock switch the whole scene reads ===
+import { setReducedMotion } from './reduced-motion';
+// === END JARVIS MOD #70 ===
+// === END JARVIS MOD #58/#62 ===
 
 // === JARVIS MOD #29: deep-space background replaces UHS charcoal in this scene ===
 const SPACE_BG = SPACE;
@@ -30,38 +38,45 @@ const LOW_PARTICLES = 1000;
 // idle dim teal, listening bright cyan, processing teal→purple drift + helix,
 // responding bright teal. NOTE: the voice hook currently emits only these four
 // states; an 'error' red-shift would slot in here if use-voice ever emits it. ===
+// === JARVIS MOD #56 (2026-08-03): warm/cool inversion. The scene is cool at
+// every state EXCEPT `listening`, which is the one warm moment — UHS gold. The
+// orb, its glow pool, and the mic chrome all shift warm together, and nothing
+// else in the scene is allowed to sit warm at rest (critic defect #3). ===
 const STATE_CORE: Record<VoiceState, string> = {
   // === JARVIS MOD #36: open-mic states — dormant near-dark, wakeListening a
   // quiet ember (hot mic, waiting for its name), speaking brightest. ===
   dormant: TEAL,
   wakeListening: TEAL,
   idle: TEAL,
-  listening: CYAN,
+  listening: GOLD,
   processing: AQUA,
   responding: TEAL,
-  speaking: TEAL,
+  speaking: CYAN,
 };
 const STATE_RIM: Record<VoiceState, string> = {
   dormant: MINT,
   wakeListening: MINT,
   idle: MINT,
-  listening: MINT,
+  listening: '#E0BE86', // gold rim — the warm accent, listening only
   processing: PURPLE,
   responding: MINT,
   speaking: MINT,
 };
+// === END JARVIS MOD #56 ===
 const STATE_BRIGHT: Record<VoiceState, number> = {
   dormant: 0.45,
   wakeListening: 0.6,
   idle: 0.72,
-  listening: 1.05,
+  listening: 0.92,
   processing: 0.95,
   responding: 1.18,
   speaking: 1.25,
   // === END MOD #36 ===
 };
 // Idle breathing amplitude; live mic amplitude scales above this while speaking.
-const IDLE_AMPLITUDE = 0.035;
+// MOD #73: 0.035 → 0.055. At the old value the displacement was measurable but
+// not perceptible against the wireframe's own line density.
+const IDLE_AMPLITUDE = 0.055;
 // === END JARVIS MOD #29 ===
 
 declare global {
@@ -120,6 +135,9 @@ declare global {
       escalations?: number;
       voiceLatency?: { p50: number; p95: number; n: number };
       // === END JARVIS MOD #38 ===
+      // === JARVIS MOD #70: reduced-motion seam (verification asserts on it) ===
+      reducedMotion?: boolean;
+      // === END JARVIS MOD #70 ===
     };
     // === END JARVIS MOD #21 ===
     // === JARVIS MOD #36: micless wake-gate test seam (Playwright drives the
@@ -131,6 +149,35 @@ declare global {
     // === END JARVIS MOD #36 ===
   }
 }
+
+// === JARVIS MOD #58 — responsive camera dolly (2026-08-03) ===
+// The camera sat at a fixed z=6, framed for a 16:10 desktop window. On a
+// portrait phone the horizontal frustum is a third as wide, so the orb
+// overflowed the screen and the agent orbits were cropped entirely (critic
+// defect #7). The dolly keeps the orb at a deliberate fraction of the viewport
+// width at every aspect ratio; agent-orbits.tsx derives its radii from the same
+// pure function, so the two can never disagree.
+function ResponsiveFraming() {
+  const { camera, size } = useThree();
+  useEffect(() => {
+    const cam = camera as THREE.PerspectiveCamera;
+    const aspect = size.height > 0 ? size.width / size.height : 1;
+    cam.position.z = cameraZForAspect(cam.fov ?? 55, aspect);
+    cam.updateProjectionMatrix();
+  }, [camera, size]);
+  return null;
+}
+// === END JARVIS MOD #58 ===
+
+// === JARVIS MOD #62: force one repaint when `dep` changes (reduced-motion) ===
+function RepaintOnChange({ dep, enabled }: { dep: string; enabled: boolean }) {
+  const invalidate = useThree((s) => s.invalidate);
+  useEffect(() => {
+    if (enabled) invalidate();
+  }, [dep, enabled, invalidate]);
+  return null;
+}
+// === END JARVIS MOD #62 ===
 
 export default function Scene() {
   // Start 'high' on both server and first client render to avoid a hydration
@@ -187,6 +234,42 @@ export default function Scene() {
   const { agents, selected, selectedName, onSelect, onClose } = useAgentOrbits();
   // === END JARVIS MOD #22 ===
 
+  // === JARVIS MOD #62 — graceful degradation (2026-08-03, rubric item 11) ===
+  // Two render-budget switches on top of the existing mobile particle culling:
+  //   hidden tab  → frameloop 'never' (a backgrounded /jarvis tab was still
+  //                 driving a full WebGL loop, on a laptop, forever).
+  //   reduced motion → frameloop 'demand'; the scene renders a still frame and
+  //                 re-renders only when voice state actually changes, so the
+  //                 orb still *reads* correctly without any idle animation.
+  const [hidden, setHidden] = useState(false);
+  const [reducedMotion, setReducedMotionState] = useState(false);
+  useEffect(() => {
+    const onVis = () => setHidden(document.visibilityState === 'hidden');
+    onVis();
+    document.addEventListener('visibilitychange', onVis);
+    const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+    // MOD #70: set the module flag BEFORE the React state, so the very next
+    // frame is already frozen rather than waiting on a re-render.
+    const onMotion = () => {
+      const v = prefersReducedMotion();
+      setReducedMotion(v);
+      setReducedMotionState(v);
+      window.__cosmosStats = { ...(window.__cosmosStats ?? {}), reducedMotion: v };
+    };
+    onMotion();
+    mq?.addEventListener?.('change', onMotion);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      mq?.removeEventListener?.('change', onMotion);
+    };
+  }, []);
+  const frameloop: 'always' | 'demand' | 'never' = hidden
+    ? 'never'
+    : reducedMotion
+      ? 'demand'
+      : 'always';
+  // === END JARVIS MOD #62 ===
+
   const lowPerf = mode === 'low';
   const particleCount = lowPerf ? LOW_PARTICLES : HIGH_PARTICLES;
   // Cap dpr in low mode; allow up to 2 in high mode for crisp wireframe.
@@ -212,14 +295,26 @@ export default function Scene() {
   }, [particleCount, voiceState]);
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden" style={{ background: SPACE_BG }}>
+    <div
+      // === JARVIS MOD #55: scopes the shared easing curve + cosmos keyframes
+      // (globals.css) to this scene only. ===
+      data-cosmos=""
+      className="relative h-screen w-screen overflow-hidden"
+      style={{ background: SPACE_BG }}
+    >
       <Canvas
         camera={{ position: [0, 0, 6], fov: 55 }}
         dpr={dpr}
+        frameloop={frameloop}
         gl={{ antialias: mode === 'high' }}
         style={{ background: SPACE_BG }}
       >
         <ambientLight intensity={0.6} />
+        {/* === JARVIS MOD #58: aspect-aware camera dolly === */}
+        <ResponsiveFraming />
+        {/* === JARVIS MOD #62: in reduced-motion ('demand') mode, a voice-state
+            change must still repaint the still frame === */}
+        <RepaintOnChange dep={`${voiceState}:${orbBrightness}`} enabled={reducedMotion} />
         {/* === JARVIS MOD #29: Trillion cosmic-orb layers === */}
         <NebulaBackground />
         <GlowPool color={orbRim} />
@@ -259,9 +354,40 @@ export default function Scene() {
         {/* === END JARVIS MOD #22 === */}
       </Canvas>
 
-      {/* JARVIS label under the orb */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-[18%] flex justify-center">
-        <span className="text-2xl font-light tracking-[0.5em] text-[#5eead4] [text-shadow:0_0_20px_rgba(45,212,191,0.5)]">
+      {/* === JARVIS MOD #79 — vignette + floor grade (2026-08-03) ===
+          The single cheapest thing separating "cinematic" from "HUD": a frame
+          that falls off at the edges instead of holding one flat value corner
+          to corner. Pure CSS over the canvas — no draw call, no GPU cost, and
+          it cannot affect FPS or the perf toggle. Sits at z-[5]: above the
+          canvas, below every panel (z-10/z-20), so no readable chrome is dimmed.
+          Centred at 48% to match the orb, not the viewport. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 z-[5]"
+        style={{
+          background:
+            'radial-gradient(ellipse 78% 68% at 50% 48%, rgba(5,11,20,0) 40%, rgba(4,8,16,0.42) 78%, rgba(2,5,10,0.72) 100%)',
+        }}
+      />
+      {/* A faint cool floor so the orb sits IN something rather than floating
+          on a flat field — the same trick as a studio sweep. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 bottom-0 z-[5] h-1/3"
+        style={{
+          background: 'linear-gradient(to top, rgba(6,20,28,0.5), rgba(6,20,28,0))',
+        }}
+      />
+      {/* === END JARVIS MOD #79 === */}
+
+      {/* JARVIS label under the orb.
+          === JARVIS MOD #59: on a phone the orb is centred higher and the glass
+          panel owns the lower third, so the wordmark tucks under the orb
+          instead of colliding with the panel at bottom-18%. === */}
+      <div // MOD #71: 65% matches PORTRAIT_BAND_BOTTOM (0.62) + clearance in framing.ts.
+        // If you move this, move that constant with it.
+        className="pointer-events-none absolute inset-x-0 top-[65%] flex justify-center md:top-auto md:bottom-[18%]">
+        <span className="text-xl font-light tracking-[0.5em] text-[#5eead4] [text-shadow:0_0_20px_rgba(45,212,191,0.5)] md:text-2xl">
           JARVIS
         </span>
       </div>

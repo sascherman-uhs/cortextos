@@ -77,6 +77,32 @@ const TURN_PERMISSION_OVERRIDES = {
   sandboxPolicy: { type: 'dangerFullAccess' },
 } as const;
 
+/**
+ * Opt-in via AgentConfig.capability_profile === 'read_only' (see the field's
+ * doc comment in types/index.ts). approvalPolicy stays 'never' even here —
+ * this adapter has no handler for inbound approval requests (handleRpcMessage
+ * answers any unrecognized method+id request with a JSON-RPC error), so
+ * turning approvals on would just fail every action instead of gating it.
+ * Isolation instead comes from the sandbox: 'read-only' / readOnly are the
+ * most restrictive modes the installed codex-cli app-server protocol exposes
+ * — verified via `codex app-server generate-json-schema --out <dir>` against
+ * the v2 bundle's `SandboxMode` (thread-level: "read-only" | "workspace-write"
+ * | "danger-full-access") and `SandboxPolicy` (turn-level: dangerFullAccess |
+ * readOnly | externalSandbox | workspaceWrite) definitions. `networkAccess`
+ * on ReadOnlySandboxPolicy defaults to false; set explicitly for clarity.
+ * These block filesystem writes and outbound network at the codex-enforced
+ * OS sandbox layer (seatbelt/landlock), not by anything in this adapter.
+ */
+const READ_ONLY_THREAD_PERMISSION_OVERRIDES = {
+  approvalPolicy: 'never',
+  sandbox: 'read-only',
+} as const;
+
+const READ_ONLY_TURN_PERMISSION_OVERRIDES = {
+  approvalPolicy: 'never',
+  sandboxPolicy: { type: 'readOnly', networkAccess: false },
+} as const;
+
 const SOCKET_BASENAME = 'codex.sock';
 const SOCKET_PATH_WARN_BYTES = 100;
 const BOOTSTRAP_PATTERN = '[codex-app-server] ready';
@@ -118,6 +144,21 @@ export class CodexAppServerPTY {
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
+  /**
+   * Model routing (OS-02b-core). The installed `codex-cli 0.153.2` app-server
+   * protocol DOES accept an explicit model — verified by running
+   * `codex app-server generate-json-schema --out <dir>` and reading the v2
+   * bundle: `ThreadStartParams.model` (string|null), `ThreadResumeParams.model`
+   * ("Configuration overrides for the resumed thread") and
+   * `TurnStartParams.model` ("Override the model for this turn and subsequent
+   * turns"). All three boundaries are wired below.
+   *
+   * Deliberately NOT falling back to `config.model`: this adapter has never
+   * passed that field to the server (it was only ever a log label), so
+   * honouring it now would change what runs in SHADOW mode. Only an enforced
+   * registry resolution sets this.
+   */
+  private _modelOverride: string | null = null;
   private _telegramApi: TelegramAPI | null = null;
   private _chatId: string | null = null;
   private _typingLastSent = 0;
@@ -215,6 +256,43 @@ export class CodexAppServerPTY {
 
   getOutputBuffer(): OutputBuffer {
     return this._outputBuffer;
+  }
+
+  /** Set the registry-resolved model for the next thread/turn. */
+  setModelOverride(modelId: string | null): void {
+    this._modelOverride = modelId;
+  }
+
+  /** Null unless routing is enforced — see the note on `_modelOverride`. */
+  getEffectiveModel(): string | undefined {
+    return this._modelOverride ?? undefined;
+  }
+
+  /**
+   * Active app-server thread id, or null before `thread/start` resolves. The
+   * model-routing observer needs it to bind a rollout file to this session.
+   */
+  getThreadId(): string | null {
+    return this._threadId;
+  }
+
+  /** `{ model }` when an explicit selection is active, otherwise `{}`. */
+  private modelParam(): Record<string, string> {
+    return this._modelOverride ? { model: this._modelOverride } : {};
+  }
+
+  /** Thread-level (thread/start, thread/resume) permission override, gated by capability_profile. */
+  private threadPermissionOverrides(): typeof THREAD_PERMISSION_OVERRIDES | typeof READ_ONLY_THREAD_PERMISSION_OVERRIDES {
+    return this._config.capability_profile === 'read_only'
+      ? READ_ONLY_THREAD_PERMISSION_OVERRIDES
+      : THREAD_PERMISSION_OVERRIDES;
+  }
+
+  /** Turn-level (turn/start) permission override, gated by capability_profile. */
+  private turnPermissionOverrides(): typeof TURN_PERMISSION_OVERRIDES | typeof READ_ONLY_TURN_PERMISSION_OVERRIDES {
+    return this._config.capability_profile === 'read_only'
+      ? READ_ONLY_TURN_PERMISSION_OVERRIDES
+      : TURN_PERMISSION_OVERRIDES;
   }
 
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
@@ -484,7 +562,8 @@ export class CodexAppServerPTY {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: persisted.threadId,
           cwd: this._cwd,
-          ...THREAD_PERMISSION_OVERRIDES,
+          ...this.modelParam(),
+          ...this.threadPermissionOverrides(),
           config: { features: { goals: true } },
           excludeTurns: true,
           persistExtendedHistory: true,
@@ -502,7 +581,8 @@ export class CodexAppServerPTY {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: latest,
           cwd: this._cwd,
-          ...THREAD_PERMISSION_OVERRIDES,
+          ...this.modelParam(),
+          ...this.threadPermissionOverrides(),
           config: { features: { goals: true } },
           excludeTurns: true,
           persistExtendedHistory: true,
@@ -514,7 +594,8 @@ export class CodexAppServerPTY {
 
     const started = await this.request<ThreadResponse>('thread/start', {
       cwd: this._cwd,
-      ...THREAD_PERMISSION_OVERRIDES,
+      ...this.modelParam(),
+      ...this.threadPermissionOverrides(),
       config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
@@ -558,7 +639,12 @@ export class CodexAppServerPTY {
   private async startTurn(input: unknown[]): Promise<void> {
     if (!this._threadId) throw new Error('No Codex app-server thread is active');
     const completion = this.createTurnCompletion();
-    await this.request('turn/start', { threadId: this._threadId, input, ...TURN_PERMISSION_OVERRIDES });
+    await this.request('turn/start', {
+      threadId: this._threadId,
+      input,
+      ...this.modelParam(),
+      ...this.turnPermissionOverrides(),
+    });
     await completion;
   }
 
@@ -845,7 +931,10 @@ export class CodexAppServerPTY {
 
     const entry = {
       timestamp: new Date().toISOString(),
-      model: this._config.model || 'gpt-5-codex',
+      // Config-labelled, NOT an observation. The routing contract forbids
+      // treating this as evidence of the model that actually ran — the
+      // observer reads `turn_context.payload.model` from the rollout instead.
+      model: this._modelOverride || this._config.model || 'gpt-5-codex',
       input_tokens: typeof total.inputTokens === 'number' ? total.inputTokens : 0,
       output_tokens: typeof total.outputTokens === 'number' ? total.outputTokens : 0,
       cache_read_tokens: typeof total.cachedInputTokens === 'number' ? total.cachedInputTokens : 0,
@@ -949,10 +1038,25 @@ export class CodexAppServerPTY {
     env['CTX_AGENT_DIR'] = this._env.agentDir;
     env['CTX_PROJECT_ROOT'] = this._env.projectRoot;
 
-    if (this._env.org && this._env.projectRoot) {
-      this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
+    // capability_profile === 'read_only': never load either env file
+    // unfiltered. Only vars named in capability_env_allowlist pass through
+    // (absent/empty allowlist = zero credentials injected). This is
+    // deliberately NOT "load then strip" — the unfiltered file contents
+    // never touch `env` at all in read_only mode.
+    if (this._config.capability_profile === 'read_only') {
+      const allowlist = new Set(this._config.capability_env_allowlist ?? []);
+      if (allowlist.size > 0) {
+        if (this._env.org && this._env.projectRoot) {
+          this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env, allowlist);
+        }
+        this.loadEnvFile(join(this._env.agentDir, '.env'), env, allowlist);
+      }
+    } else {
+      if (this._env.org && this._env.projectRoot) {
+        this.loadEnvFile(join(this._env.projectRoot, 'orgs', this._env.org, 'secrets.env'), env);
+      }
+      this.loadEnvFile(join(this._env.agentDir, '.env'), env);
     }
-    this.loadEnvFile(join(this._env.agentDir, '.env'), env);
 
     if (env['CHAT_ID']) env['CTX_TELEGRAM_CHAT_ID'] = env['CHAT_ID'];
     if (this._config.timezone) {
@@ -963,7 +1067,8 @@ export class CodexAppServerPTY {
     return env;
   }
 
-  private loadEnvFile(path: string, env: Record<string, string>): void {
+  /** `allowlist` present (read_only mode) restricts which keys are copied into `env`. */
+  private loadEnvFile(path: string, env: Record<string, string>, allowlist?: Set<string>): void {
     if (!existsSync(path)) return;
     try {
       for (const line of readFileSync(path, 'utf-8').split('\n')) {
@@ -971,7 +1076,9 @@ export class CodexAppServerPTY {
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          env[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          const key = trimmed.slice(0, eqIdx).trim();
+          if (allowlist && !allowlist.has(key)) continue;
+          env[key] = trimmed.slice(eqIdx + 1).trim();
         }
       }
     } catch {

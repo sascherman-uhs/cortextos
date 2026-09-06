@@ -10,6 +10,9 @@ import { useMemo } from 'react';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { SPACE, SPACE_2, INDIGO, PURPLE } from './palette';
+// === JARVIS MOD #70: frozen scene clock ===
+import { sceneTime } from './reduced-motion';
+// === END JARVIS MOD #70 ===
 
 const BG_VERT = /* glsl */ `
 varying vec3 vPos;
@@ -19,24 +22,48 @@ void main(){
 }
 `;
 
+// === JARVIS MOD #74 (2026-08-03): richer nebula. The old backdrop was one
+// vertical gradient plus a single trig band, which the critic read as a flat
+// single-layer field. Now THREE cloud layers at different scales, speeds and
+// directions, in two different hues, so the background has parallax and never
+// repeats visibly. Still pure trig — no noise texture, no extra draw call. ===
 const BG_FRAG = /* glsl */ `
 uniform vec3 uLow;
 uniform vec3 uMid;
 uniform vec3 uHigh;
+uniform vec3 uAlt;
 uniform float uTime;
 varying vec3 vPos;
+
+// One drifting cloud band. Returns 0..1.
+float band(vec3 d, float scale, float speed, vec3 dir){
+  float v =
+    sin(d.x * scale + uTime * speed * dir.x) *
+    cos(d.y * scale * 0.72 - uTime * speed * dir.y) *
+    sin(d.z * scale * 0.9 + uTime * speed * dir.z);
+  return v * 0.5 + 0.5;
+}
+
 void main(){
   vec3 dir = normalize(vPos);
   float t = dir.y * 0.5 + 0.5;                 // vertical gradient
   vec3 col = mix(uLow, uMid, smoothstep(0.0, 0.6, t));
   col = mix(col, uHigh, smoothstep(0.55, 1.0, t));
-  // Soft drifting cloud banding (cheap trig, no noise texture).
-  float cloud =
-    sin(dir.x * 3.0 + uTime * 0.05) *
-    cos(dir.y * 2.0 - uTime * 0.03) *
-    sin(dir.z * 2.5 + uTime * 0.04);
-  col += uHigh * (cloud * 0.5 + 0.5) * 0.08;
-  gl_FragColor = vec4(col, 1.0);
+
+  // Layer 1 — broad, slowest, the "sheet" the others sit in front of.
+  float c1 = band(dir, 1.7, 0.035, vec3(1.0, 0.6, 0.8));
+  // Layer 2 — mid scale, opposite drift, in the alternate hue.
+  float c2 = band(dir, 3.4, 0.062, vec3(-0.7, 1.0, -0.5));
+  // Layer 3 — fine, fastest, low amplitude: the detail that sells the parallax.
+  float c3 = band(dir, 6.1, 0.11, vec3(0.4, -0.9, 1.0));
+
+  // MOD #79: cloud weight raised — the layers existed but read thin against
+  // the gradient. Amplitude only; no new layer, no new draw call.
+  col += uHigh * c1 * 0.115;
+  col += uAlt  * c2 * 0.095;
+  col += uHigh * c3 * 0.055;
+  // Clouds thin out toward the bottom of the sphere so the orb reads clean.
+  gl_FragColor = vec4(mix(col, col * 0.86, smoothstep(0.45, 0.0, t)), 1.0);
 }
 `;
 
@@ -48,6 +75,9 @@ export function NebulaBackground() {
           uLow: { value: new THREE.Color(SPACE) },
           uMid: { value: new THREE.Color(SPACE_2) },
           uHigh: { value: new THREE.Color(INDIGO).lerp(new THREE.Color(PURPLE), 0.4) },
+          // MOD #74: second cloud hue — a teal-green so the field isn't
+          // monochrome indigo (spec: green/magenta/blue cloud layers).
+          uAlt: { value: new THREE.Color('#1f6f6a') },
           uTime: { value: 0 },
         },
         vertexShader: BG_VERT,
@@ -59,7 +89,7 @@ export function NebulaBackground() {
   );
 
   useFrame((state) => {
-    material.uniforms.uTime.value = state.clock.elapsedTime;
+    material.uniforms.uTime.value = sceneTime(state.clock.elapsedTime); // MOD #70
   });
 
   return (
@@ -94,7 +124,11 @@ export function GlowPool({ color }: { color: string }) {
       new THREE.ShaderMaterial({
         uniforms: {
           uColor: { value: new THREE.Color(color) },
-          uStrength: { value: 0.42 },
+          // MOD #57: 0.42 → 0.15. With the orb's new three-layer glow stacked on
+          // top, the old pool strength washed the whole frame — and a wide gold
+          // pool over the navy nebula reads BROWN, not gold. The orb's own halo
+          // now carries the warm accent; the pool only seats the orb in space.
+          uStrength: { value: 0.15 },
         },
         vertexShader: POOL_VERT,
         fragmentShader: POOL_FRAG,

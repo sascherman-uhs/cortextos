@@ -5,6 +5,9 @@ import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { ContractViolation, type CanonicalState, type TransitionOrigin } from '../bus/task-contract.js';
+import { deleteTask, TaskDeletionRefused } from '../bus/task-delete.js';
+import { requireOrgForOrgScopedWrite } from '../utils/org.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -12,7 +15,7 @@ import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity 
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
-import { createApproval, updateApproval } from '../bus/approval.js';
+import { createApproval, decideApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
@@ -25,6 +28,70 @@ import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
+
+/**
+ * Where a CLI-driven transition came from.
+ *
+ * The CLI is the legacy fleet's writer surface: agents, cron jobs and bus shell
+ * scripts all land here, and they are the population the OS-02 shadow flag
+ * exists to migrate one at a time. So an unqualified CLI call is a `writer`.
+ *
+ * `interactive` is asserted ONLY by a caller that knows it is acting for a
+ * human at a UI — in practice the dashboard's transition service, which passes
+ * `--origin interactive` and never lets an HTTP client pick the value. Claiming
+ * `interactive` only ever buys MORE enforcement, so there is nothing to gain by
+ * spoofing it; claiming `writer` buys the shadow window, which is why it is
+ * never accepted from the network and an unrecognised value fails closed to
+ * `interactive`.
+ */
+function resolveOrigin(opt?: string): TransitionOrigin {
+  const raw = (opt ?? process.env.CTX_TRANSITION_ORIGIN ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'writer') return 'writer';
+  return 'interactive';
+}
+
+/**
+ * Print a contract refusal in a shape a caller can parse, then exit non-zero.
+ * The dashboard turns this into the board's refusal alert; a human reading a
+ * terminal gets the same sentence.
+ */
+/** An actor name reduced to something safe to store and compare. Undefined when
+ *  there is nothing usable, so the caller falls back rather than recording ''. */
+function sanitizeActorName(name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const cleaned = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? cleaned.slice(0, 64) : undefined;
+}
+
+function exitOnContractViolation(err: unknown): never {
+  if (err instanceof ContractViolation) {
+    const legal = err.legalTransitions;
+    console.error(
+      'CONTRACT_REFUSED ' +
+        JSON.stringify({
+          source: err.source,
+          from: err.from,
+          to: err.to,
+          error: err.result.error,
+          detail: err.result.detail,
+          legal_transitions: legal,
+          // What the record is missing, and whether a human may supply or waive
+          // it. Without these the dashboard can only say "no"; with them it can
+          // offer the form that fixes the record for good.
+          missing: err.result.missing,
+          legacy: err.result.legacy,
+          waivable: err.result.waivable,
+        }),
+    );
+    console.error(
+      err.message +
+        (legal.length ? ` Legal moves from ${err.from}: ${legal.join(', ')}.` : ''),
+    );
+    process.exit(3);
+  }
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exit(1);
+}
 
 /**
  * Check if the org requires deliverables and the task has none attached.
@@ -154,11 +221,25 @@ busCommand
   .option('--needs-approval', 'Require human approval before execution')
   .option('--blocked-by <ids>', 'Comma-separated task IDs that must complete before this task can progress')
   .option('--blocks <ids>', 'Comma-separated task IDs that this new task will block (symmetric reverse edge)')
-  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string }) => {
+  .option('--org <name>', 'Organization this task belongs to. Falls back to CTX_ORG. Required: tasks are stored per org, and a task written outside an org is read by nothing.')
+  .action((title: string, opts: { desc?: string; assignee?: string; priority: string; project?: string; needsApproval?: boolean; blockedBy?: string; blocks?: string; org?: string }) => {
     const env = resolveEnv();
-    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+
+    // A task with no org used to be written to <instance>/tasks/ — a directory
+    // nothing reads. Sync walks <instance>/orgs/<org>/tasks/ and only that, so
+    // the CLI printed an id, the caller believed the task existed, and it
+    // reached no board, no projection and no agent. Silent task loss.
+    // Refuse instead, and name the orgs that would have worked.
+    const resolved = requireOrgForOrgScopedWrite(opts.org || env.org, env.frameworkRoot, 'task');
+    if (!resolved.ok) {
+      console.error(resolved.message);
+      process.exit(1);
+    }
+    const org = resolved.org;
+
+    const paths = resolvePaths(env.agentName, env.instanceId, org);
     const parseList = (raw?: string) => (raw ? raw.split(',').map(s => s.trim()).filter(Boolean) : []);
-    const taskId = createTask(paths, env.agentName, env.org, title, {
+    const taskId = createTask(paths, env.agentName, org, title, {
       description: opts.desc,
       assignee: opts.assignee,
       priority: opts.priority as Priority,
@@ -170,7 +251,7 @@ busCommand
     console.log(taskId);
     // Auto-notify assignee so the task is visible immediately (issue #78)
     if (opts.assignee && opts.assignee !== env.agentName) {
-      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
+      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, org);
       const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
@@ -178,10 +259,55 @@ busCommand
   });
 
 busCommand
+  .command('delete-task')
+  .description('Remove a task and every actionable remnant of it. Refused for an obligation or for work that is not already terminal — cancel those instead.')
+  .requiredOption('--id <id>', 'Task ID to delete')
+  .option('--org <name>', 'Organization that owns the task. Falls back to CTX_ORG. Required, for the same reason create-task requires it: without it the id is resolved against every org and the first match wins.')
+  .requiredOption('--reason <why>', 'Why this task is being removed. Recorded in the org deletion log.')
+  .option('--actor <name>', 'Who is deleting it. Defaults to the calling agent.')
+  .option('--force', 'Delete anyway when the contract refuses — genuine junk, fixtures, a malformed record. Recorded as forced, with the actor and the reason.')
+  .action((opts: { id: string; org?: string; reason: string; actor?: string; force?: boolean }) => {
+    const env = resolveEnv();
+    const resolved = requireOrgForOrgScopedWrite(opts.org || env.org, env.frameworkRoot, 'task', 'delete');
+    if (!resolved.ok) {
+      console.error(resolved.message);
+      process.exit(1);
+    }
+    const paths = resolvePaths(env.agentName, env.instanceId, resolved.org);
+    try {
+      const report = deleteTask(paths, opts.id, {
+        actor: opts.actor || env.agentName,
+        reason: opts.reason,
+        force: opts.force === true,
+      });
+      const msgCount = report.messages.length;
+      console.log(
+        `Deleted ${report.taskId}${report.forced ? ' (forced)' : ''}: `
+        + `${report.removed.length} path(s) removed, ${msgCount} unacked message(s) swept`
+        + (msgCount ? ` (${report.messages.map((m) => `${m.agent}/${m.queue}`).join(', ')})` : '')
+        + `. Recorded in ${report.tombstone}.`,
+      );
+    } catch (err) {
+      if (err instanceof TaskDeletionRefused) {
+        console.error(err.message);
+        process.exit(1);
+      }
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--origin <origin>', 'interactive (a human at a UI — always enforced) or writer (a migrating background writer — honours the shadow flag)')
+  .option('--fields <json>', 'Contract fields a person is supplying inline for a record that predates the contract: {"outcome","acceptanceCriteria":[],"humanAccountableId","agentRoleId"}. Recorded as a legacy_upgraded event.')
+  .option('--actor <name>', 'Who this transition is recorded against. A person when a human is driving it — the journal entry for an upgraded or waived legacy record has to name someone, and "dashboard" names a program.')
+  .option('--canonical <state>', 'The canonical state this move is aiming at (backlog|ready|doing|verify|waiting|done|cancelled|failed_terminal). Needed because the native vocabulary is coarser: backlog and ready are both "pending", so without it a backlog -> ready move looks like a no-op and skips the Ready gate.')
+  .option('--grandfather <json>', 'A named person\'s explicit waiver of the fields a legacy record never had: {"actor","reason"}. Recorded as a legacy_grandfathered event. Cannot waive dependencies, an illegal transition, or any part of the completion proof gate.')
+  .option('--expected-version <n>', 'Optimistic concurrency: the version the caller read. The move is refused with a version conflict if the record has changed since. Without it the write lands on whatever is current, which is a blind write over anyone who got there first.')
+  .action((id: string, status: string, opts: { origin?: string; fields?: string; grandfather?: string; canonical?: string; actor?: string; expectedVersion?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -201,7 +327,49 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
+    const parseJsonOption = (name: string, raw: string | undefined) => {
+      if (raw === undefined) return undefined;
+      try {
+        const value = JSON.parse(raw);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+        return value as Record<string, unknown>;
+      } catch {
+        console.error(`--${name} must be a JSON object`);
+        process.exit(1);
+      }
+    };
+    const fields = parseJsonOption('fields', opts.fields) as
+      | { outcome?: string; acceptanceCriteria?: unknown[]; humanAccountableId?: string; agentRoleId?: string }
+      | undefined;
+    const grandfather = parseJsonOption('grandfather', opts.grandfather) as
+      | { actor?: string; reason?: string }
+      | undefined;
+
+    let expectedVersion: number | undefined;
+    if (opts.expectedVersion !== undefined) {
+      expectedVersion = Number(opts.expectedVersion);
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+        console.error('--expected-version must be a non-negative integer');
+        process.exit(1);
+      }
+    }
+
+    try {
+      updateTask(paths, id, status as TaskStatus, {
+        origin: resolveOrigin(opts.origin),
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+        ...(opts.canonical ? { canonicalState: opts.canonical as CanonicalState } : {}),
+        // Only overridden when the caller names someone. Left alone otherwise
+        // so the existing audit line keeps its current actor.
+        ...(opts.actor || grandfather?.actor
+          ? { actor: sanitizeActorName(opts.actor) ?? grandfather!.actor }
+          : {}),
+        fields,
+        grandfather,
+      });
+    } catch (err) {
+      exitOnContractViolation(err);
+    }
     console.log(`Updated ${id} -> ${status}`);
   });
 
@@ -297,7 +465,10 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--evidence <json>', 'Evidence object as JSON (artifact/result/verifier/acceptance_results)')
+  .option('--origin <origin>', 'interactive (a human at a UI — always enforced) or writer (a migrating background writer — honours the shadow flag)')
+  .option('--expected-version <n>', 'Optimistic concurrency: the version the caller read. Completion is refused with a version conflict if the record has changed since.')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; evidence?: string; origin?: string; expectedVersion?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
@@ -312,7 +483,36 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
+    let evidence: Record<string, unknown> | undefined;
+    if (opts.evidence) {
+      try {
+        const parsed = JSON.parse(opts.evidence);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+        evidence = parsed as Record<string, unknown>;
+      } catch (err) {
+        console.error(`--evidence must be a JSON object: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(1);
+      }
+    }
+
+    let expectedVersion: number | undefined;
+    if (opts.expectedVersion !== undefined) {
+      expectedVersion = Number(opts.expectedVersion);
+      if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+        console.error('--expected-version must be a non-negative integer');
+        process.exit(1);
+      }
+    }
+
+    try {
+      completeTask(paths, id, effectiveResult, {
+        origin: resolveOrigin(opts.origin),
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+        ...(evidence ? { evidence } : {}),
+      });
+    } catch (err) {
+      exitOnContractViolation(err);
+    }
     console.log(`Completed ${id}`);
   });
 
@@ -955,7 +1155,8 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--buttons <spec>', 'Inline keyboard buttons. Format: "Label 1:callback_1,Label 2:callback_2" — each pair is text:callback_data separated by comma. All buttons appear in a single row. Callbacks are routed back to the agent inbox as Telegram messages with callback_data: <value>.')
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; buttons?: string }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -987,6 +1188,20 @@ busCommand
     }
 
     const api = new TelegramAPI(botToken);
+
+    // Build inline keyboard from --buttons spec if provided
+    let inlineKeyboard: object | undefined;
+    if (opts.buttons) {
+      const pairs = opts.buttons.split(',').map(b => b.trim()).filter(Boolean);
+      const row = pairs.map(pair => {
+        const colonIdx = pair.lastIndexOf(':');
+        const text = colonIdx > 0 ? pair.slice(0, colonIdx).trim() : pair;
+        const callback_data = colonIdx > 0 ? pair.slice(colonIdx + 1).trim() : pair;
+        return { text, callback_data };
+      });
+      inlineKeyboard = { inline_keyboard: [row] };
+    }
+
     try {
       let sentMessageId = 0;
       if (opts.image) {
@@ -996,7 +1211,7 @@ busCommand
         const result = await api.sendDocument(chatId, opts.file, message);
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
-        const result = await api.sendMessage(chatId, message, undefined, {
+        const result = await api.sendMessage(chatId, message, inlineKeyboard, {
           parseMode: opts.plainText ? null : 'HTML',
         });
         sentMessageId = result?.result?.message_id ?? 0;
@@ -1079,21 +1294,29 @@ busCommand
   .argument('<title>', 'What you are requesting approval for')
   .argument('<category>', 'Category: external-comms, financial, deployment, data-deletion, other')
   .argument('[context]', 'Additional context')
-  .action(async (title: string, category: string, context?: string) => {
+  .option('--org <name>', 'Organization this approval belongs to. Falls back to CTX_ORG. Required: approvals are stored per org, and one written outside an org reaches no human.')
+  .action(async (title: string, category: string, context: string | undefined, opts: { org?: string }) => {
     const validCategories: ApprovalCategory[] = ['external-comms', 'financial', 'deployment', 'data-deletion', 'other'];
     if (!validCategories.includes(category as ApprovalCategory)) {
       console.error(`Invalid category '${category}'. Must be one of: ${validCategories.join(', ')}`);
       process.exit(1);
     }
     const env = resolveEnv();
-    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    // Same hole as create-task, and worse here: an approval nobody can see is
+    // indistinguishable, to the agent waiting on it, from one still pending.
+    const resolvedOrg = requireOrgForOrgScopedWrite(opts.org || env.org, env.frameworkRoot, 'approval');
+    if (!resolvedOrg.ok) {
+      console.error(resolvedOrg.message);
+      process.exit(1);
+    }
+    const paths = resolvePaths(env.agentName, env.instanceId, resolvedOrg.org);
     // await — createApproval fan-out posts to the activity channel, which
     // must complete before the CLI process exits or the post silently
     // never sends. env.frameworkRoot is passed so the activity-channel
     // orgDir resolves to where activity-channel.env actually lives (the
     // framework repo path, NOT the runtime state path — see
     // src/bus/approval.ts:postApprovalToActivityChannel for the history).
-    const id = await createApproval(paths, env.agentName, env.org, title, category as ApprovalCategory, context || '', env.frameworkRoot, env.agentDir);
+    const id = await createApproval(paths, env.agentName, resolvedOrg.org, title, category as ApprovalCategory, context || '', env.frameworkRoot, env.agentDir);
     console.log(id);
   });
 
@@ -1103,7 +1326,8 @@ busCommand
   .argument('<id>', 'Approval ID')
   .argument('<status>', 'Resolution: approved or denied')
   .argument('[note]', 'Resolution note')
-  .action((id: string, status: string, note?: string) => {
+  .option('--actor <name>', 'Who is deciding this. Defaults to CTX_AGENT_NAME (e.g. the dashboard PATCH route sets this to "dashboard"). Recorded as the decider identity — a CLI/dashboard decision is now identity-checked the same way a Telegram decision is.')
+  .action((id: string, status: string, note: string | undefined, opts: { actor?: string }) => {
     const validStatuses: ApprovalStatus[] = ['approved', 'rejected'];
     if (!validStatuses.includes(status as ApprovalStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: approved, rejected`);
@@ -1111,7 +1335,27 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    updateApproval(paths, id, status as ApprovalStatus, note);
+    // WP-5B: this is the ONE decision boundary now — the CLI (and the
+    // dashboard PATCH route, which shells out to this exact command) no
+    // longer calls updateApproval() directly with zero identity/CAS check.
+    // env.agentName is CTX_AGENT_NAME, which the dashboard route explicitly
+    // sets to 'dashboard' before spawning this process, so the two first-party
+    // surfaces are distinguishable in the audit trail without extra plumbing.
+    const actor = sanitizeActorName(opts.actor) ?? sanitizeActorName(env.agentName);
+    if (!actor) {
+      console.error('ERROR: could not resolve a decider identity (--actor or CTX_AGENT_NAME required).');
+      process.exit(1);
+    }
+    const route = actor === 'dashboard' ? 'dashboard' : 'cli';
+    const result = decideApproval(paths, id, status as 'approved' | 'rejected', actor, { route }, note);
+    if (!result.ok) {
+      // Dashboard PATCH route (bus/update-approval.sh -> this command) greps
+      // stderr for "not found" to distinguish 404 from 500 — preserve that
+      // phrase for the missing-approval case so its behavior is unchanged.
+      const prefix = result.rejection === 'approval_missing' ? `Approval ${id} not found` : `Approval ${id} decision REFUSED (${result.rejection ?? 'unknown'})`;
+      console.error(`${prefix}: ${result.detail ?? ''}`);
+      process.exit(1);
+    }
     console.log(`Approval ${id} -> ${status}`);
   });
 

@@ -19,6 +19,15 @@ const statusConfig: Record<
     className: 'bg-success/10 text-success',
     label: 'Completed',
   },
+  // OS-01 made failed and cancelled work visible on the board. Without an
+  // entry here they fell through to a generic outline badge showing the raw
+  // status string, so a failure looked like any other state.
+  failed: { variant: 'destructive', label: 'Failed' },
+  cancelled: {
+    variant: 'secondary',
+    className: 'bg-muted text-muted-foreground',
+    label: 'Cancelled',
+  },
 };
 
 export function StatusBadge({ status, className }: StatusBadgeProps) {

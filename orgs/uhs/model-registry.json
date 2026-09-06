@@ -1,0 +1,670 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "updated_at": "2026-09-05T00:00:00Z",
+  "updated_by": "jarvis",
+  "_readme": "Single authority for model routing (OS-02b-core). Never hand-edit pins, activation or role capabilities \u2014 use `cortextos model switch|pin|unpin|activation|role-capability`, which does a CAS write and journals an event. Agent config.json `model` fields are LEGACY. TWO DIFFERENT CAPABILITY FIELDS LIVE ON A ROLE AND THEY ARE NOT INTERCHANGEABLE: `required_capabilities` is matched against a model entry's `capability_tags` during resolution, so a value there that no entry carries makes the role UNRESOLVABLE; `role_capabilities` describes the ROLE itself (what it participates in, e.g. `continuous-improvement` for weekly Kaizen enrollment), is never matched against any model, and therefore can never break resolution. Manage it with `cortextos model role-capability add|remove|list` (no restart \u2014 a capability changes no route).",
+  "activation": {
+    "org_default": "shadow",
+    "consumers": {
+      "trillion-coder": "shadow"
+    }
+  },
+  "adapters": {
+    "claude-code": {
+      "version": 1,
+      "selection": "cli:--model",
+      "observed_source": "claude-transcript",
+      "supports": [
+        "tools",
+        "sandbox",
+        "structured-output"
+      ],
+      "auth_source": "claude-cli-login"
+    },
+    "codex-app-server": {
+      "version": 1,
+      "selection": "app-server:thread/start.model + thread/resume.model + turn/start.model",
+      "observed_source": "codex-rollout",
+      "supports": [
+        "tools",
+        "sandbox"
+      ],
+      "auth_source": "codex-cli-login"
+    },
+    "kimi": {
+      "version": 1,
+      "selection": "cli:--model",
+      "observed_source": null,
+      "supports": [
+        "tools"
+      ],
+      "auth_source": "env:KIMI_API_KEY"
+    },
+    "hermes": {
+      "version": 1,
+      "selection": null,
+      "observed_source": null,
+      "supports": [],
+      "auth_source": null
+    },
+    "anthropic-api": {
+      "version": 1,
+      "selection": "sdk:model",
+      "observed_source": "response.model",
+      "supports": [
+        "structured-output",
+        "vision"
+      ],
+      "auth_source": "env:ANTHROPIC_API_KEY",
+      "hosts_runtimes": []
+    },
+    "openai-api": {
+      "version": 1,
+      "selection": "sdk:model",
+      "observed_source": "response.model",
+      "supports": [
+        "structured-output",
+        "vision"
+      ],
+      "auth_source": "env:OPENAI_API_KEY",
+      "hosts_runtimes": []
+    },
+    "ollama": {
+      "version": 1,
+      "selection": "api:model",
+      "observed_source": "response.model",
+      "supports": [],
+      "auth_source": null,
+      "hosts_runtimes": []
+    }
+  },
+  "entries": {
+    "anthropic-haiku-4-5": {
+      "model_id": "claude-haiku-4-5-20251001",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "planning",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "vision",
+        "browser",
+        "financial-scope"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 1,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source. 'planning' is tagged deliberately: without it, jarvis-heartbeat (dispatcher role, currently running Haiku) could not import its own live model as a legacy pin, and bootstrap would flag a working agent as invalid instead of preserving observed behaviour."
+    },
+    "anthropic-sonnet-4-5": {
+      "model_id": "claude-sonnet-4-5",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "planning",
+        "vision",
+        "browser",
+        "financial-scope"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 3,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "anthropic-sonnet-4-6": {
+      "model_id": "claude-sonnet-4-6",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "planning",
+        "vision",
+        "browser",
+        "financial-scope"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 3,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "anthropic-sonnet-5": {
+      "model_id": "claude-sonnet-5",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "planning",
+        "vision",
+        "browser",
+        "financial-scope"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 3,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "anthropic-opus-4-1": {
+      "model_id": "claude-opus-4-1",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "planning",
+        "vision",
+        "browser",
+        "financial-scope"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 4,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "anthropic-opus-5": {
+      "model_id": "claude-opus-5",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "planning",
+        "vision",
+        "browser",
+        "financial-scope",
+        "evidence-review",
+        "continuous-improvement"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 4,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "anthropic-fable-5-1": {
+      "model_id": "claude-fable-5-1",
+      "provider": "anthropic",
+      "runtime_adapter": "claude-code",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "business-rules",
+        "content",
+        "planning",
+        "vision",
+        "browser",
+        "financial-scope",
+        "evidence-review",
+        "continuous-improvement"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 5,
+      "auth_source": "claude-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "codex-gpt-5-codex": {
+      "model_id": "gpt-5-codex",
+      "provider": "openai",
+      "runtime_adapter": "codex-app-server",
+      "capability_tags": [
+        "coding",
+        "tool-use",
+        "sandbox",
+        "structured-output",
+        "scoped-retrieval"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 2,
+      "auth_source": "codex-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "codex-gpt-6-astra": {
+      "model_id": "gpt-6-astra",
+      "provider": "openai",
+      "runtime_adapter": "codex-app-server",
+      "capability_tags": [
+        "coding",
+        "tool-use",
+        "sandbox",
+        "structured-output",
+        "scoped-retrieval",
+        "evidence-review",
+        "planning",
+        "continuous-improvement"
+      ],
+      "context_window": 200000,
+      "billing_mode": "subscription_quota",
+      "cost_class": 4,
+      "auth_source": "codex-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "context_window is a deliberately conservative floor: role min_context is a MINIMUM check, so under-stating can only make validation stricter, never route onto a model that is too small. Raise it only with a verified source."
+    },
+    "kimi-k2": {
+      "model_id": "kimi-k2",
+      "provider": "moonshot",
+      "runtime_adapter": "kimi",
+      "capability_tags": [
+        "conversation",
+        "tool-use",
+        "coding",
+        "structured-output",
+        "scoped-retrieval",
+        "planning",
+        "content",
+        "business-rules"
+      ],
+      "context_window": 128000,
+      "billing_mode": "api_cash",
+      "cost_class": 2,
+      "auth_source": "kimi-cli-login",
+      "status": "active",
+      "health_probe": {
+        "kind": "cli-print",
+        "timeout_ms": 20000
+      },
+      "note": "Kimi CLI authenticates from ~/.kimi/credentials on this machine, not KIMI_API_KEY. The kimi adapter descriptor keeps the contract's env spelling; this entry records the observed truth."
+    },
+    "anthropic-api-sonnet-5": {
+      "model_id": "claude-sonnet-5",
+      "provider": "anthropic",
+      "runtime_adapter": "anthropic-api",
+      "capability_tags": [
+        "structured-output",
+        "vision",
+        "scoped-retrieval",
+        "content",
+        "business-rules",
+        "conversation"
+      ],
+      "context_window": 200000,
+      "billing_mode": "api_cash",
+      "cost_class": 3,
+      "auth_source": "env:ANTHROPIC_API_KEY",
+      "status": "active",
+      "health_probe": {
+        "kind": "env-key"
+      },
+      "note": "For JARVIS direct-SDK call sites, not for PTY agents. ANTHROPIC_API_KEY is present in orgs/uhs secrets."
+    },
+    "openai-api-gpt-4o": {
+      "model_id": "gpt-4o",
+      "provider": "openai",
+      "runtime_adapter": "openai-api",
+      "capability_tags": [
+        "structured-output",
+        "vision",
+        "content",
+        "conversation"
+      ],
+      "context_window": 128000,
+      "billing_mode": "api_cash",
+      "cost_class": 3,
+      "auth_source": "env:OPENAI_API_KEY",
+      "status": "unavailable",
+      "health_probe": {
+        "kind": "env-key"
+      },
+      "note": "No OPENAI_API_KEY found in org secrets or agent .env files; marked unavailable rather than guessed active."
+    },
+    "openai-api-gpt-4o-mini": {
+      "model_id": "gpt-4o-mini",
+      "provider": "openai",
+      "runtime_adapter": "openai-api",
+      "capability_tags": [
+        "structured-output",
+        "content",
+        "conversation"
+      ],
+      "context_window": 128000,
+      "billing_mode": "api_cash",
+      "cost_class": 1,
+      "auth_source": "env:OPENAI_API_KEY",
+      "status": "unavailable",
+      "health_probe": {
+        "kind": "env-key"
+      },
+      "note": "No OPENAI_API_KEY found in org secrets or agent .env files; marked unavailable rather than guessed active."
+    },
+    "ollama-qwen25-coder-7b": {
+      "model_id": "qwen2.5-coder:7b",
+      "provider": "ollama",
+      "runtime_adapter": "ollama",
+      "capability_tags": [
+        "coding",
+        "structured-output"
+      ],
+      "context_window": 32768,
+      "billing_mode": "local",
+      "cost_class": 0,
+      "auth_source": null,
+      "status": "active",
+      "health_probe": {
+        "kind": "http-tags",
+        "url": "http://127.0.0.1:11434/api/tags",
+        "timeout_ms": 3000
+      },
+      "note": "Probed 2026-09-05: `ollama list` reports it and the local server answered /api/tags."
+    },
+    "ollama-llama32-3b": {
+      "model_id": "llama3.2:3b",
+      "provider": "ollama",
+      "runtime_adapter": "ollama",
+      "capability_tags": [
+        "conversation"
+      ],
+      "context_window": 131072,
+      "billing_mode": "local",
+      "cost_class": 0,
+      "auth_source": null,
+      "status": "active",
+      "health_probe": {
+        "kind": "http-tags",
+        "url": "http://127.0.0.1:11434/api/tags",
+        "timeout_ms": 3000
+      },
+      "note": "Probed 2026-09-05: `ollama list` reports it and the local server answered /api/tags."
+    }
+  },
+  "tiers": {
+    "economy": [
+      "anthropic-haiku-4-5",
+      "codex-gpt-5-codex",
+      "ollama-qwen25-coder-7b"
+    ],
+    "standard": [
+      "anthropic-sonnet-4-6",
+      "anthropic-sonnet-5",
+      "anthropic-sonnet-4-5",
+      "kimi-k2",
+      "codex-gpt-5-codex"
+    ],
+    "premium": [
+      "anthropic-opus-5",
+      "anthropic-fable-5-1",
+      "anthropic-opus-4-1"
+    ],
+    "review": [
+      "anthropic-fable-5-1",
+      "codex-gpt-6-astra"
+    ]
+  },
+  "org_default_tier": "standard",
+  "roles": {
+    "ingress": {
+      "tier": "standard",
+      "required_capabilities": [
+        "conversation",
+        "scoped-retrieval",
+        "tool-use"
+      ],
+      "role_capabilities": [],
+      "min_context": 100000,
+      "data_scope": "scott"
+    },
+    "dispatcher": {
+      "tier": "standard",
+      "required_capabilities": [
+        "structured-output",
+        "planning",
+        "scoped-retrieval"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "org"
+    },
+    "revenue_ops": {
+      "tier": "standard",
+      "required_capabilities": [
+        "tool-use",
+        "business-rules",
+        "structured-output"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "org"
+    },
+    "delivery_ops": {
+      "tier": "standard",
+      "required_capabilities": [
+        "tool-use",
+        "browser",
+        "business-rules"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "org"
+    },
+    "finance_ops": {
+      "tier": "standard",
+      "required_capabilities": [
+        "tool-use",
+        "structured-output",
+        "financial-scope"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "finance"
+    },
+    "listing_intel": {
+      "tier": "economy",
+      "required_capabilities": [
+        "structured-output",
+        "scoped-retrieval"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 50000,
+      "data_scope": "org"
+    },
+    "growth_ops": {
+      "tier": "standard",
+      "required_capabilities": [
+        "content",
+        "scoped-retrieval"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "org"
+    },
+    "vera": {
+      "tier": "standard",
+      "required_capabilities": [
+        "conversation",
+        "tool-use"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "raquel"
+    },
+    "vivienne": {
+      "tier": "standard",
+      "required_capabilities": [
+        "conversation",
+        "vision"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "angelic"
+    },
+    "builder": {
+      "tier": "economy",
+      "required_capabilities": [
+        "coding",
+        "tool-use",
+        "sandbox"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "repos"
+    },
+    "verifier": {
+      "tier": "review",
+      "required_capabilities": [
+        "coding",
+        "tool-use",
+        "evidence-review"
+      ],
+      "role_capabilities": [
+        "continuous-improvement"
+      ],
+      "min_context": 100000,
+      "data_scope": "repos"
+    }
+  },
+  "agents": {
+    "jarvis-telegram": {
+      "role": "ingress",
+      "pin": null
+    },
+    "jarvis-orchestrator": {
+      "role": "dispatcher",
+      "pin": null
+    },
+    "jarvis-heartbeat": {
+      "role": "dispatcher",
+      "pin": null
+    },
+    "tron": {
+      "role": "dispatcher",
+      "pin": null
+    },
+    "jarvis-estimator": {
+      "role": "revenue_ops",
+      "pin": null
+    },
+    "jarvis-inventory": {
+      "role": "delivery_ops",
+      "pin": null
+    },
+    "jarvis-accounting": {
+      "role": "finance_ops",
+      "pin": null
+    },
+    "jarvis-mls": {
+      "role": "listing_intel",
+      "pin": null
+    },
+    "jarvis-marketing": {
+      "role": "growth_ops",
+      "pin": null
+    },
+    "vera": {
+      "role": "vera",
+      "pin": null
+    },
+    "vivienne": {
+      "role": "vivienne",
+      "pin": null
+    },
+    "trillion-coder": {
+      "role": "builder",
+      "pin": null
+    }
+  },
+  "callsites": {}
+}

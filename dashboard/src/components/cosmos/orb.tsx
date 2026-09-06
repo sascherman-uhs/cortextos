@@ -13,6 +13,17 @@ import * as THREE from 'three';
 import { createOrbMaterial, createGlowMaterial } from './orb-shader';
 import { NodeWeb } from './node-web';
 import { TEAL, MINT } from './palette';
+// === JARVIS MOD #57: shared smoothing helpers (nothing snaps) ===
+import { approach, approachAsym } from './motion';
+// === JARVIS MOD #79: soft atmospheric bloom sprite (shells make edges) ===
+import { getSoftGlowTexture } from './dot-texture';
+// === JARVIS MOD #70: frozen scene clock for prefers-reduced-motion ===
+import { sceneTime, sceneDelta, sceneHalfLife } from './reduced-motion';
+// === END JARVIS MOD #57/#70 ===
+
+// MOD #72: allocated once — these are lerp targets read every frame.
+const BLOOM_TINT = new THREE.Color('#4c4fa8');
+const CORE_TINT = new THREE.Color('#ffffff');
 
 interface OrbProps {
   /** Surface displacement amplitude (idle breathing → live mic/TTS amplitude). */
@@ -51,28 +62,92 @@ export function Orb({
   const smoothRing = useRef(0);
 
   const orbMat = useMemo(() => createOrbMaterial(color, rim), []); // eslint-disable-line react-hooks/exhaustive-deps
-  const glowMat = useMemo(() => createGlowMaterial(rim), []); // eslint-disable-line react-hooks/exhaustive-deps
+  // === JARVIS MOD #57 — three glow layers (2026-08-03).
+  // The spec calls for wide atmospheric bloom + medium halo + bright inner core,
+  // all additive, wrapping the fresnel-rimmed wireframe. Previously ONE shell,
+  // which read flat and let the orb's silhouette die into the nebula. ===
+  // === JARVIS MOD #72 (2026-08-03): the three layers must READ as three.
+  // Wave-2 tuned the beige wash out by flattening everything toward zero, which
+  // left one soft gradient — the critic's zoomed crops couldn't find a second
+  // layer, let alone a third. Depth comes from CONTRAST between the layers, not
+  // total brightness: a TIGHT bright core (small solid angle, so it costs
+  // almost no total light), a medium halo at a clearly different radius, and a
+  // wide bloom faint enough that it never tints the nebula. ===
+  // MOD #79: the wide layer is a camera-facing sprite, NOT a fresnel shell —
+  // a shell is brightest at its silhouette and drew a visible disc edge.
+  const bloomTex = useMemo(() => getSoftGlowTexture(), []);
+  const bloomMatRef = useRef<THREE.SpriteMaterial>(null);
+  const haloMat = useMemo(() => createGlowMaterial(rim, { power: 2.4, strength: 0.19 }), []); // eslint-disable-line react-hooks/exhaustive-deps
+  const coreMat = useMemo(
+    () => createGlowMaterial(color, { power: 6.5, strength: 0.7, core: 1, side: THREE.FrontSide }),
+    [], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  // Layer tints (module-level constants would re-allocate per frame otherwise).
+  // Asymmetric voice-brightness envelope: leaps on syllables, releases slowly.
+  const voiceBright = useRef(brightness);
+  // === END JARVIS MOD #57 ===
 
   useFrame((state, delta) => {
-    const t = state.clock.elapsedTime;
+    // MOD #70: both frozen while prefers-reduced-motion is on, so any frame
+    // that does get drawn is identical to the last one.
+    const t = sceneTime(state.clock.elapsedTime);
+    const dt = sceneDelta(delta); // also guards tab-resume delta spikes
+
+    // === JARVIS MOD #57: fast attack (~60ms half-life), slow decay (~380ms),
+    // plus the spec's ~4s idle sine so the orb is never static even at rest. ===
+    voiceBright.current = approachAsym(
+      voiceBright.current,
+      brightness,
+      sceneHalfLife(0.06),
+      sceneHalfLife(0.38),
+      dt,
+    );
+    const idlePulse = 1 + Math.sin((t * Math.PI * 2) / 4) * 0.045;
+    const vb = voiceBright.current * idlePulse;
+    // === END JARVIS MOD #57 ===
 
     // Drive orb shader uniforms from live props.
     orbMat.uniforms.uTime.value = t;
-    orbMat.uniforms.uAmp.value = amplitude * 3.7; // scale idle(0.035) → visible roil
-    orbMat.uniforms.uBrightness.value = brightness;
+    orbMat.uniforms.uAmp.value = amplitude * 4.6; // MOD #73: 3.7 → 4.6, visible roil
+    orbMat.uniforms.uBrightness.value = vb;
     (orbMat.uniforms.uColor.value as THREE.Color).set(color);
     (orbMat.uniforms.uRimColor.value as THREE.Color).set(rim);
-    (glowMat.uniforms.uColor.value as THREE.Color).set(rim);
-    glowMat.uniforms.uStrength.value = 0.45 * brightness;
+    // === JARVIS MOD #57: all three layers track live color + the eased envelope ===
+    // MOD #72/#79: the bloom sprite is tinted above; halo/core below.
+    // MOD #72: bloom is tinted hard toward the nebula indigo and the core
+    // toward white — three layers that differ in radius, falloff AND hue read
+    // as three; three that differ only in radius blend into one gradient.
+    // The heavy indigo lerp also keeps the widest layer COOL at every state:
+    // a wide surface that follows the gold rim is exactly what produced the
+    // wave-2 beige wash, so the warm accent stays on the core + halo only.
+    (haloMat.uniforms.uColor.value as THREE.Color).set(rim);
+    // MOD #79: 0.3 → 0.16. At 0.3 the listening core blew out to white and the
+    // orb lost its gold identity — hot has to stay HUED, not clipped.
+    (coreMat.uniforms.uColor.value as THREE.Color).set(color).lerp(CORE_TINT, 0.16);
+    if (bloomMatRef.current) {
+      bloomMatRef.current.color.set(rim).lerp(BLOOM_TINT, 0.72);
+      bloomMatRef.current.opacity = 0.5 * vb;
+    }
+    haloMat.uniforms.uStrength.value = 0.19 * vb;
+    coreMat.uniforms.uStrength.value = 0.7 * vb;
+    // === END JARVIS MOD #57 ===
 
     // Slow two-axis tumble.
+    // === JARVIS MOD #73 (2026-08-03): the icosahedron read as RIGID. The noise
+    // displacement was real but sampled in OBJECT space, so the deformation
+    // rotated WITH the mesh — a fixed shape spinning, which is exactly what
+    // "rigid" looks like. Fixed by evolving the noise field faster (orb-shader)
+    // and adding the spec's 6s scale breath on top, which is deformation the
+    // tumble cannot disguise. ===
     if (groupRef.current) {
       groupRef.current.rotation.y = t * 0.12;
       groupRef.current.rotation.x = t * 0.05;
+      const breath = 1 + Math.sin((t * Math.PI * 2) / 6) * 0.04; // spec: 6s, 1→1.04
+      groupRef.current.scale.setScalar(breath);
     }
 
     // Ease ring strength so processing enter/exit is smooth.
-    smoothRing.current += (ringStrength - smoothRing.current) * Math.min(delta * 3, 1);
+    smoothRing.current = approach(smoothRing.current, ringStrength, sceneHalfLife(0.22), dt);
     const rs = smoothRing.current;
     if (ring1Ref.current && ring2Ref.current) {
       ring1Ref.current.rotation.z = t * 0.9;
@@ -96,12 +171,37 @@ export function Orb({
         <icosahedronGeometry args={[1.55, detail]} />
       </mesh>
 
-      {/* Additive glow shell */}
+      {/* === JARVIS MOD #57: three additive glow layers, outer → inner.
+          Low-perf drops the bloom + core but KEEPS the halo — the mobile hero
+          orb reads as a bare wireframe without it (MOD #59). === */}
+      <mesh material={haloMat}>
+        <icosahedronGeometry args={[2.25, showGlow ? 5 : 3]} />
+      </mesh>
       {showGlow && (
-        <mesh material={glowMat}>
-          <icosahedronGeometry args={[1.85, 3]} />
-        </mesh>
+        <>
+          {/* Wide atmospheric bloom — a camera-facing sprite with a long
+              gradient tail. Brightest AT the body, fading outward with no
+              silhouette, which is what atmosphere does and a shell cannot. */}
+          {bloomTex && (
+            <sprite scale={[9, 9, 1]}>
+              <spriteMaterial
+                ref={bloomMatRef}
+                map={bloomTex}
+                transparent
+                depthWrite={false}
+                blending={THREE.AdditiveBlending}
+                opacity={0.5}
+              />
+            </sprite>
+          )}
+          {/* Bright inner core (front-side, center-bright). Tight radius +
+              high falloff power = a small hot centre, not a filled ball. */}
+          <mesh material={coreMat}>
+            <icosahedronGeometry args={[1.12, 4]} />
+          </mesh>
+        </>
       )}
+      {/* === END JARVIS MOD #57 === */}
 
       {/* Sparse internal node-web (tumbles with the orb) */}
       {internalNodes > 0 && (

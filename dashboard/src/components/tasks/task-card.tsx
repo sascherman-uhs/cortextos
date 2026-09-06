@@ -1,7 +1,7 @@
 'use client';
 
 import { Card } from '@/components/ui/card';
-import { PriorityBadge, OrgBadge, TimeAgo } from '@/components/shared';
+import { PriorityBadge, OrgBadge, OriginBadge, TimeAgo } from '@/components/shared';
 // UHS MOD #7 — task number badge (components/uhs/ never overwritten by upstream)
 import { TaskNumberBadge } from '@/components/uhs/task-number-badge';
 import type { Task } from '@/lib/types';
@@ -28,6 +28,7 @@ export function TaskCard({ task, onClick }: TaskCardProps) {
         <div className="flex flex-wrap items-center gap-1.5">
           <PriorityBadge priority={task.priority} />
           <OrgBadge org={task.org} />
+          <OriginBadge task={task} />
         </div>
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           {task.assignee ? (

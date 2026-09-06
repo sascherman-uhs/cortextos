@@ -6,6 +6,11 @@ import { getTaskById } from '@/lib/data/tasks';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { syncAll } from '@/lib/sync';
 import { db } from '@/lib/db';
+import { auth } from '@/lib/auth';
+import { transitionTask } from '@/lib/task-transition';
+import { sourceForTaskId, toCanonical, type CanonicalState } from '@/lib/data/transition-contract';
+import { offeredActions } from '@/lib/tasks/offered-actions';
+import { signedInActor } from '@/lib/actor';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,6 +31,15 @@ function isValidId(id: string): boolean {
 // passing values into bus shell scripts as positional arguments.
 function isValidAgentName(name: string): boolean {
   return typeof name === 'string' && /^[a-z0-9_-]+$/.test(name) && name.length <= 64;
+}
+
+// A person's name, reduced to something safe to record as an actor/verifier in
+// the task journal and to pass as a positional CLI argument. Returns undefined
+// when there is nothing usable, so the caller can fall back.
+function sanitizeActor(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  const cleaned = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? cleaned.slice(0, 64) : undefined;
 }
 
 // Cap free-text fields (note, outputSummary) to a safe upper bound before
@@ -55,12 +69,23 @@ export async function GET(
       return Response.json({ error: 'Task not found' }, { status: 404 });
     }
 
+    // The canonical state the OWNING store holds, not the one the SQLite
+    // projection infers. They can disagree: a native record carrying
+    // canonical_state 'failed_terminal' has native status 'pending', which the
+    // projection reads as 'backlog'. The detail sheet derives its buttons from
+    // this, so guessing here is how it came to offer moves the contract
+    // refuses. Falls back to the projection only when the record states none.
+    let canonicalState: CanonicalState | null = null;
+
     // Enrich with outputs from the source JSON file (outputs are not synced to SQLite)
     if (task.source_file && fs.existsSync(task.source_file)) {
       try {
         const raw = JSON.parse(fs.readFileSync(task.source_file, 'utf-8'));
         if (Array.isArray(raw.outputs)) {
           task.outputs = raw.outputs;
+        }
+        if (typeof raw.canonical_state === 'string' && raw.canonical_state) {
+          canonicalState = raw.canonical_state as CanonicalState;
         }
       } catch { /* non-fatal — outputs are optional */ }
     }
@@ -79,12 +104,21 @@ export async function GET(
         try {
           // Fetch payload + result + error for full task context
           const payloadRes = await fetch(
-            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error`,
+            `${supaUrl}/rest/v1/tasks?id=eq.${supaId}&select=payload,result,error,version,canonical_state`,
             { headers: sbHeaders, cache: 'no-store' },
           );
           if (payloadRes.ok) {
             const rows = await payloadRes.json();
             const payload = rows[0]?.payload ?? {};
+            // The owning store's version wins over the SQLite projection, which
+            // can lag a sync cycle. The detail view sends this back as
+            // expectedVersion, so a stale number here is a blind write.
+            if (Number.isFinite(Number(rows[0]?.version))) {
+              Object.assign(task, { version: Number(rows[0].version) });
+            }
+            if (typeof rows[0]?.canonical_state === 'string' && rows[0].canonical_state) {
+              canonicalState = rows[0].canonical_state as CanonicalState;
+            }
             const rtId = payload.recurring_task_id;
             // Pass result + error through to the task object
             if (rows[0]?.result !== undefined) {
@@ -123,6 +157,16 @@ export async function GET(
         } catch { /* non-fatal — recurring info is optional */ }
       }
     }
+
+    // The moves this record may actually make, derived from the contract and
+    // filtered to what PATCH can express. The client renders these rather than
+    // keeping a second table of buttons that can drift out of agreement.
+    const source = sourceForTaskId(id);
+    const from = canonicalState ?? toCanonical(source, task.status);
+    Object.assign(task, {
+      canonicalState: from,
+      offeredActions: offeredActions(source, from),
+    });
 
     return Response.json(task);
   } catch (err) {
@@ -191,23 +235,63 @@ export async function DELETE(
     }
   }
 
-  // Delete the task file directly
-  const fs = await import('fs/promises');
-  const path = await import('path');
-  const ctxRoot = getCTXRoot();
-  const taskDir = task.org
-    ? path.default.join(ctxRoot, 'orgs', task.org, 'tasks')
-    : path.default.join(ctxRoot, 'tasks');
-  const taskFile = path.default.join(taskDir, `${id}.json`);
-
-  try {
-    await fs.default.unlink(taskFile);
-    try { syncAll(); } catch { /* best-effort */ }
-    return Response.json({ success: true });
-  } catch (err) {
-    console.error('[api/tasks/[id]] DELETE error:', err);
-    return Response.json({ error: 'Failed to delete task' }, { status: 500 });
+  // fix7 — a delete goes through `bus delete-task`, not through unlink.
+  //
+  // Unlinking the task JSON left the audit log, the event journal, the claim
+  // lock, the deliverables tree and — the part that actually hurt — unacked
+  // messages in live agents' inboxes saying "Task status updated to
+  // in_progress: [task_…]" about a task that no longer existed. Thirteen of
+  // those were found in real inboxes. The CLI command sweeps all of it and
+  // writes a tombstone naming who deleted what and why.
+  //
+  // `--force` is passed because this button cannot yet surface a refusal: the
+  // page ignores a non-ok response, so a contract refusal would read as a
+  // delete that silently did nothing. The deletion log records the forcing and
+  // the person. Surfacing the "cancel it instead" refusal in the UI is the
+  // follow-up; it needs an error path on the button first.
+  if (!task.org) {
+    return Response.json(
+      { error: 'Task has no organization; refusing to delete it by guessing which org owns it.' },
+      { status: 409 },
+    );
   }
+
+  const frameworkRoot = getFrameworkRoot();
+  const actor = (await signedInActor()) ?? 'dashboard';
+
+  const result = spawnSync(
+    'bash',
+    [
+      path.join(frameworkRoot, 'bus', 'delete-task.sh'),
+      id,
+      `deleted from the dashboard by ${actor}`,
+      '--force',
+      '--org',
+      task.org,
+    ],
+    {
+      timeout: 15000,
+      stdio: 'pipe',
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        CTX_FRAMEWORK_ROOT: frameworkRoot,
+        CTX_ROOT: getCTXRoot(),
+        CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default',
+        CTX_AGENT_NAME: 'dashboard',
+        CTX_ORG: task.org,
+      },
+    },
+  );
+
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || '').toString().trim();
+    console.error('[api/tasks/[id]] DELETE failed:', detail);
+    return Response.json({ error: 'Failed to delete task', detail }, { status: 500 });
+  }
+
+  try { syncAll(); } catch { /* the SQLite projection also self-heals on the next sync */ }
+  return Response.json({ success: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -347,55 +431,78 @@ export async function PUT(
     }
   }
 
-  // Read and update the task JSON file directly
-  const fs = await import('fs/promises');
-  const path = await import('path');
-  const ctxRoot = getCTXRoot();
-  const taskDir = task.org
-    ? path.default.join(ctxRoot, 'orgs', task.org, 'tasks')
-    : path.default.join(ctxRoot, 'tasks');
-  const taskFile = path.default.join(taskDir, `${id}.json`);
+  // ---------------------------------------------------------------------------
+  // OS-02: field edits go through the same locked, versioned write path the bus
+  // uses. The previous implementation read the task JSON, mutated it in memory
+  // and renamed a temp file over it — no lock, no version, no journal entry.
+  // Any concurrent agent write in that window was lost, and nothing recorded
+  // that a human had edited the task at all. This was the writer that would
+  // have quietly defeated the whole contract.
+  // ---------------------------------------------------------------------------
+  const { editTaskFields } = await import('@/lib/task-edit');
+  const editResult = editTaskFields({
+    taskId: id,
+    org: task.org || '',
+    actor: 'dashboard',
+    expectedVersion: typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined,
+    fields: {
+      ...(title !== undefined ? { title: title.trim() } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(assignee !== undefined ? { assigned_to: assignee } : {}),
+      ...(priority !== undefined ? { priority } : {}),
+    },
+  });
 
-  try {
-    const raw = await fs.default.readFile(taskFile, 'utf-8');
-    const taskData = JSON.parse(raw);
-
-    const oldAssignee = taskData.assigned_to;
-    if (title !== undefined) taskData.title = title.trim();
-    if (description !== undefined) taskData.description = description;
-    if (assignee !== undefined) taskData.assigned_to = assignee;
-    if (priority !== undefined) taskData.priority = priority;
-    taskData.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-
-    const tmp = taskFile + '.tmp';
-    await fs.default.writeFile(tmp, JSON.stringify(taskData, null, 2) + '\n');
-    await fs.default.rename(tmp, taskFile);
-
-    // Notify new assignee if changed. assignee was validated against the
-    // agent-name whitelist above, and the message body is capped before it
-    // is passed as a positional arg to the bus script (which quotes "$3").
-    if (assignee && assignee !== oldAssignee && assignee !== 'human' && assignee !== 'user' && isValidAgentName(assignee)) {
-      try {
-        const notifyMsg = capText(`Task reassigned to you: [${id}] ${taskData.title}`);
-        spawnSync(
-          'bash',
-          [
-            path.join(getFrameworkRoot(), 'bus', 'send-message.sh'),
-            assignee,
-            'normal',
-            notifyMsg,
-          ],
-          { timeout: 5000, stdio: 'pipe', env: { ...process.env, CTX_FRAMEWORK_ROOT: getFrameworkRoot(), CTX_ROOT: getCTXRoot(), CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default', CTX_AGENT_NAME: 'dashboard', CTX_ORG: task?.org || '' } },
-        );
-      } catch { /* non-fatal */ }
+  if (!editResult.ok) {
+    if (editResult.status === 409) {
+      return Response.json(
+        {
+          error: 'version_conflict',
+          message:
+            'This task changed while you were editing it. The current record is shown below — review it and try again.',
+          current: editResult.current,
+          currentVersion: editResult.currentVersion,
+        },
+        { status: 409 },
+      );
     }
-
-    try { syncAll(); } catch { /* best-effort */ }
-    return Response.json({ success: true });
-  } catch (err) {
-    console.error('[api/tasks/[id]] PUT error:', err);
-    return Response.json({ error: 'Failed to update task' }, { status: 500 });
+    console.error('[api/tasks/[id]] PUT error:', editResult.error, editResult.detail ?? '');
+    return Response.json({ error: editResult.error, detail: editResult.detail }, { status: editResult.status });
   }
+
+  // Notify the new assignee if it changed. `assignee` was validated against the
+  // agent-name whitelist above, and the message body is capped before it is
+  // passed as a positional arg to the bus script (which quotes "$3").
+  if (
+    assignee &&
+    assignee !== editResult.previousAssignee &&
+    assignee !== 'human' &&
+    assignee !== 'user' &&
+    isValidAgentName(assignee)
+  ) {
+    try {
+      const notifyMsg = capText(`Task reassigned to you: [${id}] ${editResult.title}`);
+      spawnSync(
+        'bash',
+        [path.join(getFrameworkRoot(), 'bus', 'send-message.sh'), assignee, 'normal', notifyMsg],
+        {
+          timeout: 5000,
+          stdio: 'pipe',
+          env: {
+            ...process.env,
+            CTX_FRAMEWORK_ROOT: getFrameworkRoot(),
+            CTX_ROOT: getCTXRoot(),
+            CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default',
+            CTX_AGENT_NAME: 'dashboard',
+            CTX_ORG: task.org || '',
+          },
+        },
+      );
+    } catch { /* non-fatal — the assignment is already persisted */ }
+  }
+
+  try { syncAll(); } catch { /* best-effort */ }
+  return Response.json({ success: true, version: editResult.version });
 }
 
 // ---------------------------------------------------------------------------
@@ -448,66 +555,120 @@ export async function PATCH(
 
   // Look up task's org to pass CTX_ORG to bus script
   const task = getTaskById(id);
+  if (!task) {
+    return Response.json({ error: 'Task not found' }, { status: 404 });
+  }
 
   // ---------------------------------------------------------------------------
-  // Supabase-sourced tasks (id prefix "supa_") — bus scripts can't find these
-  // because they live only in SQLite, not in CortexOS JSON files. Handle them
-  // by calling Supabase REST directly and updating the local SQLite cache.
+  // OS-02: one transition service for both stores.
+  //
+  // The Supabase and native branches used to be separate state machines with
+  // separate conflict behavior — neither of which actually detected a conflict.
+  // Both now go through the same call, return the same shape, and answer a
+  // concurrent edit with a 409 carrying the current record so the board can
+  // show what happened and refresh instead of overwriting somebody's work.
   // ---------------------------------------------------------------------------
-  if (id.startsWith('supa_')) {
-    const supabaseId = id.slice(5); // strip "supa_" prefix → numeric string
-    const supaUrl = process.env.SUPABASE_URL;
-    const supaKey = process.env.SUPABASE_KEY;
+  const expectedVersion =
+    typeof body.expectedVersion === 'number' ? body.expectedVersion : undefined;
 
-    if (!supaUrl || !supaKey) {
+  // Who is doing this. The signed-in person if there is one — the contract asks
+  // for a NAMED verifier, and 'dashboard' names a program, not a person. Never
+  // taken from the request body for anything that matters; body.actor is only a
+  // hint and must still pass the agent-name whitelist.
+  const session = await auth().catch(() => null);
+  const sessionActor = sanitizeActor(session?.user?.name);
+  const actor =
+    sessionActor ??
+    (typeof body.actor === 'string' && isValidAgentName(body.actor) ? body.actor : 'dashboard');
+
+  const suppliedEvidence =
+    body.evidence && typeof body.evidence === 'object' && !Array.isArray(body.evidence)
+      ? { ...(body.evidence as Record<string, unknown>) }
+      : {};
+  if (suppliedEvidence.result === undefined && outputSummary) {
+    suppliedEvidence.result = capText(outputSummary);
+  }
+  if (suppliedEvidence.result === undefined && suppliedEvidence.artifact === undefined && note) {
+    suppliedEvidence.result = capText(note);
+  }
+  if (status === 'completed') {
+    // The person who clicked Complete IS the verifier, and recording that is a
+    // true statement. What is NOT invented here is acceptance-check results: a
+    // task that declares acceptance criteria with no recorded results stays
+    // refused (plan §12 — no verified Done without proof).
+    if (suppliedEvidence.verifier === undefined) suppliedEvidence.verifier = actor;
+    if (suppliedEvidence.verification_method === undefined) {
+      suppliedEvidence.verification_method = 'human_review';
+    }
+  }
+  const evidence = Object.keys(suppliedEvidence).length > 0 ? suppliedEvidence : undefined;
+
+  // NOTE: `origin` is deliberately NOT read from the body. This is an HTTP
+  // caller acting for a human, so the transition service marks it interactive
+  // and the contract is enforced regardless of the per-source shadow flag.
+  const outcome = await transitionTask({
+    taskId: id,
+    to: status,
+    actor,
+    expectedVersion,
+    evidence,
+    reason: note ? capText(note) : undefined,
+    org: task.org || '',
+  });
+
+  if (!outcome.ok) {
+    if (outcome.status === 422) {
+      // A move the work contract refuses. 422 rather than 500: the request was
+      // well formed, the rules said no. The board renders `message` in its
+      // live-region alert, which names the legal moves.
       return Response.json(
-        { error: 'SUPABASE_URL / SUPABASE_KEY not configured in .env.local' },
-        { status: 500 },
-      );
-    }
-
-    try {
-      const now = new Date().toISOString();
-      const patch: Record<string, string | null> = { status };
-      if (status === 'completed') patch.completed_at = now;
-      if (status === 'in_progress') patch.started_at = now;
-
-      const sbRes = await fetch(
-        `${supaUrl}/rest/v1/tasks?id=eq.${supabaseId}`,
         {
-          method: 'PATCH',
-          headers: {
-            apikey: supaKey,
-            Authorization: `Bearer ${supaKey}`,
-            'Content-Type': 'application/json',
-            Prefer: 'return=minimal',
-          },
-          body: JSON.stringify(patch),
+          error: outcome.error,
+          message: outcome.message,
+          detail: outcome.detail,
+          violation: outcome.violation,
+          legalTransitions: outcome.legalTransitions,
         },
+        { status: 422 },
       );
-
-      if (!sbRes.ok) {
-        const errText = await sbRes.text();
-        throw new Error(`Supabase PATCH failed ${sbRes.status}: ${errText}`);
-      }
-
-      // Mirror immediately in local SQLite so the UI updates before next sync
-      db.prepare(
-        `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?
-         WHERE id = ?`,
-      ).run(
-        status,
-        now,
-        status === 'completed' ? now : null,
-        id,
-      );
-
-      return Response.json({ success: true });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error('[api/tasks/[id]] supa_ PATCH error:', message);
-      return Response.json({ error: `Failed to update task: ${message}` }, { status: 500 });
     }
+    if (outcome.status === 409) {
+      return Response.json(
+        {
+          error: 'version_conflict',
+          message:
+            'This task changed while you were looking at it. The current state is shown below — review it and try again.',
+          current: outcome.current,
+          currentVersion: outcome.currentVersion,
+        },
+        { status: 409 },
+      );
+    }
+    console.error('[api/tasks/[id]] PATCH transition failed:', outcome.error, outcome.detail ?? '');
+    return Response.json(
+      { error: outcome.error, detail: outcome.detail },
+      { status: outcome.status },
+    );
+  }
+
+  // Mirror the Supabase result into SQLite so the board reflects it before the
+  // next sync. SQLite is a projection; this is a cache refresh, not authority.
+  if (id.startsWith('supa_')) {
+    const now = new Date().toISOString();
+    db.prepare(
+      `UPDATE tasks SET status = ?, updated_at = ?, completed_at = ?, version = ? WHERE id = ?`,
+    ).run(
+      outcome.nativeStatus,
+      now,
+      outcome.nativeStatus === 'completed' ? now : null,
+      outcome.version ?? 1,
+      id,
+    );
+    return Response.json({
+      success: true,
+      version: outcome.version,
+      canonicalState: outcome.canonicalState,
+    });
   }
 
   const frameworkRoot = getFrameworkRoot();
@@ -517,38 +678,10 @@ export async function PATCH(
     CTX_ROOT: getCTXRoot(),
     CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID ?? 'default',
     CTX_AGENT_NAME: 'dashboard',
-    CTX_ORG: task?.org || '',
+    CTX_ORG: task.org || '',
   };
 
   try {
-    let spawnResult;
-    if (status === 'completed') {
-      // Use complete-task.sh for completion (handles additional side effects).
-      // summaryArg is capped and passed as a positional arg; the bus script
-      // quotes "$2" and exec's node directly, so no shell interpolation occurs.
-      const summaryArg = capText(outputSummary);
-      spawnResult = spawnSync(
-        'bash',
-        [path.join(frameworkRoot, 'bus', 'complete-task.sh'), id, summaryArg],
-        { encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe' },
-      );
-    } else {
-      // Use update-task.sh for other status changes. All args are positional
-      // and bounded; blockedBy was validated above, id/status are whitelisted.
-      const args: string[] = [id, status];
-      if (note) args.push(capText(note));
-      if (blockedBy) args.push(String(blockedBy));
-
-      spawnResult = spawnSync(
-        'bash',
-        [path.join(frameworkRoot, 'bus', 'update-task.sh'), ...args],
-        { encoding: 'utf-8', timeout: 10000, env, stdio: 'pipe' },
-      );
-    }
-    if (spawnResult.status !== 0) {
-      throw new Error(spawnResult.stderr || spawnResult.stdout || 'Script failed');
-    }
-
     // Notify the task creator when a task is completed or status changes significantly.
     // This is how agents find out their blocked tasks can be unblocked.
     if (task?.source_file) {
@@ -561,8 +694,29 @@ export async function PATCH(
         // the recipient name passes the agent-name whitelist — prevents
         // passing crafted names into the bus CLI.
         const agentNames = new Set(['dashboard', 'human', 'user']);
-        if (createdBy && !agentNames.has(createdBy) && isValidAgentName(createdBy)) {
-          const rawMsg = status === 'completed'
+
+        // fix8 — do not put a NEW pointer into an inbox for work that is over.
+        //
+        // The store has just superseded every message naming this task, because
+        // the transition reached a terminal state. Sending a fresh
+        // "Task status updated to cancelled: [task_…]" straight afterwards
+        // would land AFTER that sweep and undo it: the assignee ends up holding
+        // a pointer to cancelled work again, which is the defect this route was
+        // making worse rather than fixing.
+        //
+        // `done` is the deliberate exception, and only in its unblocking form:
+        // that message is not an instruction about the finished task, it tells
+        // the recipient that THEIR OWN blocked work can move. Cancelled and
+        // abandoned carry no such consequence for anyone, so they send nothing;
+        // the outcome is on the board and in the superseded notice.
+        const terminalOutcome =
+          outcome.canonicalState === 'done'
+          || outcome.canonicalState === 'cancelled'
+          || outcome.canonicalState === 'failed_terminal';
+        const notifiable = !terminalOutcome || outcome.canonicalState === 'done';
+
+        if (notifiable && createdBy && !agentNames.has(createdBy) && isValidAgentName(createdBy)) {
+          const rawMsg = outcome.canonicalState === 'done'
             ? `Human task completed by user: [${id}] ${task.title} - you can now unblock your work`
             : `Task status updated to ${status}: [${id}] ${task.title}`;
           const msg = capText(rawMsg);
@@ -585,7 +739,11 @@ export async function PATCH(
       // Sync is best-effort
     }
 
-    return Response.json({ success: true });
+    return Response.json({
+      success: true,
+      version: outcome.version,
+      canonicalState: outcome.canonicalState,
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[api/tasks/[id]] PATCH error:', message);

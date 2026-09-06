@@ -69,3 +69,69 @@ export function normalizeOrgName(frameworkRoot: string, org: string): string {
 
   return org;
 }
+
+/**
+ * The organizations that exist under a framework root, in on-disk casing.
+ *
+ * Used to turn "no org set" from a silent misfile into a message that names
+ * the orgs the caller could have used. Returns an empty list when the
+ * directory cannot be read — an empty list is "we could not tell you", and
+ * callers word it that way rather than claiming there are none.
+ */
+export function listOrgNames(frameworkRoot: string): string[] {
+  try {
+    return readdirSync(join(frameworkRoot, 'orgs'), { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The org an org-scoped write must name, or the message explaining why it
+ * cannot go ahead.
+ *
+ * `bus create-task` with no org resolved its paths to `<instance>/tasks/` —
+ * a directory nothing reads. Dashboard sync walks
+ * `<instance>/orgs/<org>/tasks/` and only that, so the CLI printed a task id,
+ * the caller believed the task existed, and it reached no board, no
+ * projection and no agent. Silent loss.
+ *
+ * `bus create-approval` had the same hole against `<instance>/approvals/`,
+ * where it is worse: an approval request for a high-stakes action that
+ * reaches no human reads, to the agent that asked, exactly like one that is
+ * merely still pending.
+ */
+export function requireOrgForOrgScopedWrite(
+  org: string | undefined,
+  frameworkRoot: string,
+  kind: 'task' | 'approval' = 'task',
+  /** What the caller was about to do. `delete` reaches the same refusal from
+   *  the other direction: an unqualified delete would scan for the id across
+   *  every org and remove whichever copy it happened to find first. */
+  action: 'create' | 'delete' = 'create',
+): { ok: true; org: string } | { ok: false; message: string } {
+  const name = (org ?? '').trim();
+  if (name) return { ok: true, org: name };
+  const available = listOrgNames(frameworkRoot);
+  const reader =
+    kind === 'approval'
+      ? 'not the approvals queue, not sync, not any human'
+      : 'not the board, not sync, not any agent';
+  const article = kind === 'approval' ? 'an' : 'a';
+  const why =
+    action === 'delete'
+      ? `Refusing to delete ${article} ${kind} with no organization: the id would be resolved against every org directory `
+        + 'and the first match removed, which is a guess about whose work is being destroyed.'
+      : `Refusing to create ${article} ${kind} with no organization: it would be written outside every `
+        + `org directory, where nothing reads it — ${reader}.`;
+  return {
+    ok: false,
+    message:
+      why + '\n'
+      + 'Pass --org <name> or set CTX_ORG.'
+      + (available.length ? `\nOrganizations here: ${available.join(', ')}.` : ''),
+  };
+}

@@ -13,6 +13,8 @@
 //   - telegramToday                 → count today's lines in jarvis-telegram
 //                                     inbound/outbound-messages.jsonl
 import { auth } from '@/lib/auth';
+// === JARVIS MOD #65 — shared staging definitions (see the file header for why) ===
+import { fetchStagingCounts } from '@/lib/uhs/staging-status';
 import { IPCClient } from '@/lib/ipc-client';
 import { getLogDir } from '@/lib/config';
 import fs from 'fs/promises';
@@ -36,9 +38,13 @@ const MLS_ENV_PATH =
   '/Users/sascherman/Utopia Home Staging Dropbox/UHS/Collective/uhsMLS/.env';
 const MLS_SUPABASE_URL = 'https://eyyhgnmawyqfrhavuzks.supabase.co';
 
-// ---- 60s server-side cache -------------------------------------------------
+// ---- server-side caches ----------------------------------------------------
+// Main cache (fleet uptime, tasks, stagings, MLS): 60s — these change often.
+// Telegram-today cache: 24h — daily counter, stale-on-first-load is acceptable.
 let cache: { at: number; data: CosmosStats } | null = null;
 const CACHE_MS = 60_000;
+let tgCache: { at: number; value: Metric<number> } | null = null;
+const TG_CACHE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function unavailable(reason: string): { ok: false; unavailable: string } {
   return { ok: false, unavailable: reason };
@@ -94,21 +100,19 @@ async function jarvisMetrics(): Promise<{
     'tasks?status=eq.pending&select=id',
   );
 
-  // Active stagings: probe likely tables in order; the first that responds wins.
-  // If none exist we honestly report unavailable rather than inventing a number.
-  let activeStagings: Metric<number> = unavailable('no stagings table');
-  const candidates = [
-    'projects?status=eq.active&select=id',
-    'stagings?status=eq.active&select=id',
-    'staging_projects?status=eq.active&select=id',
-  ];
-  for (const q of candidates) {
-    const m = await supabaseCount(url, key, q);
-    if (m.ok) {
-      activeStagings = m;
-      break;
-    }
-  }
+  // === JARVIS MOD #65 — the tile now uses the SHARED definition ===
+  // Was `status=eq.STAGED`, which undercounted: it missed projects already
+  // installed but still sitting at CONTRACTED, missed every NOTICE_GIVEN home
+  // whose furniture is still in place, and counted signed work not yet
+  // installed. That predicate is why the tile read 16 while the voice lane read
+  // 19 and the chat card said 2 — three answers to one question. The predicate
+  // lives in @/lib/uhs/staging-status now, so the tile and the voice tools can
+  // no longer drift apart.
+  const counts = await fetchStagingCounts();
+  const activeStagings: Metric<number> = counts
+    ? { ok: true, value: counts.activeStagings }
+    : unavailable('estimate supabase unavailable');
+  // === END MOD #65 ===
 
   return { pendingTasks, activeStagings };
 }
@@ -257,11 +261,19 @@ export async function GET() {
     return Response.json(cache.data);
   }
 
-  const [jarvis, mls, uptime, tg] = await Promise.all([
+  // Telegram-today has its own 24h cache — only re-count after midnight.
+  let tg: Metric<number>;
+  if (tgCache && Date.now() - tgCache.at < TG_CACHE_MS) {
+    tg = tgCache.value;
+  } else {
+    tg = await telegramToday();
+    tgCache = { at: Date.now(), value: tg };
+  }
+
+  const [jarvis, mls, uptime] = await Promise.all([
     jarvisMetrics(),
     mlsNewToday(),
     fleetUptime(),
-    telegramToday(),
   ]);
 
   const data: CosmosStats = {
