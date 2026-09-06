@@ -32,6 +32,18 @@ function adapter(over: Partial<ModelRoutingAdapter> = {}): ModelRoutingAdapter {
     summary: async () => summary,
     events: async () => ({ events: [{ id: 'e1' }], attempts: [{ id: 'a1' }] }),
     apply: async () => ({ error: 'unused' }),
+    attempts: async (agent, limit) => ({
+      attempts: [
+        {
+          attempt_id: 'att-1',
+          agent,
+          at: '2026-09-05T10:00:00Z',
+          requested_model_id: 'claude-sonnet-4-6',
+          resolved_model_id: 'claude-sonnet-4-6',
+          observed: { model_id: 'claude-opus-5', confidence: 'mismatch' },
+        },
+      ].slice(0, limit ?? 5),
+    }),
     ...over,
   };
 }
@@ -93,5 +105,55 @@ describe('GET /api/model-routing', () => {
     await get('http://localhost/api/model-routing?limit=9999');
     await get('http://localhost/api/model-routing?limit=abc');
     expect(seen).toEqual([200, 25]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-agent attempts (Fleet row expander)
+// ---------------------------------------------------------------------------
+
+describe('GET /api/model-routing?agent=…', () => {
+  it('returns the agent\'s normalized attempts', async () => {
+    const res = await get('http://localhost/api/model-routing?agent=vera&limit=5');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.agent).toBe('vera');
+    expect(body.supported).toBe(true);
+    expect(body.attempts[0]).toMatchObject({
+      attempt_id: 'att-1',
+      requested: 'claude-sonnet-4-6',
+      observed: 'claude-opus-5',
+      confidence: 'mismatch',
+    });
+  });
+
+  it('reports an adapter that cannot list attempts instead of pretending there are none', async () => {
+    __setModelRoutingAdapter(adapter({ attempts: undefined }));
+    const body = await (await get('http://localhost/api/model-routing?agent=vera')).json();
+    expect(body.supported).toBe(false);
+    expect(body.attempts).toEqual([]);
+  });
+
+  it('treats an older CLI without the subcommand as unsupported, not as an outage', async () => {
+    __setModelRoutingAdapter(
+      adapter({ attempts: async () => ({ error: "unknown command 'attempts'" }) }),
+    );
+    const res = await get('http://localhost/api/model-routing?agent=vera');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.supported).toBe(false);
+    expect(body.attempts).toEqual([]);
+  });
+
+  it('rejects an invalid agent name', async () => {
+    const res = await get('http://localhost/api/model-routing?agent=../etc/passwd');
+    expect(res.status).toBe(400);
+  });
+
+  it('surfaces an attempts backend failure as 503', async () => {
+    __setModelRoutingAdapter(adapter({ attempts: async () => ({ error: 'attempts log unreadable' }) }));
+    const res = await get('http://localhost/api/model-routing?agent=vera');
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe('attempts log unreadable');
   });
 });

@@ -7,6 +7,7 @@
 
 import { NextRequest } from 'next/server';
 import {
+  getAgentAttempts,
   getModelRoutingAdapter,
   getRoutingEvents,
   getRoutingSummary,
@@ -15,11 +16,31 @@ import {
 
 export const dynamic = 'force-dynamic';
 
+const AGENT_NAME = /^[a-z0-9_-]+$/;
+
 export async function GET(request: NextRequest) {
   const limitParam = Number(request.nextUrl.searchParams.get('limit') ?? '25');
   const limit = Number.isFinite(limitParam) ? Math.min(Math.max(Math.trunc(limitParam), 1), 200) : 25;
 
   const backend = getModelRoutingAdapter().kind;
+
+  // `?agent=X` — per-agent dispatch attempts for the Fleet row expander.
+  const agent = request.nextUrl.searchParams.get('agent');
+  if (agent !== null) {
+    if (!AGENT_NAME.test(agent)) {
+      return Response.json({ error: 'Invalid agent name', backend }, { status: 400 });
+    }
+    try {
+      const out = await getAgentAttempts(agent, Math.min(limit, 50));
+      if (isRoutingError(out)) return Response.json({ ...out, backend, agent }, { status: 503 });
+      return Response.json({ backend, agent, attempts: out.attempts, supported: out.supported });
+    } catch (e) {
+      return Response.json(
+        { error: e instanceof Error ? e.message : 'routing service unavailable', backend, agent },
+        { status: 503 },
+      );
+    }
+  }
 
   let summary;
   try {

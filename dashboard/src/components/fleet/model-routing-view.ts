@@ -52,7 +52,7 @@ const RECEIPT_LABELS: Record<ReceiptState, { label: string; description: string 
   validated: { label: 'Validated', description: 'Passed capability, context and auth checks. Not yet written.' },
   desired_written: { label: 'Desired written', description: 'Registry updated. Agents still run the previous model until they restart.' },
   draining: { label: 'Draining', description: 'Restarting affected agents one at a time. Not applied yet.' },
-  applied: { label: 'Applied', description: 'Affected agents restarted and resolved to the new model.' },
+  applied: { label: 'Applied', description: 'The operation completed. What it did to running agents is listed below.' },
   blocked: { label: 'Blocked', description: 'Stopped before applying. Needs a human decision.' },
   failed: { label: 'Failed', description: 'The operation errored. Nothing further will happen automatically.' },
   reverted: { label: 'Reverted', description: 'A later revert operation undid this change.' },
@@ -108,24 +108,46 @@ export interface DesiredVsRunning {
 }
 
 export function describeDesiredVsRunning(resolution: Resolution | null | undefined): DesiredVsRunning {
-  const desired = resolution?.selected?.model_id ?? '—';
+  // `expected_model_id` is the registry's own statement of what should run and
+  // wins the comparison when the CLI emits it; `selected.model_id` is the
+  // fallback on older builds.
+  const expected = resolution?.expected_model_id ?? null;
+  const selected = resolution?.selected?.model_id ?? null;
+  const desired = selected ?? expected ?? '\u2014';
+  const target = expected ?? selected;
+
   const observedModel = resolution?.observed?.model_id ?? null;
   const legacy = resolution?.legacy_effective?.model_id ?? null;
   const running = observedModel ?? legacy ?? 'unknown';
 
-  let confidence: ObservedConfidence = resolution?.observed?.confidence ?? 'unconfirmed';
-  if (!resolution?.observed) confidence = 'unconfirmed';
-  if (observedModel && resolution?.selected && observedModel !== resolution.selected.model_id) confidence = 'mismatch';
+  let confidence: ObservedConfidence;
+  if (!observedModel) {
+    confidence = 'unconfirmed';
+  } else if (target && observedModel !== target) {
+    confidence = 'mismatch';
+  } else {
+    confidence = resolution?.observed?.confidence ?? 'verified';
+  }
 
   const drift = confidence === 'mismatch';
   const confidenceLabel =
     confidence === 'verified' ? 'verified' : confidence === 'mismatch' ? 'mismatch' : 'unconfirmed';
-  const hint =
-    confidence === 'verified'
-      ? 'The running model was read back from the agent session transcript.'
+
+  const provenance: string[] = [];
+  const src = resolution?.observed?.source;
+  if (src) provenance.push(`source: ${src}`);
+  const binding = resolution?.observed?.binding;
+  if (binding) provenance.push(`binding: ${binding}`);
+  const at = resolution?.observed?.at;
+  if (at) provenance.push(`observed ${at}`);
+
+  const base =
+    !resolution?.observed || !observedModel
+      ? 'no observation available'
       : confidence === 'mismatch'
-        ? 'The agent is running a different model than the registry resolves. Restart it or investigate.'
-        : 'No session evidence yet — the running model is inferred, not confirmed.';
+        ? `The agent is running ${observedModel}, not the ${target ?? 'resolved'} model the registry expects. Restart it or investigate.`
+        : 'The running model was read back from the agent session transcript.';
+
   return {
     desired,
     running,
@@ -133,8 +155,79 @@ export function describeDesiredVsRunning(resolution: Resolution | null | undefin
     confidenceLabel,
     tone: confidence === 'verified' ? 'success' : confidence === 'mismatch' ? 'error' : 'warning',
     drift,
-    hint,
+    hint: provenance.length ? `${base} (${provenance.join(' \u00b7 ')})` : base,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Receipt narration — never claim a restart that did not happen
+// ---------------------------------------------------------------------------
+
+export interface RestartSummary {
+  /** One honest sentence about restarts, derived only from receipt fields. */
+  headline: string;
+  results: { agent: string; ok: boolean; message?: string }[];
+  clearedPins: string[];
+  /** True only when the receipt reports actual restart results. */
+  restartsPerformed: boolean;
+}
+
+export function describeReceiptOutcome(receipt: Receipt | null | undefined): RestartSummary | null {
+  if (!receipt) return null;
+  const results = receipt.restart_results ?? [];
+  const affected = receipt.affected_consumers ?? [];
+  const clearedPins = receipt.cleared_pins ?? [];
+  const applied = receipt.state === 'applied';
+
+  let headline: string;
+  if (results.length > 0) {
+    const ok = results.filter((r) => r.ok).length;
+    headline = `Restarted ${ok} of ${results.length} agent${results.length === 1 ? '' : 's'}: ${results
+      .map((r) => `${r.agent} ${r.ok ? 'ok' : 'failed'}`)
+      .join(', ')}.`;
+  } else if (receipt.restart_required === false || affected.length === 0) {
+    headline = applied
+      ? 'Applied \u2014 no restart needed.'
+      : 'No agent restart is needed for this operation.';
+  } else if (receipt.restart_required === true) {
+    headline = `${affected.length} agent${affected.length === 1 ? '' : 's'} still need a restart to pick this up: ${affected.join(', ')}.`;
+  } else {
+    headline = `The receipt does not report any restarts. ${affected.length} affected agent${
+      affected.length === 1 ? '' : 's'
+    } (${affected.join(', ')}) may still be running the previous model.`;
+  }
+
+  return { headline, results, clearedPins, restartsPerformed: results.length > 0 };
+}
+
+/** Turn a shell-level failure string into something an operator can act on. */
+export function humanizeRoutingError(message: string | null | undefined): string | null {
+  if (!message) return null;
+  if (/exit(ed)?\s+\d+/i.test(message) && /cortextos|routing CLI/i.test(message)) {
+    return 'The routing CLI produced no usable output on this host. Check that `cortextos` is installed and on PATH.';
+  }
+  return message;
+}
+
+/** Validation errors rendered as remediation items rather than raw codes. */
+export interface RemediationItem {
+  code: string;
+  message: string;
+  severity: 'error' | 'warning';
+}
+
+export function remediationItems(resolution: Resolution | null | undefined): RemediationItem[] {
+  const errors = (resolution?.validation?.errors ?? []).map((e) => ({
+    code: e.code,
+    message: e.message,
+    severity: 'error' as const,
+  }));
+  const warnings = (resolution?.validation?.warnings ?? []).map((w, i) => ({
+    code: `warning_${i}`,
+    message: w,
+    severity: 'warning' as const,
+  }));
+  return [...errors, ...warnings];
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +305,10 @@ export interface SwitchPreview {
   costSentence: string;
   restartWarning: string;
   blocked: string | null;
+  /** Agents in scope that carry a legacy-migration or invalid pin. */
+  legacyPinnedAgents: string[];
+  /** What "also clear legacy pins" would remove, for the dialog preview. */
+  clearablePins: { agent: string; entry_id: string; kind: string }[];
 }
 
 /** Which agents a role-tier switch touches, and what it will do to them. */
@@ -228,6 +325,8 @@ export function previewRoleSwitch(
       costSentence: 'Cost impact unknown — the registry could not be read.',
       restartWarning: '',
       blocked: 'routing service unavailable',
+      legacyPinnedAgents: [],
+      clearablePins: [],
     };
   }
   const affectedAgents = Object.entries(summary.agents)
@@ -247,15 +346,23 @@ export function previewRoleSwitch(
   const blocked =
     candidates.length === 0 ? `Tier "${tier}" has no candidate entries — nothing to switch to.` : null;
 
+  const clearablePins = affectedAgents
+    .map((a) => ({ agent: a, pin: summary.agents[a]?.pin }))
+    .filter((x): x is { agent: string; pin: NonNullable<typeof x.pin> } => !!x.pin)
+    .filter((x) => x.pin.kind === 'legacy-migration' || x.pin.kind === 'proposed-invalid')
+    .map((x) => ({ agent: x.agent, entry_id: x.pin.entry_id, kind: x.pin.kind }));
+
   return {
     affectedAgents,
     targetEntryId,
     costSentence: describeCostChange(currentSelected ?? null, target),
     restartWarning:
       pinned.length > 0
-        ? `${restartWarning} ${pinned.length} pinned agent${pinned.length === 1 ? '' : 's'} (${pinned.join(', ')}) keep their pin and are unaffected.`
+        ? `${restartWarning} ${pinned.length} pinned agent${pinned.length === 1 ? '' : 's'} (${pinned.join(', ')}) keep their pin and are unaffected unless you clear it below.`
         : restartWarning,
     blocked,
+    legacyPinnedAgents: clearablePins.map((c) => c.agent),
+    clearablePins,
   };
 }
 
@@ -272,6 +379,8 @@ export function previewAgentPin(
       costSentence: 'Cost impact unknown — the registry could not be read.',
       restartWarning: '',
       blocked: 'routing service unavailable',
+      legacyPinnedAgents: [],
+      clearablePins: [],
     };
   }
   const target = summary.entries.find((e) => e.entry_id === entryId) ?? null;
@@ -286,6 +395,8 @@ export function previewAgentPin(
     costSentence: describeCostChange(currentSelected ?? null, target),
     restartWarning: `${agent} will be restarted to pick this up.`,
     blocked,
+    legacyPinnedAgents: isLegacyPin(summary, agent) ? [agent] : [],
+    clearablePins: [],
   };
 }
 

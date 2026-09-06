@@ -53,7 +53,16 @@ const resolution: Resolution = {
   },
   validation: { ok: true, errors: [], warnings: [] },
   legacy_effective: { model_id: 'claude-haiku-4-5-20251001', runtime: 'claude-code' },
-  eval_state: 'unevaluated',
+  expected_model_id: 'claude-sonnet-4-6',
+  // A hostile observation: the session binding echoes the agent's own token.
+  observed: {
+    model_id: 'claude-sonnet-4-6',
+    source: 'claude-transcript',
+    binding: `session-${SENTINEL}`,
+    confidence: 'verified',
+    at: '2026-09-05T17:00:00Z',
+    attempt_id: `att-${SENTINEL}`,
+  },
 };
 
 const receipt: Receipt = {
@@ -63,6 +72,9 @@ const receipt: Receipt = {
   reason: 'ZZTEST switch',
   affected_consumers: [AGENT],
   state: 'desired_written',
+  restart_required: true,
+  cleared_pins: [AGENT],
+  restart_results: [{ agent: AGENT, ok: false, message: `pm2 refused (${SENTINEL})` }],
   created_at: '2026-09-05T18:00:00Z',
 };
 
@@ -278,5 +290,61 @@ describe('PATCH model_routing', () => {
     expect(res.status).toBe(503);
     expect(text).not.toContain(SENTINEL);
     expect(text).toContain('[redacted]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Redaction of the fields added for the Fleet fixes (observed / receipt detail)
+// ---------------------------------------------------------------------------
+
+describe('redaction covers the new routing fields', () => {
+  it('scrubs the sentinel out of observed.binding and attempt_id on GET', async () => {
+    const text = await (await get()).text();
+    expect(text).not.toContain(SENTINEL);
+    const body = JSON.parse(text);
+    expect(body.routing.expected_model_id).toBe('claude-sonnet-4-6');
+    expect(body.routing.observed.confidence).toBe('verified');
+    expect(body.routing.observed.binding).toContain('[redacted]');
+  });
+
+  it('scrubs the sentinel out of restart_results and keeps the new receipt fields', async () => {
+    const res = await patch({ op: 'model_routing', action: 'unpin', reason: 'ZZTEST unpin' });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).not.toContain(SENTINEL);
+    const body = JSON.parse(text);
+    expect(body.receipt.restart_required).toBe(true);
+    expect(body.receipt.cleared_pins).toEqual([AGENT]);
+    expect(body.receipt.restart_results[0].ok).toBe(false);
+    expect(body.receipt.restart_results[0].message).toContain('[redacted]');
+  });
+
+  it('returns a blocked receipt as a receipt, not as a 503', async () => {
+    __setModelRoutingAdapter(
+      fakeAdapter({
+        apply: async () => ({
+          ...receipt,
+          state: 'blocked',
+          restart_required: false,
+          restart_results: [],
+          error: `tier has no dispatchable candidates (${SENTINEL})`,
+        }),
+      }),
+    );
+    const res = await patch({ op: 'model_routing', action: 'unpin', reason: 'ZZTEST blocked' });
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).not.toContain(SENTINEL);
+    const body = JSON.parse(text);
+    expect(body.success).toBe(false);
+    expect(body.receipt.state).toBe('blocked');
+    expect(body.receipt.error).toContain('[redacted]');
+  });
+
+  it('still 503s when the adapter returns something that is not a receipt', async () => {
+    __setModelRoutingAdapter(fakeAdapter({ apply: async () => ({ state: 'applied' }) as never }));
+    const res = await patch({ op: 'model_routing', action: 'unpin', reason: 'ZZTEST' });
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toMatch(/no receipt/);
   });
 });
