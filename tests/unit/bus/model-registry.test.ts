@@ -17,8 +17,14 @@ import {
   isFallbackEligible,
   isPinDispatchable,
   isPinExpired,
+  findOperationEvents,
+  isDedupedStart,
+  isFreshSession,
   listAttempts,
   listEvents,
+  newestAttemptFor,
+  newestObservationFor,
+  revertAffectedAgents,
   loadRegistry,
   migrateBootstrap,
   observeClaudeModel,
@@ -1113,5 +1119,306 @@ describe('health probes', () => {
     const reg = loadRegistry(ctx);
     const result = await probeEntryHealth(reg, 'nope', ctx);
     expect(result.ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live-verifier defects 1, 3, 5, 6
+// ---------------------------------------------------------------------------
+
+describe('DEFECT 1 — a proposed-invalid pin is a remediation item', () => {
+  function pinInvalid(taskId?: string): void {
+    const reg = loadRegistry(ctx);
+    reg.agents['trillion-coder'].pin = {
+      entry_id: 'anthropic-sonnet',
+      kind: 'proposed-invalid',
+      reason: 'Legacy pair is invalid and cannot dispatch: runtime mismatch',
+      actor: 'jarvis',
+      created_at: FROZEN.toISOString(),
+      expires_at: null,
+      ...(taskId ? { task_id: taskId } : {}),
+    };
+    saveRegistryCAS(reg, 1, ctx);
+  }
+
+  it('reports pin_not_dispatchable AND a remediation the UI can act on', () => {
+    pinInvalid();
+    const res = resolve({ agent: 'trillion-coder' }, ctx);
+    expect(res.validation.errors.map((e) => e.code)).toContain('pin_not_dispatchable');
+    expect(res.remediation?.kind).toBe('proposed-invalid-pin');
+    expect(res.remediation?.agent).toBe('trillion-coder');
+    expect(res.remediation?.entry_id).toBe('anthropic-sonnet');
+    expect(res.remediation?.detail).toMatch(/cannot dispatch/);
+  });
+
+  it('carries the human task id when bootstrap raised one', () => {
+    pinInvalid('task-4711');
+    expect(resolve({ agent: 'trillion-coder' }, ctx).remediation?.task_id).toBe('task-4711');
+  });
+
+  it('omits remediation entirely for a healthy route', () => {
+    expect(resolve({ agent: 'jarvis-mls' }, ctx).remediation).toBeUndefined();
+  });
+
+  it('bootstrap writes the task id onto the pin it creates', () => {
+    writeAgentConfig('trillion-coder', { model: 'claude-sonnet-4-6', runtime: 'codex' });
+    const result = migrateBootstrap({ ...ctx, createHumanTask: () => 'task-9000' });
+    expect(result.proposed_invalid[0]?.task_id).toBe('task-9000');
+    expect(loadRegistry(ctx).agents['trillion-coder'].pin?.task_id).toBe('task-9000');
+    expect(resolve({ agent: 'trillion-coder' }, ctx).remediation?.task_id).toBe('task-9000');
+  });
+});
+
+describe('DEFECT 3 — resolve carries desired vs running', () => {
+  it('sets expected_model_id from the legacy config while in shadow', () => {
+    writeAgentConfig('jarvis-mls', { model: 'claude-legacy-9', runtime: 'claude-code' });
+    const res = resolve({ agent: 'jarvis-mls' }, ctx);
+    expect(res.activation).toBe('shadow');
+    expect(res.expected_model_id).toBe('claude-legacy-9');
+  });
+
+  it('sets expected_model_id from the resolved entry once enforced', () => {
+    const reg = loadRegistry(ctx);
+    reg.activation.consumers['jarvis-mls'] = 'enforced';
+    saveRegistryCAS(reg, 1, ctx);
+    const res = resolve({ agent: 'jarvis-mls' }, ctx);
+    expect(res.expected_model_id).toBe(res.selected?.model_id);
+  });
+
+  it('returns null observed when nothing has ever run', () => {
+    expect(resolve({ agent: 'jarvis-mls' }, ctx).observed).toBeNull();
+  });
+
+  it('reports the newest attempt, with its confidence and attempt id', () => {
+    const first = recordAttempt({ consumer: 'jarvis-mls', resolution: resolve({ agent: 'jarvis-mls' }, ctx) }, ctx);
+    updateAttemptObserved(first.path, { model_id: 'claude-haiku-4-5-20251001', source: 'claude-transcript', binding: 'session-id' }, ctx);
+    const res = resolve({ agent: 'jarvis-mls' }, ctx);
+    expect(res.observed?.attempt_id).toBe(first.id);
+    expect(res.observed?.model_id).toBe('claude-haiku-4-5-20251001');
+    expect(res.observed?.binding).toBe('session-id');
+    expect(res.observed?.confidence).not.toBe('unconfirmed');
+  });
+
+  it('never reports another agent\'s observation', () => {
+    const other = recordAttempt({ consumer: 'trillion-coder', resolution: resolve({ agent: 'trillion-coder' }, ctx) }, ctx);
+    updateAttemptObserved(other.path, { model_id: 'gpt-5-codex', source: 'codex-session' }, ctx);
+    expect(resolve({ agent: 'jarvis-mls' }, ctx).observed).toBeNull();
+    expect(newestAttemptFor('trillion-coder', ctx)?.attempt_id).toBe(other.id);
+    expect(newestObservationFor('jarvis-mls', ctx)).toBeNull();
+  });
+
+  it('skips the journal scan when the caller opts out', () => {
+    const a = recordAttempt({ consumer: 'jarvis-mls', resolution: resolve({ agent: 'jarvis-mls' }, ctx) }, ctx);
+    updateAttemptObserved(a.path, { model_id: 'claude-haiku-4-5-20251001', source: 'claude-transcript' }, ctx);
+    expect(resolve({ agent: 'jarvis-mls', withObserved: false }, ctx).observed).toBeNull();
+    expect(resolve({ agent: 'jarvis-mls' }, ctx).observed).not.toBeNull();
+  });
+
+  it('filters listAttempts by consumer', () => {
+    recordAttempt({ consumer: 'jarvis-mls', resolution: resolve({ agent: 'jarvis-mls' }, ctx) }, ctx);
+    recordAttempt({ consumer: 'trillion-coder', resolution: resolve({ agent: 'trillion-coder' }, ctx) }, ctx);
+    expect(listAttempts(ctx, 10).length).toBe(2);
+    expect(listAttempts(ctx, 10, { consumer: 'jarvis-mls' }).map((a) => a.consumer)).toEqual(['jarvis-mls']);
+  });
+});
+
+describe('DEFECT 5 — pin, unpin and cleared pins are revertible', () => {
+  it('records target_agent and the prior pin on a pin receipt', async () => {
+    const receipt = await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'x', expiresAt: null },
+      { ...ctx, skipRestart: true },
+    );
+    expect((receipt.from as { target_agent: string }).target_agent).toBe('jarvis-mls');
+    expect((receipt.from as { pin: unknown }).pin).toBeNull();
+    expect((receipt.to as { target_agent: string }).target_agent).toBe('jarvis-mls');
+  });
+
+  it('reverts an unpin by restoring the exact prior pin', async () => {
+    await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'held', expiresAt: null },
+      { ...ctx, skipRestart: true },
+    );
+    const unpin = await applyOperation(
+      { kind: 'unpin', agent: 'jarvis-mls', actor: 'scott', reason: 'cleared' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(loadRegistry(ctx).agents['jarvis-mls'].pin).toBeNull();
+
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: unpin.operation_id, actor: 'scott', reason: 'put it back' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(reverted.state).toBe('applied');
+    expect(reverted.error).toBeNull();
+    const pin = loadRegistry(ctx).agents['jarvis-mls'].pin;
+    expect(pin?.entry_id).toBe('anthropic-sonnet');
+    expect(pin?.reason).toBe('held');
+  });
+
+  it('reverts a pin back to no pin at all', async () => {
+    const pinned = await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'x', expiresAt: null },
+      { ...ctx, skipRestart: true },
+    );
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: pinned.operation_id, actor: 'scott', reason: 'undo' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(reverted.state).toBe('applied');
+    expect(loadRegistry(ctx).agents['jarvis-mls'].pin).toBeNull();
+  });
+
+  it('restores pins a --clear-pins switch cleared', async () => {
+    const reg = loadRegistry(ctx);
+    reg.agents['jarvis-heartbeat'].pin = {
+      entry_id: 'anthropic-opus',
+      kind: 'explicit',
+      reason: 'held for the install',
+      actor: 'scott',
+      created_at: FROZEN.toISOString(),
+      expires_at: null,
+    };
+    saveRegistryCAS(reg, 1, ctx);
+
+    const sw = await applyOperation(
+      { kind: 'switch', role: 'dispatcher', tier: 'premium', actor: 'scott', reason: 'move', clearPins: true },
+      { ...ctx, skipRestart: true },
+    );
+    expect(loadRegistry(ctx).agents['jarvis-heartbeat'].pin).toBeNull();
+
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: sw.operation_id, actor: 'scott', reason: 'undo' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(reverted.state).toBe('applied');
+    const back = loadRegistry(ctx);
+    expect(back.roles.dispatcher.tier).toBe('standard');
+    expect(back.agents['jarvis-heartbeat'].pin?.reason).toBe('held for the install');
+  });
+
+  it('restarts the agent a reverted pin moves', async () => {
+    const pinned = await applyOperation(
+      { kind: 'pin', agent: 'jarvis-mls', entry_id: 'anthropic-sonnet', actor: 'scott', reason: 'x', expiresAt: null },
+      { ...ctx, skipRestart: true },
+    );
+    const restarted: string[] = [];
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: pinned.operation_id, actor: 'scott', reason: 'undo' },
+      {
+        ...ctx,
+        restart: async (agent: string): Promise<ModelRestartResult> => {
+          restarted.push(agent);
+          return { agent, ok: true, detail: 'restarted', pid: 4242 };
+        },
+      },
+    );
+    expect(reverted.affected_consumers).toEqual(['jarvis-mls']);
+    expect(reverted.restart_required).toBe(true);
+    expect(restarted).toEqual(['jarvis-mls']);
+  });
+
+  it('keeps the revert reason and the reverted operation id on the receipt', async () => {
+    const unpin = await applyOperation(
+      { kind: 'unpin', agent: 'jarvis-mls', actor: 'scott', reason: 'x' },
+      { ...ctx, skipRestart: true },
+    );
+    const reverted = await applyOperation(
+      { kind: 'revert', operation_id: unpin.operation_id, actor: 'scott', reason: 'rollback before the 9am install' },
+      { ...ctx, skipRestart: true },
+    );
+    expect(reverted.reason).toBe('rollback before the 9am install');
+    expect(reverted.revert_of).toBe(unpin.operation_id);
+    const events = findOperationEvents(reverted.operation_id, ctx);
+    expect(events.every((e) => e.reason === 'rollback before the 9am install')).toBe(true);
+  });
+
+  it('names the agents a revert will move', () => {
+    const reg = loadRegistry(ctx);
+    expect(revertAffectedAgents(reg, { target_agent: 'jarvis-mls', pin: null }, FROZEN)).toEqual(['jarvis-mls']);
+    expect(revertAffectedAgents(reg, { role: 'dispatcher', tier: 'standard' }, FROZEN))
+      .toEqual(expect.arrayContaining(['jarvis-orchestrator', 'jarvis-heartbeat']));
+    expect(revertAffectedAgents(reg, { target_agent: 'gone-agent', pin: null }, FROZEN)).toEqual([]);
+  });
+});
+
+describe('DEFECT 6 — a deduped start is not a failed restart', () => {
+  it('classifies the daemon dedupe response, by code and by message', () => {
+    expect(isDedupedStart({ success: false, code: 'DEDUPED', error: 'whatever' })).toBe(true);
+    expect(isDedupedStart({
+      success: false,
+      error: 'start request for "jarvis-mls" deduped — agent already in registry (in-flight start or already running)',
+    })).toBe(true);
+    expect(isDedupedStart({ success: false, error: 'agent dir not found' })).toBe(false);
+    expect(isDedupedStart({ success: true })).toBe(false);
+  });
+
+  it('calls a run fresh only when the process identity actually changed', () => {
+    const before = { pid: 100, sessionStart: '2026-09-05T11:00:00Z', status: 'running' };
+    expect(isFreshSession(before, { pid: 101, sessionStart: '2026-09-05T11:00:00Z', status: 'running' })).toBe(true);
+    expect(isFreshSession(before, { pid: 100, sessionStart: '2026-09-05T12:00:00Z', status: 'running' })).toBe(true);
+    expect(isFreshSession(before, before)).toBe(false);
+    expect(isFreshSession(before, { pid: null, sessionStart: null, status: null })).toBe(false);
+    expect(isFreshSession({ pid: null, sessionStart: null, status: null }, { pid: 7, sessionStart: null, status: 'running' })).toBe(true);
+  });
+
+  it('applies when the injected restarter reports a deduped-but-confirmed restart', async () => {
+    const receipt = await applyOperation(
+      { kind: 'switch', role: 'listing_intel', tier: 'premium', actor: 'scott', reason: 'x' },
+      {
+        ...ctx,
+        restart: async (agent: string): Promise<ModelRestartResult> => ({
+          agent,
+          ok: true,
+          detail: 'restarted (start was deduped by the daemon registry; confirmed a fresh session pid 812)',
+          pid_before: 811,
+          pid: 812,
+          session_start: '2026-09-05T12:00:01Z',
+          deduped_but_restarted: true,
+        }),
+      },
+    );
+    expect(receipt.state).toBe('applied');
+    expect(receipt.error).toBeNull();
+    expect(receipt.restart_required).toBe(true);
+    expect(receipt.restart_results[0].pid).toBe(812);
+    expect(receipt.restart_results[0].deduped_but_restarted).toBe(true);
+  });
+
+  it('still blocks when no fresh session appeared', async () => {
+    const receipt = await applyOperation(
+      { kind: 'switch', role: 'listing_intel', tier: 'premium', actor: 'scott', reason: 'x' },
+      {
+        ...ctx,
+        restart: async (agent: string): Promise<ModelRestartResult> => ({
+          agent,
+          ok: false,
+          detail: 'start failed: deduped — and no fresh session appeared within 15s, so the agent is still on the old route',
+          pid_before: 811,
+          pid: 811,
+        }),
+      },
+    );
+    expect(receipt.state).toBe('blocked');
+    expect(receipt.error).toMatch(/no fresh session/);
+  });
+
+  it('says no restart was needed when nothing was affected', async () => {
+    const receipt = await applyOperation(
+      { kind: 'activation', consumer: 'jarvis:scripts/email_triage/drafter.py', mode: 'enforced', actor: 'scott', reason: 'x' },
+      ctx,
+    );
+    expect(receipt.state).toBe('applied');
+    expect(receipt.affected_consumers).toEqual([]);
+    expect(receipt.restart_required).toBe(false);
+    expect(receipt.restart_results).toEqual([]);
+  });
+
+  it('marks restart_required true whenever agents were actually restarted', async () => {
+    const receipt = await applyOperation(
+      { kind: 'switch', role: 'listing_intel', tier: 'premium', actor: 'scott', reason: 'x' },
+      { ...ctx, restart: async (agent: string) => ({ agent, ok: true, detail: 'restarted', pid: 1 }) },
+    );
+    expect(receipt.restart_required).toBe(true);
+    expect(receipt.restart_results.map((r) => r.agent)).toEqual(['jarvis-mls']);
   });
 });

@@ -62,9 +62,20 @@ function printResolution(res: ModelResolution): void {
   if (res.legacy_effective) {
     console.log(`legacy config     : model=${res.legacy_effective.model_id ?? '-'} runtime=${res.legacy_effective.runtime ?? '-'}`);
   }
+  console.log(`expected (desired): ${res.expected_model_id ?? '(none)'}`);
+  console.log(
+    `observed (running): ${res.observed
+      ? `${res.observed.model_id ?? '-'} (${res.observed.confidence}, ${res.observed.source ?? 'no source'}, ` +
+        `binding ${res.observed.binding ?? 'unknown'}, attempt ${res.observed.attempt_id})`
+      : 'no attempt recorded yet'}`,
+  );
   console.log(`validation        : ${res.validation.ok ? 'ok' : 'FAILED'}`);
   for (const e of res.validation.errors) console.log(`  error   [${e.code}] ${e.message}`);
   for (const w of res.validation.warnings) console.log(`  warning ${w}`);
+  if (res.remediation) {
+    console.log(`remediation       : ${res.remediation.kind}${res.remediation.task_id ? ` (task ${res.remediation.task_id})` : ''}`);
+    console.log(`  ${res.remediation.detail}`);
+  }
 }
 
 export const modelCommand = new Command('model')
@@ -122,6 +133,7 @@ modelCommand
   .option('--override-entry <entry>', 'Authorized task override: entry id')
   .option('--actor <actor>', 'Actor for an override', 'scott')
   .option('--reason <reason>', 'Reason for an override', '')
+  .option('--strict', 'Exit 2 when validation fails (default: exit 0 — the status is in the JSON)')
   .option('--json', 'Output JSON')
   .option('--org <org>', 'Org name', DEFAULT_ORG)
   .option('--root <path>', 'Registry root')
@@ -151,7 +163,12 @@ modelCommand
         ctx,
       );
       out(json, res, () => printResolution(res));
-      if (!res.validation.ok) process.exitCode = 2;
+      // A resolution WAS produced, and its validation status is inside it.
+      // Exiting non-zero here made every consumer that checks the exit code
+      // throw away a perfectly good answer — a proposed-invalid pin is a
+      // remediation item, not a failed command. `--strict` restores the old
+      // behaviour for scripts that want the gate.
+      if (opts.strict && !res.validation.ok) process.exitCode = 2;
     } catch (err) {
       die(json, (err as Error).message);
     }
@@ -173,8 +190,13 @@ async function runOperation(
       console.log(`operation ${receipt.operation_id} (${receipt.kind}) → ${receipt.state}`);
       console.log(`revision  ${receipt.registry_revision_before} → ${receipt.registry_revision_after}`);
       console.log(`affected  ${receipt.affected_consumers.join(', ') || '(none)'}`);
+      console.log(`restarts  ${receipt.restart_required ? 'required' : 'not needed'}`);
       for (const r of receipt.restart_results) {
-        console.log(`  restart ${r.agent}: ${r.ok ? 'ok' : 'FAILED'} — ${r.detail}${r.observed_after ? ` (now ${r.observed_after})` : ''}`);
+        const pid = r.pid ? ` pid ${r.pid_before ?? '?'}→${r.pid}` : '';
+        console.log(
+          `  restart ${r.agent}: ${r.ok ? 'ok' : 'FAILED'} — ${r.detail}` +
+          `${pid}${r.observed_after ? ` (now ${r.observed_after})` : ''}`,
+        );
       }
       if (receipt.error) console.log(`error     ${receipt.error}`);
     });
@@ -389,6 +411,37 @@ modelCommand
 // ---------------------------------------------------------------------------
 // events / health / migrate
 // ---------------------------------------------------------------------------
+
+modelCommand
+  .command('attempts')
+  .description('Show recorded attempts (newest first), optionally for one agent')
+  .option('--agent <agent>', 'Only attempts for this consumer')
+  .option('--limit <n>', 'How many attempts', '20')
+  .option('--json', 'Output JSON')
+  .option('--org <org>', 'Org name', DEFAULT_ORG)
+  .option('--root <path>', 'Registry root')
+  .action((opts: Record<string, string | boolean | undefined>) => {
+    const ctx = ctxFrom(opts as { org?: string; root?: string });
+    const limit = Number(opts.limit || 20);
+    try {
+      const attempts = listAttempts(ctx, limit, opts.agent ? { consumer: String(opts.agent) } : {});
+      out(!!opts.json, attempts, () => {
+        if (attempts.length === 0) {
+          console.log(`no attempts recorded${opts.agent ? ` for ${String(opts.agent)}` : ''}`);
+          return;
+        }
+        for (const a of attempts) {
+          console.log(
+            `${a.at}  ${a.consumer.padEnd(22)} ${a.activation.padEnd(9)} ` +
+            `expected=${(a.expected_model_id ?? a.model_id ?? 'none').padEnd(28)} ` +
+            `observed=${a.observed.model_id ?? '-'} (${a.observed.confidence}) ${a.attempt_id}`,
+          );
+        }
+      });
+    } catch (err) {
+      die(!!opts.json, (err as Error).message);
+    }
+  });
 
 modelCommand
   .command('events')

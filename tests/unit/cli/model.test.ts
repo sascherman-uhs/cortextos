@@ -145,10 +145,72 @@ describe('cortextos model resolve', () => {
     expect(out.selected.entry_id).toBe('anthropic-sonnet');
   });
 
-  it('exits 2 when no valid route exists', async () => {
+  // DEFECT 1. A resolution that printed full JSON used to exit 2 whenever
+  // validation failed, so every consumer that checks the exit code threw the
+  // answer away. The status lives IN the JSON; the exit code is for
+  // invocation errors.
+  it('exits 0 when validation fails but a resolution was produced', async () => {
     await run(['resolve', '--agent', 'jarvis-mls', '--override-entry', 'not-a-real-entry', '--json']);
-    expect(json<{ selected: unknown }>().selected).toBeNull();
+    const res = json<{ selected: unknown; validation: { ok: boolean; errors: { code: string }[] } }>();
+    expect(res.selected).toBeNull();
+    expect(res.validation.ok).toBe(false);
+    expect(res.validation.errors.length).toBeGreaterThan(0);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it('--strict restores exit 2 on a validation failure', async () => {
+    await run(['resolve', '--agent', 'jarvis-mls', '--override-entry', 'not-a-real-entry', '--strict', '--json']);
     expect(exitCode).toBe(2);
+  });
+
+  it('--strict still exits 0 when validation passes', async () => {
+    await run(['resolve', '--agent', 'jarvis-mls', '--strict', '--json']);
+    expect(exitCode).toBeUndefined();
+  });
+
+  it('still exits 1 when the registry cannot be read at all', async () => {
+    rmSync(join(root, 'orgs', 'uhs', 'model-registry.json'), { force: true });
+    await expect(run(['resolve', '--agent', 'jarvis-mls', '--json'])).rejects.toThrow('process.exit:1');
+  });
+
+  // DEFECT 3. Desired vs running, both in the resolution.
+  it('carries expected_model_id and a null observed before anything has run', async () => {
+    await run(['resolve', '--agent', 'jarvis-mls', '--json']);
+    const res = json<{ expected_model_id: string | null; observed: unknown }>();
+    expect(res.expected_model_id).toBe('claude-haiku-4-5-20251001');
+    expect(res.observed).toBeNull();
+  });
+
+  it('reports the newest attempt as observed instead of a blanket unconfirmed', async () => {
+    await run([
+      'attempt', '--consumer', 'jarvis-mls',
+      '--observed', 'claude-haiku-4-5-20251001', '--observed-source', 'claude-transcript', '--json',
+    ]);
+    await run(['resolve', '--agent', 'jarvis-mls', '--json']);
+    const res = json<{ observed: { model_id: string; confidence: string; attempt_id: string; source: string } }>();
+    expect(res.observed.model_id).toBe('claude-haiku-4-5-20251001');
+    expect(res.observed.confidence).toBe('verified');
+    expect(res.observed.source).toBe('claude-transcript');
+    expect(res.observed.attempt_id).toMatch(/^att/);
+  });
+
+  it('surfaces a mismatch on the resolution, not just inside the attempt file', async () => {
+    await run([
+      'attempt', '--consumer', 'jarvis-mls',
+      '--observed', 'claude-sonnet-4-6', '--observed-source', 'claude-transcript', '--json',
+    ]);
+    await run(['resolve', '--agent', 'jarvis-mls', '--json']);
+    const res = json<{ expected_model_id: string; observed: { model_id: string; confidence: string } }>();
+    expect(res.expected_model_id).toBe('claude-haiku-4-5-20251001');
+    expect(res.observed.model_id).toBe('claude-sonnet-4-6');
+    expect(res.observed.confidence).toBe('mismatch');
+  });
+
+  it('prints desired and running in the human view', async () => {
+    await run(['resolve', '--agent', 'jarvis-mls']);
+    const text = logs.join('\n');
+    expect(text).toMatch(/expected \(desired\)/);
+    expect(text).toMatch(/observed \(running\).*no attempt recorded yet/);
   });
 
   it('requires a target', async () => {
@@ -191,6 +253,86 @@ describe('cortextos model switch / pin / unpin', () => {
     expect(reg.agents['jarvis-mls'].pin).toBeNull();
   });
 
+  // DEFECT 5. revert used to throw "refusing to guess the target" for any
+  // pin/unpin, because the receipt recorded the pin object without saying
+  // whose pin it was.
+  it('reverts a pin back to no pin', async () => {
+    await run([
+      'pin', '--agent', 'jarvis-mls', '--entry', 'anthropic-sonnet',
+      '--reason', 'temporary', '--no-restart', '--json',
+    ]);
+    const receipt = json<{ operation_id: string; from: { target_agent: string; pin: unknown } }>();
+    expect(receipt.from.target_agent).toBe('jarvis-mls');
+    expect(receipt.from.pin).toBeNull();
+
+    await run(['revert', '--operation', receipt.operation_id, '--reason', 'undo', '--no-restart', '--json']);
+    expect(json<{ state: string; error: string | null }>().state).toBe('applied');
+    const reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
+    expect(reg.agents['jarvis-mls'].pin).toBeNull();
+  });
+
+  it('reverts an unpin by restoring the exact prior pin', async () => {
+    await run([
+      'pin', '--agent', 'jarvis-mls', '--entry', 'anthropic-sonnet',
+      '--reason', 'temporary', '--no-restart', '--json',
+    ]);
+    await run(['unpin', '--agent', 'jarvis-mls', '--reason', 'clearing', '--no-restart', '--json']);
+    const unpinOp = json<{ operation_id: string }>().operation_id;
+    let reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
+    expect(reg.agents['jarvis-mls'].pin).toBeNull();
+
+    await run(['revert', '--operation', unpinOp, '--reason', 'put it back', '--no-restart', '--json']);
+    expect(json<{ state: string }>().state).toBe('applied');
+    reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
+    expect(reg.agents['jarvis-mls'].pin?.entry_id).toBe('anthropic-sonnet');
+    expect(reg.agents['jarvis-mls'].pin?.reason).toBe('temporary');
+  });
+
+  it('stores the revert reason and the operation it reverts on the receipt', async () => {
+    await run(['unpin', '--agent', 'jarvis-mls', '--reason', 'x', '--no-restart', '--json']);
+    const op = json<{ operation_id: string }>().operation_id;
+    await run(['revert', '--operation', op, '--reason', 'rollback for the 9am install', '--no-restart', '--json']);
+    const receipt = json<{ reason: string; revert_of: string }>();
+    expect(receipt.reason).toBe('rollback for the 9am install');
+    expect(receipt.revert_of).toBe(op);
+  });
+
+  it('restores pins a --clear-pins switch cleared', async () => {
+    await run([
+      'pin', '--agent', 'jarvis-mls', '--entry', 'anthropic-sonnet',
+      '--reason', 'held', '--no-restart', '--json',
+    ]);
+    await run([
+      'switch', '--role', 'listing_intel', '--tier', 'standard',
+      '--reason', 'move everyone', '--clear-pins', '--no-restart', '--json',
+    ]);
+    const switchOp = json<{ operation_id: string }>().operation_id;
+    let reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
+    expect(reg.agents['jarvis-mls'].pin).toBeNull();
+
+    await run(['revert', '--operation', switchOp, '--reason', 'undo', '--no-restart', '--json']);
+    expect(json<{ state: string }>().state).toBe('applied');
+    reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
+    expect(reg.roles.listing_intel.tier).toBe('economy');
+    expect(reg.agents['jarvis-mls'].pin?.entry_id).toBe('anthropic-sonnet');
+  });
+
+  // DEFECT 6 (receipt half): an operation nobody has to restart must SAY so.
+  it('marks restart_required false when no consumer is affected', async () => {
+    await run(['activation', '--consumer', 'not-an-agent', '--mode', 'enforced', '--reason', 'x', '--json']);
+    const receipt = json<{ state: string; affected_consumers: string[]; restart_required: boolean }>();
+    expect(receipt.state).toBe('applied');
+    expect(receipt.affected_consumers).toEqual([]);
+    expect(receipt.restart_required).toBe(false);
+  });
+
+  it('marks restart_required false when --no-restart was asked for', async () => {
+    await run(['switch', '--role', 'listing_intel', '--tier', 'standard', '--reason', 'x', '--no-restart', '--json']);
+    const receipt = json<{ affected_consumers: string[]; restart_required: boolean }>();
+    expect(receipt.affected_consumers).toEqual(['jarvis-mls']);
+    expect(receipt.restart_required).toBe(false);
+  });
+
   it('reverts a switch by operation id', async () => {
     await run(['switch', '--role', 'listing_intel', '--tier', 'standard', '--reason', 'x', '--no-restart', '--json']);
     const opId = json<{ operation_id: string }>().operation_id;
@@ -198,6 +340,28 @@ describe('cortextos model switch / pin / unpin', () => {
     expect(json<{ state: string }>().state).toBe('applied');
     const reg = JSON.parse(readFileSync(join(root, 'orgs', 'uhs', 'model-registry.json'), 'utf-8')) as ModelRegistry;
     expect(reg.roles.listing_intel.tier).toBe('economy');
+  });
+});
+
+describe('cortextos model attempts (DEFECT 3)', () => {
+  it('lists attempts for one agent as JSON', async () => {
+    await run(['attempt', '--consumer', 'jarvis-mls', '--observed', 'claude-haiku-4-5-20251001', '--json']);
+    await run(['attempts', '--agent', 'jarvis-mls', '--limit', '5', '--json']);
+    const rows = json<{ consumer: string; observed: { model_id: string } }[]>();
+    expect(rows.length).toBe(1);
+    expect(rows[0].consumer).toBe('jarvis-mls');
+    expect(rows[0].observed.model_id).toBe('claude-haiku-4-5-20251001');
+  });
+
+  it('filters out other consumers', async () => {
+    await run(['attempt', '--consumer', 'jarvis-mls', '--json']);
+    await run(['attempts', '--agent', 'jarvis-marketing', '--json']);
+    expect(json<unknown[]>().length).toBe(0);
+  });
+
+  it('says so plainly when nothing has been recorded', async () => {
+    await run(['attempts', '--agent', 'jarvis-mls']);
+    expect(logs.join('\n')).toContain('no attempts recorded');
   });
 });
 
