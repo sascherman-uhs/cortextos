@@ -15,13 +15,16 @@ import {
   describeDesiredVsRunning,
   describeEffectiveSource,
   describeReceipt,
+  describeReceiptOutcome,
   describeReceiptState,
   evalStateLabel,
+  humanizeRoutingError,
   isLegacyPin,
   previewAgentPin,
   previewRoleSwitch,
+  remediationItems,
 } from '../model-routing-view';
-import type { ReceiptState, RegistrySummary, Resolution } from '@/lib/model-routing';
+import type { Receipt, ReceiptState, RegistrySummary, Resolution } from '@/lib/model-routing';
 
 const summary: RegistrySummary = {
   schema_version: 1,
@@ -210,5 +213,168 @@ describe('switch preview', () => {
     expect(isLegacyPin(summary, 'trillion-coder')).toBe(true);
     expect(isLegacyPin(summary, 'jarvis-orchestrator')).toBe(false);
     expect(isLegacyPin(null, 'vera')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 3 — the badge follows `observed` / `expected_model_id`
+// ---------------------------------------------------------------------------
+
+describe('desired vs running with observation fields', () => {
+  it('compares the observation against expected_model_id when the CLI emits it', () => {
+    const d = describeDesiredVsRunning(
+      resolution({
+        expected_model_id: 'claude-opus-5',
+        observed: { model_id: 'claude-opus-5', source: 'transcript', confidence: 'verified', binding: 'sess-7' },
+      }),
+    );
+    expect(d.confidence).toBe('verified');
+    expect(d.hint).toContain('binding: sess-7');
+  });
+
+  it('reports mismatch against expected_model_id even when selected still agrees with the observation', () => {
+    const d = describeDesiredVsRunning(
+      resolution({
+        expected_model_id: 'claude-opus-5',
+        observed: { model_id: 'claude-sonnet-4-6', source: 'transcript', confidence: 'verified' },
+      }),
+    );
+    expect(d.confidence).toBe('mismatch');
+    expect(d.hint).toContain('claude-opus-5');
+  });
+
+  it('says so plainly when there is no observation to go on', () => {
+    expect(describeDesiredVsRunning(resolution()).hint).toContain('no observation available');
+    expect(describeDesiredVsRunning(resolution({ observed: null })).confidence).toBe('unconfirmed');
+    // An observation with no model id is not evidence of anything.
+    expect(
+      describeDesiredVsRunning(resolution({ observed: { model_id: null, source: 'transcript' } })).confidence,
+    ).toBe('unconfirmed');
+  });
+
+  it('trusts observed.confidence when the models agree and no expectation is stated', () => {
+    const d = describeDesiredVsRunning(
+      resolution({ selected: null, observed: { model_id: 'kimi-k2', source: 'pty', confidence: 'unconfirmed' } }),
+    );
+    expect(d.confidence).toBe('unconfirmed');
+    expect(d.desired).toBe('—');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 4 — the narration follows the receipt, never the other way round
+// ---------------------------------------------------------------------------
+
+function receipt(over: Partial<Receipt> = {}): Receipt {
+  return {
+    operation_id: 'op-1',
+    kind: 'switch',
+    actor: 'dashboard',
+    reason: 'ZZTEST',
+    affected_consumers: [],
+    state: 'applied',
+    created_at: '2026-09-05T18:00:00Z',
+    ...over,
+  };
+}
+
+describe('receipt outcome narration', () => {
+  it('says no restart was needed when nothing was affected', () => {
+    expect(describeReceiptOutcome(receipt())?.headline).toBe('Applied — no restart needed.');
+  });
+
+  it('honours restart_required:false even with affected consumers', () => {
+    const o = describeReceiptOutcome(receipt({ affected_consumers: ['vera'], restart_required: false }));
+    expect(o?.headline).toBe('Applied — no restart needed.');
+    expect(o?.restartsPerformed).toBe(false);
+  });
+
+  it('lists the actual restart results rather than asserting success', () => {
+    const o = describeReceiptOutcome(
+      receipt({
+        affected_consumers: ['vera', 'tron'],
+        restart_required: true,
+        restart_results: [
+          { agent: 'vera', ok: true },
+          { agent: 'tron', ok: false, message: 'pm2 refused' },
+        ],
+      }),
+    );
+    expect(o?.headline).toContain('Restarted 1 of 2 agents');
+    expect(o?.restartsPerformed).toBe(true);
+    expect(o?.results).toHaveLength(2);
+  });
+
+  it('never claims a restart when the receipt only says one is required', () => {
+    const o = describeReceiptOutcome(
+      receipt({ state: 'desired_written', affected_consumers: ['vera'], restart_required: true }),
+    );
+    expect(o?.headline).toMatch(/still need a restart/);
+    expect(o?.headline).not.toMatch(/Restarted/);
+  });
+
+  it('stays honest on an older CLI that reports neither flag nor results', () => {
+    const o = describeReceiptOutcome(receipt({ state: 'desired_written', affected_consumers: ['vera'] }));
+    expect(o?.headline).toMatch(/does not report any restarts/);
+    expect(o?.restartsPerformed).toBe(false);
+  });
+
+  it('surfaces pins the operation cleared', () => {
+    expect(describeReceiptOutcome(receipt({ cleared_pins: ['vera'] }))?.clearedPins).toEqual(['vera']);
+  });
+
+  it('does not describe the applied state as a completed restart', () => {
+    expect(describeReceiptState('applied').description).not.toMatch(/agents restarted/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 1 (display half) — remediation items, not shell exit codes
+// ---------------------------------------------------------------------------
+
+describe('remediation items and error wording', () => {
+  it('carries the validation message text', () => {
+    const items = remediationItems(
+      resolution({
+        validation: {
+          ok: false,
+          errors: [{ code: 'pin_not_dispatchable', message: 'Pin kimi-k2 is not dispatchable — awaiting human remediation' }],
+          warnings: ['display-only'],
+        },
+      }),
+    );
+    expect(items[0]).toMatchObject({ code: 'pin_not_dispatchable', severity: 'error' });
+    expect(items[0].message).toContain('awaiting human remediation');
+    expect(items[1].severity).toBe('warning');
+  });
+
+  it('replaces a raw CLI exit string with something actionable', () => {
+    expect(humanizeRoutingError('cortextos model exited 2')).toMatch(/no usable output/);
+    expect(humanizeRoutingError('Pinned entry is unknown')).toBe('Pinned entry is unknown');
+    expect(humanizeRoutingError(null)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 5 — the dialog can preview and clear legacy pins
+// ---------------------------------------------------------------------------
+
+describe('legacy pins in the switch preview', () => {
+  it('names the pins a role switch would clear', () => {
+    const p = previewRoleSwitch(summary, 'dispatcher', 'premium');
+    expect(p.legacyPinnedAgents).toEqual(['vera']);
+    expect(p.clearablePins).toEqual([{ agent: 'vera', entry_id: 'opus', kind: 'legacy-migration' }]);
+  });
+
+  it('reports no clearable pins for a role that has none', () => {
+    expect(previewRoleSwitch(summary, 'builder', 'economy').clearablePins.map((c) => c.agent)).toEqual([
+      'trillion-coder',
+    ]);
+    expect(previewRoleSwitch(null, 'dispatcher', 'premium').clearablePins).toEqual([]);
+  });
+
+  it('flags a single-agent pin preview when that agent carries a legacy pin', () => {
+    expect(previewAgentPin(summary, 'vera', 'haiku').legacyPinnedAgents).toEqual(['vera']);
+    expect(previewAgentPin(summary, 'jarvis-heartbeat', 'haiku').legacyPinnedAgents).toEqual([]);
   });
 });

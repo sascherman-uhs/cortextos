@@ -32,6 +32,8 @@ export interface ChangeModelSubmit {
   entry_id?: string;
   reason: string;
   expected_revision?: number;
+  /** Role-tier switch only: also remove legacy pins on the affected agents. */
+  clear_pins?: boolean;
 }
 
 interface ChangeModelDialogProps {
@@ -78,11 +80,17 @@ export function ChangeModelDialog({
     () => resolution?.selected?.entry_id ?? (summary?.entries ?? []).find((e) => e.status === 'active')?.entry_id ?? '',
   );
   const [reason, setReason] = useState('');
+  const [clearPins, setClearPins] = useState(false);
 
   const preview =
     mode === 'role_tier'
       ? previewRoleSwitch(summary, role, tier, resolution?.selected)
       : previewAgentPin(summary, agent, entryId, resolution?.selected);
+
+  // Legacy pins survive a role-tier switch unless explicitly cleared, so the
+  // option lives here as well as on the row button.
+  const clearable = mode === 'role_tier' ? preview.clearablePins : [];
+  const willClearPins = clearPins && clearable.length > 0;
 
   const canSubmit =
     mutable &&
@@ -163,6 +171,36 @@ export function ChangeModelDialog({
           </div>
         )}
 
+        {clearable.length > 0 && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 text-xs">
+            <label className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={clearPins}
+                onChange={(e) => setClearPins(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium">
+                  Also clear {clearable.length} legacy pin{clearable.length === 1 ? '' : 's'}
+                </span>
+                <span className="mt-0.5 block text-muted-foreground">
+                  {willClearPins
+                    ? 'These pins will be removed by this operation:'
+                    : 'Left checked off, these agents keep their pin and will NOT move to the new tier:'}
+                </span>
+                <ul className="mt-1 space-y-0.5 font-mono text-[11px] text-muted-foreground">
+                  {clearable.map((c) => (
+                    <li key={c.agent}>
+                      {c.agent} → {c.entry_id} ({c.kind})
+                    </li>
+                  ))}
+                </ul>
+              </span>
+            </label>
+          </div>
+        )}
+
         <div className="space-y-1">
           <Label htmlFor="change-model-reason">
             Reason <span className="text-destructive">*</span>
@@ -214,6 +252,7 @@ export function ChangeModelDialog({
                 entry_id: entryId,
                 reason: reason.trim(),
                 expected_revision: resolution?.registry_revision,
+                clear_pins: willClearPins,
               })
             }
           >
