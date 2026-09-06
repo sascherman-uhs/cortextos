@@ -21,6 +21,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { isPerson, type Person } from './briefing-acl';
 
 const SUPA_URL = process.env.SUPABASE_URL;
 const SUPA_KEY = process.env.SUPABASE_KEY;
@@ -92,13 +93,40 @@ export interface BriefingSnapshot {
   published_ui_at: string | null;
   persons: string[];
   sections: Record<SectionId, BriefingSection>;
+  facets: Record<string, BriefingFacet>;
+  /** False for every persona: the six sections ride on the scott_briefing_body facet. */
+  body_included: boolean;
+  /** How many facets the ACL removed for this viewer. A drop here is a leak signal. */
+  withheld_facet_count: number;
   body_text: string;
   counts: Record<string, number>;
   labels: Record<string, string>;
 }
 
+/**
+ * One person-scoped facet of the snapshot. `visible_to` was stamped by the composer;
+ * this module filters on that stamp and never re-derives the policy, so the dashboard
+ * and uhsJARVIS cannot drift into disagreeing about who may see what.
+ */
+export interface BriefingFacet {
+  id: string;
+  title: string;
+  scope: string;
+  visible_to: string[];
+  format: string;
+  status: 'ok' | 'unavailable' | string;
+  note?: string | null;
+  acl_reason?: string | null;
+  error?: string | null;
+  unavailable_message?: string | null;
+  produced_at?: string;
+  content?: Record<string, unknown>;
+}
+
 export interface BriefingResult {
   snapshot: BriefingSnapshot | null;
+  /** The person this result was filtered for. */
+  person?: string;
   /** Where the snapshot came from. 'none' means there is no snapshot for that date. */
   origin: 'supabase' | 'local_fallback' | 'none';
   /** Non-fatal problems the UI should surface rather than hide. */
@@ -161,6 +189,9 @@ export function rowToSnapshot(
     policy_version: (row.policy_version as number) ?? null,
     published_ui_at: (row.published_ui_at as string) ?? null,
     persons: (row.persons as string[]) ?? ['scott'],
+    facets: (row.facets as Record<string, BriefingFacet>) ?? {},
+    body_included: true,
+    withheld_facet_count: 0,
     sections,
     body_text: (body.body_text as string) ?? '',
     counts: (body.counts as Record<string, number>) ?? {},
@@ -169,15 +200,95 @@ export function rowToSnapshot(
 }
 
 // ---------------------------------------------------------------------------
-// Person filtering
+// Person filtering — OS-04b
 //
-// Slice 1 renders Scott's view only; Raquel and Angelic are OS-04b. The data model is
-// person-aware from day one so that adding them is a filter change, not a rewrite — and
-// so nobody is tempted to ship a second composer in the meantime.
+// One record, three readers. Everything below runs on the server, before any bytes are
+// serialised, because a filter applied in the browser is not a filter.
+//
+// Fail closed twice over: a facet with no `visible_to` stamp is withheld (a missing ACL
+// is not permission), and a person who cannot see the scott_briefing_body facet loses
+// the body ENTIRELY rather than a trimmed version of it. Half a leak is still a leak.
 // ---------------------------------------------------------------------------
+
+export const BODY_FACET_ID = 'scott_briefing_body';
 
 export function isPersonPermitted(snapshot: BriefingSnapshot, person: string): boolean {
   return snapshot.persons.includes(person);
+}
+
+export function permittedFacets(
+  facets: Record<string, BriefingFacet>,
+  person: string,
+  warnings: string[] = [],
+): Record<string, BriefingFacet> {
+  const out: Record<string, BriefingFacet> = {};
+  for (const [id, facet] of Object.entries(facets ?? {})) {
+    if (!Array.isArray(facet?.visible_to)) {
+      warnings.push(`facet "${id}" carries no visible_to stamp and was withheld`);
+      continue;
+    }
+    if (facet.visible_to.includes(person)) out[id] = facet;
+  }
+  return out;
+}
+
+/**
+ * The single filtering entry point. Returns a NEW snapshot object — the caller can never
+ * accidentally hand out the unfiltered one it was derived from.
+ */
+export function filterSnapshotForPerson(
+  snapshot: BriefingSnapshot,
+  person: string,
+  warnings: string[] = [],
+): BriefingSnapshot {
+  const stored = snapshot.facets ?? {};
+  const facets = permittedFacets(stored, person, warnings);
+  // A snapshot composed before OS-04b carries no facets at all. There, `persons` WAS the
+  // access list (and held only Scott), so honouring it is the correct reading of an old
+  // record — not a loophole. Any snapshot that does carry facets is governed by the
+  // stamps, and a body facet the viewer lacks means no body.
+  const legacy = Object.keys(stored).length === 0;
+  const bodyAllowed =
+    legacy ? snapshot.persons.includes(person)
+           : Object.prototype.hasOwnProperty.call(facets, BODY_FACET_ID);
+  const emptySections = {} as Record<SectionId, BriefingSection>;
+  for (const id of REQUIRED_SECTIONS) emptySections[id] = emptySection(id);
+
+  return {
+    ...snapshot,
+    facets,
+    body_included: bodyAllowed,
+    withheld_facet_count:
+      Object.keys(snapshot.facets ?? {}).length - Object.keys(facets).length,
+    sections: bodyAllowed ? snapshot.sections : emptySections,
+    body_text: bodyAllowed ? snapshot.body_text : '',
+    counts: bodyAllowed ? snapshot.counts : {},
+  };
+}
+
+/** Facet ids in the order the persona briefings present them. */
+export const FACET_ORDER = [
+  BODY_FACET_ID,
+  'raquel_todo',
+  'raquel_quick_wins',
+  'blog_pipeline',
+  'staging_schedule',
+  'todays_focus',
+  'angelic_tasks',
+  'angelic_inbox',
+  'design_tip',
+] as const;
+
+export function orderedFacets(
+  facets: Record<string, BriefingFacet>,
+): [string, BriefingFacet][] {
+  const known = FACET_ORDER.filter((id) => id in facets).map(
+    (id) => [id, facets[id]] as [string, BriefingFacet],
+  );
+  const extra = Object.entries(facets)
+    .filter(([id]) => !(FACET_ORDER as readonly string[]).includes(id))
+    .sort(([a], [b]) => a.localeCompare(b));
+  return [...known, ...extra];
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +366,7 @@ export function readLocalFallback(
  */
 export async function getBriefingSnapshot(
   businessDate: string,
-  person = 'scott',
+  person: Person | string = 'scott',
 ): Promise<BriefingResult> {
   const warnings: string[] = [];
   let origin: BriefingResult['origin'] = 'none';
@@ -277,14 +388,24 @@ export async function getBriefingSnapshot(
     return { snapshot: null, origin: 'none', warnings, requestedDate: businessDate };
   }
 
-  const snapshot = rowToSnapshot(row, warnings);
-  if (!isPersonPermitted(snapshot, person)) {
-    warnings.push(
-      `this snapshot carries no facet for "${person}" — person views other than Scott land in OS-04b`,
-    );
-    return { snapshot: null, origin, warnings, requestedDate: businessDate };
+  const raw = rowToSnapshot(row, warnings);
+  if (!isPerson(person)) {
+    warnings.push(`"${person}" is not a person this briefing knows about`);
+    return { snapshot: null, origin, warnings, requestedDate: businessDate, person };
   }
-  return { snapshot, origin, warnings, requestedDate: businessDate };
+  if (!isPersonPermitted(raw, person)) {
+    warnings.push(
+      `this snapshot carries no facet for "${person}" — it was composed before that ` +
+        'person had one, and no view is invented for them',
+    );
+    return { snapshot: null, origin, warnings, requestedDate: businessDate, person };
+  }
+  const snapshot = filterSnapshotForPerson(raw, person, warnings);
+  if (!snapshot.body_included && Object.keys(snapshot.facets).length === 0) {
+    warnings.push(`nothing in this snapshot is visible to "${person}"`);
+    return { snapshot: null, origin, warnings, requestedDate: businessDate, person };
+  }
+  return { snapshot, origin, warnings, requestedDate: businessDate, person };
 }
 
 /** Today's business date in the policy timezone. */

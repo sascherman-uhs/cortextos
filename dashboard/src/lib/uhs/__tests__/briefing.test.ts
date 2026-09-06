@@ -186,7 +186,16 @@ describe('getBriefingSnapshot', () => {
     stubFetch([row({ persons: ['scott'] })]);
     const result = await getBriefingSnapshot(DATE, 'raquel');
     expect(result.snapshot).toBeNull();
-    expect(result.warnings.join(' ')).toContain('OS-04b');
+    expect(result.warnings.join(' ')).toContain('no facet for "raquel"');
+  });
+
+  it('still serves a pre-OS-04b snapshot, which had no facets at all', async () => {
+    // Old records used `persons` as the whole access list. Reading them by that rule is
+    // the correct interpretation of the record, not a bypass of the newer stamps.
+    stubFetch([row({ persons: ['scott'] })]);
+    const result = await getBriefingSnapshot(DATE, 'scott');
+    expect(result.snapshot?.body_included).toBe(true);
+    expect(result.snapshot?.body_text).toBe('BRIEFING');
   });
 });
 
