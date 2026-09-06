@@ -1,0 +1,208 @@
+{
+  "policy_version": "1.0.0",
+  "status": "active",
+  "description": "The ONE retrieval contract for UHS knowledge. Every caller — fleet CLI, dashboard, skills and interactive agents — resolves collections, layer order, authorization scope and dedupe from THIS file. Collection selection is data, not code, so the CLI and the dashboard cannot drift apart again. Byte-identical copies are vendored in uhsJARVIS at scripts/agent-os/knowledge/retrieval-policy.json; a drift test in each repo fails if they diverge.",
+  "org": "uhs",
+
+  "layers": [
+    {
+      "id": "registry",
+      "order": 1,
+      "authority": "canonical-registry",
+      "description": "Capability/vendor/project registry lookup. Answers 'do we have X?' with a path, never from memory."
+    },
+    {
+      "id": "structured",
+      "order": 2,
+      "authority": "authoritative-record",
+      "description": "Structured authoritative business data (Supabase uhsMLS/uhs-jarvis, Assessor). Current facts come from records, not prose."
+    },
+    {
+      "id": "documents",
+      "order": 3,
+      "authority": "approved-document",
+      "description": "Scoped source documents and wiki: deterministic lookup over registered document roots."
+    },
+    {
+      "id": "semantic",
+      "order": 4,
+      "authority": "semantic-retrieval",
+      "description": "Semantic retrieval over the federated permitted collections. Always cited, never authoritative on its own."
+    }
+  ],
+
+  "collections": {
+    "org": [
+      {
+        "name": "uhs",
+        "authority": "approved-document",
+        "description": "JARVIS business knowledge base: vault/, USER.md, AGENTS.md, SOUL.md. The collection the dashboard could reach and the CLI could not."
+      },
+      {
+        "name": "shared-{org}",
+        "authority": "shared-wiki",
+        "description": "CortexOS org-shared collection. '{org}' is substituted with the caller's org, so this entry works for every org while the literal entries above are UHS-specific and are simply absent (and reported as such) elsewhere."
+      }
+    ],
+    "agent_prefix": "agent-",
+    "agent_authority": "persona-private"
+  },
+
+  "authorization": {
+    "roles": {
+      "operator": {
+        "org_collections": true,
+        "own_agent_collection": true,
+        "other_agent_collections": true,
+        "restricted_documents": true,
+        "description": "Scott, or an authenticated dashboard session acting as him."
+      },
+      "agent": {
+        "org_collections": true,
+        "own_agent_collection": true,
+        "other_agent_collections": false,
+        "restricted_documents": false,
+        "description": "A fleet agent or persona. Sees org knowledge and its own private collection only."
+      },
+      "service": {
+        "org_collections": true,
+        "own_agent_collection": false,
+        "other_agent_collections": false,
+        "restricted_documents": false,
+        "description": "An unattended script, skill or cron with no persona identity."
+      },
+      "anonymous": {
+        "org_collections": false,
+        "own_agent_collection": false,
+        "other_agent_collections": false,
+        "restricted_documents": false,
+        "description": "Unauthenticated caller. Retrieves nothing."
+      }
+    },
+    "restricted_source_patterns": [
+      "/vault/personal/",
+      "/vault/internal/legal-templates/",
+      "/vault/business/insurance/",
+      "/vault/team/",
+      "/vault/hr/",
+      "/vault/finance/",
+      "/vault/insights/.*payroll",
+      "secrets\\.env$",
+      "/\\.env"
+    ],
+    "restricted_note": "Persona-private, HR, personal and financial-instrument scope. scope='all' means 'all I am permitted to see', never 'every collection on disk'."
+  },
+
+  "federation": {
+    "scope_map": {
+      "shared": ["org"],
+      "private": ["own_agent"],
+      "all": ["org", "own_agent", "other_agent"]
+    },
+    "note": "The requested scope is intersected with the caller's role grants. A scope can never widen a grant."
+  },
+
+  "dedupe": {
+    "key": "canonical_source|content_hash",
+    "algorithm": "sha256",
+    "content_hash_input": "normalized_whitespace_lowercased_content",
+    "note": "Two collections holding the same document collapse to one citation; the highest-scoring, highest-authority copy wins and the duplicates are recorded on the citation."
+  },
+
+  "ingestion": {
+    "states": ["discovered", "indexed", "retrieval_verified", "failed"],
+    "terminal_success_state": "retrieval_verified",
+    "rules": [
+      "A failed input is NEVER archived or moved as a success.",
+      "Idempotence is by stable source id (canonical absolute path) plus content hash.",
+      "'indexed' is a claim; only 'retrieval_verified' is evidence.",
+      "Failed inputs stay in the retryable inbox with their classified error until they succeed or a human retires them."
+    ],
+    "error_classes": [
+      "transient_api",
+      "quota",
+      "timeout",
+      "unsupported_format",
+      "extraction_failed",
+      "too_large",
+      "denied_path",
+      "unreadable",
+      "unknown"
+    ]
+  },
+
+  "freshness": {
+    "lag_warn_hours": 36,
+    "lag_fail_hours": 168,
+    "note": "Source newer than its index entry is lag; two indexed sources disagreeing on the same claim is a conflict. Both are surfaced, never silently resolved."
+  },
+
+  "structured_sources": [
+    {
+      "id": "uhsmls.properties",
+      "question_patterns": ["property", "address", "parcel", "sqft", "beds", "baths", "year built", "subdivision"],
+      "authority": "authoritative-record",
+      "location": "Supabase uhsMLS.properties",
+      "lookup": "ILIKE on address → parcel_id, sqft, beds, baths, year_built, subdivision, zip, lat/lon"
+    },
+    {
+      "id": "uhsmls.agents",
+      "question_patterns": ["agent", "realtor", "license", "brokerage", "office"],
+      "authority": "authoritative-record",
+      "location": "Supabase uhsMLS.agents",
+      "lookup": "ILIKE on agent_name → license_number, phone, email, office_name, in_crm"
+    },
+    {
+      "id": "uhsmls.listings",
+      "question_patterns": ["listing", "mls", "dom", "sold", "list price", "close date"],
+      "authority": "authoritative-record",
+      "location": "Supabase uhsMLS.listings",
+      "lookup": "eq parcel_id, order list_date desc"
+    },
+    {
+      "id": "assessor.owner",
+      "question_patterns": ["owner", "who owns", "homeowner"],
+      "authority": "authoritative-record",
+      "location": "Clark County Assessor ArcGIS MapServer",
+      "lookup": "APN dash-stripped; enumerate layers before assuming which carries owner name. Owner is NOT the listing agent."
+    },
+    {
+      "id": "uhs_projects",
+      "question_patterns": ["client", "prior project", "existing client", "crm", "project history"],
+      "authority": "authoritative-record",
+      "location": "Supabase uhs-jarvis: uhs_projects / project_contacts",
+      "lookup": "Client lookup uses Supabase project and contact records. GoHighLevel is RETIRED (2026-07-06) and must never be queried.",
+      "supersedes": ["gohighlevel"]
+    }
+  ],
+
+  "retired_sources": [
+    {
+      "id": "gohighlevel",
+      "retired_on": "2026-07-06",
+      "successor": "uhs_projects",
+      "note": "Any retrieved guidance naming GoHighLevel as the CRM is obsolete. Answer from the successor and say the old guidance is retired."
+    },
+    {
+      "id": "calendly",
+      "retired_on": "2026-07-01",
+      "successor": "uhsScheduler booking links",
+      "note": "calendly.com links are dead; UHS self-hosts its scheduler."
+    }
+  ],
+
+  "registry_sources": [
+    {
+      "id": "capability-registry",
+      "authority": "canonical-registry",
+      "relative_path": "vault/registry/capability-registry.json",
+      "description": "Org-wide capability registry: skills, scripts, repos, scheduled jobs, fleet agents, MCPs and vendor accounts by env-key name. A vendor hit means WE ALREADY HAVE IT."
+    }
+  ],
+
+  "document_roots": [
+    { "id": "vault", "relative_path": "vault", "authority": "approved-document" },
+    { "id": "memory", "relative_path": "memory", "authority": "approved-document" },
+    { "id": "root-docs", "relative_path": ".", "authority": "approved-document", "max_depth": 1 }
+  ]
+}

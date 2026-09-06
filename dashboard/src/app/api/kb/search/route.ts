@@ -1,32 +1,33 @@
 import { NextRequest } from 'next/server';
-import { execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
 import path from 'path';
-import os from 'os';
-import { getCTXRoot, getFrameworkRoot } from '@/lib/config';
 
+import { getCTXRoot, getFrameworkRoot } from '@/lib/config';
+import { auth } from '@/lib/auth';
+import {
+  POLICY,
+  retrieve,
+  type CallerRole,
+  type LayerId,
+  type RetrievalScope,
+} from '../../../../../../src/knowledge/contract';
 
 export const dynamic = 'force-dynamic';
 
 /**
- * GET /api/kb/search?q=<question>&org=<org>&agent=<agent>&scope=<scope>&limit=<n>&threshold=<f>
+ * GET /api/kb/search
+ *   ?q=<question>&org=<org>&agent=<agent>&scope=shared|private|all
+ *   &limit=<n>&threshold=<f>&role=<agent|service>&layers=registry,structured,documents,semantic
  *
- * Searches the cortextOS knowledge base via kb-query.sh → mmrag.py → ChromaDB.
+ * This route used to decide for itself which ChromaDB collections to search: it
+ * ran `mmrag collections` and queried EVERY collection it found whenever
+ * scope=all. That reached the `uhs` business collection the CLI could not, and
+ * it also handed out `agent-tron`, `agent-kimi` and `agent-trillion-coder` —
+ * private persona scope — to any caller who said "all".
  *
- * Response:
- * {
- *   results: Array<{
- *     content: string,
- *     source_file: string,
- *     agent_name?: string,
- *     org: string,
- *     score: number,
- *     doc_type: string
- *   }>,
- *   total: number,
- *   query: string,
- *   collection: string
- * }
+ * It no longer decides anything. Collection selection, federation,
+ * authorization and dedupe all resolve in `src/knowledge/contract.ts` from
+ * `retrieval-policy.json`, the same module the fleet CLI calls. `scope=all`
+ * means "all I am permitted to see".
  */
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
@@ -35,8 +36,7 @@ export async function GET(request: NextRequest) {
   const agent = searchParams.get('agent') ?? '';
   const q = searchParams.get('q') ?? '';
 
-  // Security (H12): Validate org/agent against allowlist before shell use.
-  if (org && !/^[a-z0-9_-]+$/.test(org)) {
+  if (org && !/^[a-z0-9_-]+$/i.test(org)) {
     return Response.json({ error: 'Invalid org' }, { status: 400 });
   }
   if (agent && !/^[a-z0-9_-]+$/.test(agent)) {
@@ -45,244 +45,104 @@ export async function GET(request: NextRequest) {
   if (q.length > 500) {
     return Response.json({ error: 'Query too long' }, { status: 400 });
   }
-
-  const scope = searchParams.get('scope') || 'all';
-  const limit = parseInt(searchParams.get('limit') || '10', 10);
-  const threshold = parseFloat(searchParams.get('threshold') || '0.5');
-
   if (!q || q.trim().length === 0) {
     return Response.json({ error: 'q parameter required' }, { status: 400 });
   }
 
+  const scope = (searchParams.get('scope') || 'all') as RetrievalScope;
   if (!['shared', 'private', 'all'].includes(scope)) {
     return Response.json({ error: 'scope must be shared, private, or all' }, { status: 400 });
   }
 
+  const limit = parseInt(searchParams.get('limit') || '10', 10);
   if (isNaN(limit) || limit < 1 || limit > 50) {
     return Response.json({ error: 'limit must be 1-50' }, { status: 400 });
   }
 
+  const threshold = parseFloat(searchParams.get('threshold') || '0.5');
   if (isNaN(threshold) || threshold < 0 || threshold > 1) {
     return Response.json({ error: 'threshold must be 0.0-1.0' }, { status: 400 });
   }
 
+  const requestedLayers = (searchParams.get('layers') || '')
+    .split(',').map((l) => l.trim()).filter(Boolean) as LayerId[];
+  const validLayers: LayerId[] = ['registry', 'structured', 'documents', 'semantic'];
+  for (const l of requestedLayers) {
+    if (!validLayers.includes(l)) {
+      return Response.json({ error: `unknown layer '${l}'` }, { status: 400 });
+    }
+  }
+
+  // ---- authorization, decided here on the server, never by the query string --
+  //
+  // The session establishes the CEILING. A caller may ask to be treated as a
+  // narrower role (an agent-facing surface proxying a persona's question), but
+  // never a wider one. Without a session the caller is anonymous and the
+  // contract returns nothing rather than guessing.
+  const session = await auth().catch(() => null);
+  const ceiling: CallerRole = session?.user ? 'operator' : 'anonymous';
+  const requestedRole = searchParams.get('role') as CallerRole | null;
+  const narrowing: CallerRole[] = ['agent', 'service', 'anonymous'];
+  const role: CallerRole =
+    requestedRole && narrowing.includes(requestedRole) && ceiling !== 'anonymous'
+      ? requestedRole
+      : ceiling;
+
   const frameworkRoot = getFrameworkRoot();
-  const ctxRoot = getCTXRoot();
-
-  // Derive instance ID from CTX_ROOT (e.g. ~/.cortextos/e2e-phase → "e2e-phase")
-  const instanceId = path.basename(ctxRoot);
-
-  const kbRoot = path.join(os.homedir(), '.cortextos', instanceId, 'orgs', org, 'knowledge-base');
-  const chromaDir = path.join(kbRoot, 'chromadb');
-  const configPath = path.join(kbRoot, 'config.json');
-  const isWin = process.platform === 'win32';
-  const venvBin = isWin ? 'Scripts' : 'bin';
-  const pythonExe = isWin ? 'python.exe' : 'python3';
-  const pythonPath = path.join(frameworkRoot, 'knowledge-base', 'venv', venvBin, pythonExe);
-  const mmragPath = path.join(frameworkRoot, 'knowledge-base', 'scripts', 'mmrag.py');
-
-  // Determine collection(s) from scope (matching kb-query.sh logic)
-  let collection = '';
-  if (scope === 'private') {
-    collection = `agent-${agent}`;
-  } else if (scope === 'shared') {
-    collection = `shared-${org}`;
-  }
-  // scope === 'all' → collection stays empty, we query both below
-
-  // Load org secrets for GEMINI_API_KEY
-  const secretsPath = org
-    ? path.join(frameworkRoot, 'orgs', org, 'secrets.env')
-    : null;
-
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    CTX_FRAMEWORK_ROOT: frameworkRoot,
-    CTX_INSTANCE_ID: instanceId,
-    PATH: process.env.PATH ?? '',
-    MMRAG_DIR: kbRoot,
-    MMRAG_CHROMADB_DIR: chromaDir,
-    MMRAG_CONFIG: configPath,
-  };
-
-  if (org) env.CTX_ORG = org;
-  if (agent) env.CTX_AGENT_NAME = agent;
-
-  // Load GEMINI_API_KEY from secrets if available
-  if (secretsPath) {
-    try {
-      const secrets = readFileSync(secretsPath, 'utf-8');
-      const match = secrets.match(/^GEMINI_API_KEY=(.+)$/m);
-      if (match) env.GEMINI_API_KEY = match[1].trim();
-    } catch {
-      // No secrets file — GEMINI_API_KEY may be in process.env already
-    }
-  }
-  if (!env.GEMINI_API_KEY && process.env.GEMINI_API_KEY) {
-    env.GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-  }
-
-  if (!env.GEMINI_API_KEY) {
-    return Response.json(
-      { error: 'GEMINI_API_KEY not configured. Add it to orgs/{org}/secrets.env' },
-      { status: 503 }
-    );
-  }
-
-  // Pre-flight: check venv exists
-  if (!existsSync(path.join(frameworkRoot, 'knowledge-base', 'venv'))) {
-    return Response.json({ results: [], total: 0, query: q, collection: `shared-${org}` });
-  }
-
-  /**
-   * Run a single mmrag.py query against one collection.
-   * Returns empty array (never throws) — callers handle missing/empty collections gracefully.
-   */
-  function runQuery(col: string): Array<{
-    content?: string; result?: string; similarity?: number;
-    source?: string; type?: string; filename?: string;
-    chunk_index?: number; total_chunks?: number; content_full_length?: number;
-  }> {
-    const pyArgs = [
-      mmragPath, 'query', q,
-      '--collection', col,
-      '--top-k', String(limit),
-      '--threshold', String(threshold),
-      '--json',
-    ];
-    let stdout = '';
-    try {
-      stdout = execFileSync(pythonPath, pyArgs, {
-        timeout: 30000,
-        encoding: 'utf-8',
-        env: env as NodeJS.ProcessEnv,
-      });
-    } catch (e: unknown) {
-      // On non-zero exit, try to recover stdout (partial output)
-      stdout = (e as { stdout?: string }).stdout || '';
-      if (!stdout) return [];
-    }
-    const trimmed = stdout.trim();
-    const jsonStart = trimmed.indexOf('{');
-    if (jsonStart === -1) return [];
-    try {
-      const parsed = JSON.parse(trimmed.slice(jsonStart));
-      return parsed.results || [];
-    } catch { return []; }
-  }
-
-  /**
-   * List available collection names for the org by running mmrag.py collections.
-   * Handles partial output (ChromaDB pickle corruption may crash mid-output).
-   */
-  function listCollections(): string[] {
-    let stdout = '';
-    try {
-      stdout = execFileSync(pythonPath, [mmragPath, 'collections'], {
-        timeout: 15000,
-        encoding: 'utf-8',
-        env: env as NodeJS.ProcessEnv,
-      });
-    } catch (e: unknown) {
-      stdout = (e as { stdout?: string }).stdout || '';
-      if (!stdout) return [];
-    }
-    const names: string[] = [];
-    for (const line of stdout.trim().split('\n')) {
-      if (!line || line.startsWith('Collection') || line.startsWith('---')) continue;
-      const parts = line.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        const name = parts.slice(0, parts.length - 1).join(' ');
-        if (name) names.push(name);
-      }
-    }
-    return names;
-  }
+  const instanceId = path.basename(getCTXRoot());
 
   try {
-    let allResults: Array<{
-      content?: string; result?: string; similarity?: number;
-      source?: string; type?: string; filename?: string;
-      chunk_index?: number; total_chunks?: number; content_full_length?: number;
-    }> = [];
+    const response = retrieve({
+      question: q,
+      caller: { surface: 'dashboard', role, org, agent: agent || undefined },
+      scope,
+      topK: limit,
+      threshold,
+      store: { frameworkRoot, instanceId, org, agent: agent || undefined },
+      roots: { jarvisRoot: process.env.UHS_JARVIS_ROOT },
+      layers: requestedLayers.length > 0 ? requestedLayers : undefined,
+    });
 
-    if (collection) {
-      // Explicit collection requested — query it directly
-      allResults = runQuery(collection);
-    } else {
-      // scope=all: discover available collections and query each one.
-      // Prefer this over hardcoded "shared-{org}" because many installs only
-      // have agent-* collections (no shared collection ingested yet).
-      const knownCollections = listCollections();
-
-      if (knownCollections.length > 0) {
-        for (const col of knownCollections) {
-          // Filter by scope
-          const isShared = col.startsWith('shared-');
-          const isPrivate = col.startsWith('agent-');
-          const matchesScope =
-            scope === 'all' ||
-            (scope === 'shared' && isShared) ||
-            (scope === 'private' && isPrivate);
-          // If agent is specified for private scope, only that agent's collection
-          const matchesAgent =
-            !agent || !isPrivate || col === `agent-${agent}`;
-
-          if (matchesScope && matchesAgent) {
-            const colResults = runQuery(col);
-            // Tag each result with its collection name for display
-            allResults.push(...colResults.map(r => ({ ...r, _collection: col })));
-          }
-        }
-      } else {
-        // Fallback: no collection list available, try conventional names
-        allResults.push(...runQuery(`shared-${org}`));
-        if (agent) allResults.push(...runQuery(`agent-${agent}`));
-      }
-
-      // Sort merged results by similarity descending, deduplicate by content hash
-      allResults.sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0));
-      const seen = new Set<string>();
-      allResults = allResults.filter(r => {
-        const k = (r.source || '') + '::' + (r.content || r.result || '').slice(0, 100);
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      // Apply limit after merge
-      allResults = allResults.slice(0, limit);
-    }
-
-    if (allResults.length === 0) {
-      return Response.json({ results: [], total: 0, query: q, collection: `shared-${org}` });
-    }
-
-    const results = allResults.map((r) => ({
-      content: r.content || r.result || '',
-      source_file: r.source || '',
+    // Legacy result shape kept so existing dashboard consumers do not break,
+    // with the contract's citation fields added alongside.
+    const results = response.results.map((hit) => ({
+      content: hit.content,
+      source_file: hit.citation.canonicalSource,
       agent_name: agent || undefined,
       org: org || '',
-      score: r.similarity ?? 0,
-      doc_type: r.type || 'text',
-      filename: r.filename || '',
-      collection: (r as { _collection?: string })._collection || collection || `shared-${org}`,
-      chunk_index: r.chunk_index ?? null,
-      total_chunks: r.total_chunks ?? null,
-      content_full_length: r.content_full_length ?? null,
+      score: hit.citation.score,
+      doc_type: hit.citation.layer === 'semantic' ? 'text' : hit.citation.layer,
+      filename: hit.citation.filename,
+      collection: hit.citation.collection,
+      chunk_index: hit.citation.chunkIndex,
+      total_chunks: hit.citation.totalChunks,
+      content_full_length: null,
+      citation: hit.citation,
     }));
 
     return Response.json({
       results,
-      total: results.length,
+      total: response.total,
       query: q,
-      collection: collection || 'all',
+      collection: response.collectionsSearched.length === 1
+        ? response.collectionsSearched[0]
+        : (response.collectionsSearched.length === 0 ? `shared-${org}` : 'all'),
+      contract: {
+        policyVersion: POLICY.policy_version,
+        caller: response.caller,
+        scope: response.scope,
+        layersConsulted: response.layersConsulted,
+        collectionsSearched: response.collectionsSearched,
+        collectionsDenied: response.collectionsDenied,
+        restrictedWithheld: response.restrictedWithheld,
+        retiredGuidance: response.retiredGuidance,
+        conflicts: response.conflicts,
+        degraded: response.degraded,
+        uncertainty: response.uncertainty,
+      },
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    // If knowledge base not set up, return empty rather than 500
-    if (message.includes('not set up') || message.includes('No collections')) {
-      return Response.json({ results: [], total: 0, query: q, collection: `shared-${org}` });
-    }
     console.error('[api/kb/search] Error:', message);
     return Response.json({ error: 'Knowledge base query failed' }, { status: 500 });
   }
