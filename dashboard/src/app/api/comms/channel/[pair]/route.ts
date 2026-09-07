@@ -35,8 +35,15 @@ export async function GET(
   // /^[a-z0-9_-]+$/ validation rejected '@' and '.', so every human↔agent channel
   // 400'd and the feed rendered empty. Halves are used in path.join below, so the
   // char class still excludes '/' and we explicitly reject '..' and leading dots.
+  // Case-sensitive on purpose. buildPairKey() runs both halves through
+  // normalizeName(), which lowercases, so every real pair key is lowercase — an
+  // uppercase half can never name a stored channel. The halves also feed
+  // path.join below, so accepting them would resolve on a case-insensitive
+  // filesystem (macOS) and 404 on a case-sensitive one (Linux). The `i` flag
+  // here was collateral from MOD #18, which widened the char class for '@' and
+  // '.' in email-shaped identities and never intended to admit case.
   const validHalf = (a: string) =>
-    /^[a-z0-9][a-z0-9._@-]*$/i.test(a) && !a.includes('..');
+    /^[a-z0-9][a-z0-9._@-]*$/.test(a) && !a.includes('..');
   if (agents.length !== 2 || !agents.every(validHalf)) {
     return Response.json({ error: 'Invalid pair format. Use agent1--agent2' }, { status: 400 });
   }

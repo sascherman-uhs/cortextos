@@ -925,15 +925,22 @@ describe('FastChecker', () => {
     beforeEach(() => { vi.useFakeTimers(); });
     afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 
-    it('fires exec after bootstrap at 50-min interval', async () => {
+    it('fires the idle-session heartbeat on its 3-min interval after bootstrap', async () => {
       const { execFile } = await import('child_process');
       const agent = createMockAgent('my-agent');
       const checker = new FastChecker(agent, paths, '/tmp/framework');
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
+      // Two stale assumptions used to live here and both made this unmatchable:
+      // the interval is 3 min, not 50 (fast-checker.ts HEARTBEAT_INTERVAL_MS —
+      // it keeps dashboard status green), and execFile now takes an options
+      // object carrying the child env BEFORE the callback. toHaveBeenCalledWith
+      // matches arity exactly, so a 3-arg expectation could never match the
+      // 4-arg call — the watchdog was firing correctly the whole time.
       expect(execFile).toHaveBeenCalledWith(
         'cortextos',
         expect.arrayContaining(['bus', 'update-heartbeat', expect.stringContaining('[watchdog] my-agent alive — idle session')]),
+        expect.objectContaining({ env: expect.any(Object) }),
         expect.any(Function),
       );
       checker.stop();

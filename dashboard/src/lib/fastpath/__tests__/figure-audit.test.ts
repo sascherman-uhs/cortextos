@@ -10,8 +10,17 @@ import { auditFigures, extractFigures, numbersIn } from '../figure-audit';
 /** The authoritative snapshot in force during the soak. */
 const SNAPSHOT = [21, 23, 2];
 
+// Pinned to the soak date. auditFigures treats TODAY's own weekday/month as
+// grounded (the uncached block states the current Pacific date every turn), so
+// leaving `now` to default to the real clock made these cases calendar-flaky:
+// T7 asserts "september" is flagged, which is false every September, and T10
+// asserts "friday" is flagged, which is false every Friday. The two tests below
+// under "today's own date is a legitimate known" already pin this same instant;
+// this helper simply never did.
+const SOAK_NOW = new Date('2026-08-03T18:00:00Z'); // Monday in Pacific
+
 const clean = (reply: string, allowedText = '') =>
-  auditFigures(reply, SNAPSHOT, allowedText).unsourced;
+  auditFigures(reply, SNAPSHOT, allowedText, SOAK_NOW).unsourced;
 
 describe('the six fabrication turns — every one must flag', () => {
   it('T1: calibration lines spoken as data (the worst case)', () => {
