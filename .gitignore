@@ -16,10 +16,24 @@ orgs/
 !community/**
 
 # Secrets
+# Inverted on purpose: ignore every .env variant, then re-admit the example.
+# Enumerating suffixes (.env.local, .env.pre-rotation-…) always misses one —
+# a rotated credential backup sat untracked-and-unignored until 2026-09-07.
 .env
+.env*
 !.env.example
 templates/*/.env
 .cortextos-env
+
+# Pre-modification backups — snapshots of source, never source themselves.
+# Some carry rotated credentials (.backups/*.env.pre-rotation-*), so these
+# directories must never be committable.
+.backups/
+**/.backups/
+
+# Scratch / runtime
+*.tmp.mjs
+.cortextOS/
 
 # Agent runtime data
 orgs/*/agents/*/memory/
