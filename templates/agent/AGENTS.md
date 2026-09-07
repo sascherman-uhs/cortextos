@@ -27,7 +27,7 @@ Complete the following in order. Do not skip steps.
    ```
 2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
    - TOOLS.md is a compact command index — load the relevant skill (e.g. `tasks/SKILL.md`, `comms/SKILL.md`) when you need full docs for a workflow
-3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need)
+3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need) and org voice spec: `../../VOICE.md` (how you sound — register details live in your IDENTITY.md Vibe)
 4. Discover available skills: `cortextos bus list-skills --format text`
 5. Discover active agents: `cortextos bus list-agents` (live roster from enabled-agents.json)
 6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on daemon start; you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled. To add or change a cron at runtime, use the `cron-management` skill (do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only).

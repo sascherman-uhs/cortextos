@@ -233,8 +233,8 @@
       "part": "Internal",
       "docs": [
         {
-          "id": "sales-client-pipeline__crm-data-gohighlevel",
-          "name": "CRM Data (GoHighLevel)",
+          "id": "sales-client-pipeline__crm-data-uhsestimate",
+          "name": "CRM Data (uhsEstimate)",
           "purpose": "contacts, pipelines, opportunity stages"
         },
         {
@@ -524,7 +524,7 @@
         {
           "id": "technology-systems-data__system-integration-inventory",
           "name": "System & Integration Inventory",
-          "purpose": "Stageforce, GHL, Supabase, MLS, mmrag map"
+          "purpose": "Stageforce, uhsEstimate CRM, Supabase, MLS, mmrag map"
         },
         {
           "id": "technology-systems-data__credentials-access-map",

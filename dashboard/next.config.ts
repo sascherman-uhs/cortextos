@@ -28,6 +28,29 @@ const nextConfig: NextConfig = {
   // (~/cortextos/package-lock.json) instead of the dashboard, emitting a
   // "multiple lockfiles" warning on every dev start.
   turbopack: { root: __dirname },
+  // === JARVIS MOD #107 ROUND 4 — Turbopack dev crash-loop (2026-08-09) ========
+  // dash-cortexos was crash-looping (PM2 restart #29) on a Rust panic from
+  // turbo-tasks-backend/src/backend/operation/mod.rs:966 — "Every task must have
+  // a task type". The panic payload names the cause: `meta_restored: true,
+  // data_restored: true` with `persistent_task_type: None`, i.e. it is dying
+  // while RESTORING tasks from Turbopack's persistent dev cache, not while
+  // compiling. A task graph serialized by one Turbopack version, deserialized by
+  // another, holds TaskIds that no longer exist — a known Next 16 issue with
+  // `turbopackFileSystemCacheForDev` (default true). See
+  // github.com/vercel/next.js/discussions/87283 and /90691.
+  //
+  // Because the cache lives in .next and SURVIVES a restart, PM2 restarting the
+  // process just re-read the same corrupt graph and panicked again — that is the
+  // loop. Wiping .next fixes the current instance; turning the dev filesystem
+  // cache OFF is what stops it recurring on the next Next.js upgrade.
+  //
+  // Trade accepted deliberately: cold dev starts recompile from scratch (a few
+  // extra seconds). This box runs ONE long-lived dev server that Scott uses
+  // live; a slower start beats a server that dies mid-session. Revisit if/when
+  // the restore path is fixed upstream. The alternative — pinning dev to
+  // `next dev --webpack` — is a much larger behavioural change, and the build
+  // logs already show serwist friction with that combination.
+  experimental: { turbopackFileSystemCacheForDev: false },
   env: {
     NEXT_PUBLIC_BUILD_SHA: buildSha(),
     NEXT_PUBLIC_BUILD_TIME: new Date().toISOString().slice(0, 16).replace("T", " ") + " UTC",

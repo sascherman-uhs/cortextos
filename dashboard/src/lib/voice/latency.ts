@@ -16,7 +16,12 @@
 // a reply, so every call is unawaited and every error is swallowed.
 // === END header ===
 
-export type VoicePath = 'realtime' | 'fastpath';
+// === JARVIS MOD #107: 'realtime-el' is the Daniel lane — OpenAI Realtime for
+// the brain, ElevenLabs for the voice. It has to be its own path or every
+// Realtime turn lands in the metrics file labelled 'fastpath' (useTts owns the
+// first-audible clock on that lane), and the two engines become impossible to
+// tell apart in exactly the measurement they were split to compare. ===
+export type VoicePath = 'realtime' | 'realtime-el' | 'fastpath';
 
 export interface TurnLatency {
   /** Which voice engine served the turn. */

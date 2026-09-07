@@ -9,23 +9,47 @@ import path from 'path';
 import os from 'os';
 import { CTX_FRAMEWORK_ROOT } from './config';
 
-export const PARA_DIRS = [
-  '00-inbox',
-  '01-projects',
-  '02-areas',
-  '03-resources',
-  '04-archive',
-  '05-daily',
-  '06-maps',
-  // UHS vault structure (non-PARA)
-  'business',
-  'clients',
-  'learnings',
-  'sessions',
-  'research',
-] as const;
+// === JARVIS MOD #106 — allow-list → deny-list =================================
+// This module used to carry a hand-maintained whitelist of 13 directory names
+// (the 7 PARA dirs plus 5 UHS ones). The UHS vault has 26 top-level dirs and
+// 418 markdown files; the whitelist matched 5 of them and 38 files. Everything
+// the vault actually knows — insights/ (278 files), reference/, internal/,
+// external/, team/, brand/, wiki/ — was invisible to /api/wiki/search and to
+// anything else built on listAllNotes. A whitelist of names nobody updates is
+// indistinguishable from a vault that is mostly empty.
+//
+// So: walk from the root and deny the junk instead. Only .md files are ever
+// collected, so binaries exclude themselves; this list is for directories that
+// hold attachments, caches, or vendored trees whose contents are noise.
+export const VAULT_DENY_DIRS = new Set([
+  '.obsidian',
+  '.git',
+  '.trash',
+  'node_modules',
+  'attachments',
+  'assets',
+  'media',
+  '_resources',
+]);
 
-export type ParaDir = (typeof PARA_DIRS)[number];
+/** Directory names that should never be walked or served (deny list + dotdirs). */
+export function isDeniedDir(name: string): boolean {
+  return name.startsWith('.') || VAULT_DENY_DIRS.has(name.toLowerCase());
+}
+
+/** Top-level vault directories, discovered rather than declared. */
+export function listVaultTopDirs(vaultRoot: string): string[] {
+  try {
+    return fs
+      .readdirSync(vaultRoot, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !isDeniedDir(e.name))
+      .map((e) => e.name)
+      .sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+// === END MOD #106 ===
 
 const VAULT_FALLBACK = process.env.CTX_VAULT_PATH
   ?? path.join(os.homedir(), 'storage', 'Documents', 'Github', 'sondres-orchestrator', 'vault');
@@ -119,8 +143,13 @@ export function firstMeaningfulLine(body: string, max = 160): string {
 }
 
 /**
- * Resolves a relative vault path safely. Refuses anything outside the vault
- * root or outside the PARA dirs.
+ * Resolves a relative vault path safely. Refuses traversal, hidden paths, and
+ * anything under a denied directory.
+ *
+ * MOD #106: the old gate required the first segment to be a PARA dir name,
+ * which made every note outside those 13 folders unopenable from the wiki UI
+ * even when search found it. The security boundary that matters is "inside the
+ * vault root, not hidden, not junk" — that is what is checked now.
  */
 export function resolveVaultPath(
   vaultRoot: string,
@@ -130,9 +159,10 @@ export function resolveVaultPath(
   const cleaned = relPath.replace(/^\/+/, '');
   // Reject any traversal attempts up front
   if (cleaned.includes('..')) return null;
-  // Must start with one of the PARA dir names
-  const top = cleaned.split('/')[0];
-  if (!PARA_DIRS.includes(top as ParaDir)) return null;
+  const segments = cleaned.split('/').filter(Boolean);
+  if (segments.length === 0) return null;
+  // Every directory segment must be walkable; the leaf must not be hidden.
+  if (segments.some((s) => isDeniedDir(s))) return null;
 
   const abs = path.resolve(vaultRoot, cleaned);
   // Defense in depth — confirm resolved path is inside the vault root
@@ -141,7 +171,9 @@ export function resolveVaultPath(
 }
 
 /**
- * Walk all PARA dirs and collect every .md file. Used by search.
+ * Walk the whole vault and collect every .md file. Used by search.
+ * MOD #106: walks from the root (minus the deny list) instead of 13 named dirs.
+ * Root-level notes (README.md, agent-skill-requests.md) are included too.
  */
 export function listAllNotes(vaultRoot: string): Array<{
   relPath: string;
@@ -149,11 +181,8 @@ export function listAllNotes(vaultRoot: string): Array<{
   mtimeMs: number;
 }> {
   const out: Array<{ relPath: string; absPath: string; mtimeMs: number }> = [];
-  for (const dir of PARA_DIRS) {
-    const abs = path.join(vaultRoot, dir);
-    if (!fs.existsSync(abs)) continue;
-    walk(abs, vaultRoot, out);
-  }
+  if (!fs.existsSync(vaultRoot)) return out;
+  walk(vaultRoot, vaultRoot, out);
   return out;
 }
 
@@ -166,6 +195,7 @@ function walk(
     if (entry.name.startsWith('.')) continue;
     const child = path.join(abs, entry.name);
     if (entry.isDirectory()) {
+      if (isDeniedDir(entry.name)) continue;
       walk(child, vaultRoot, out);
     } else if (entry.isFile() && entry.name.endsWith('.md')) {
       const stat = fs.statSync(child);

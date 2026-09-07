@@ -45,7 +45,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getSharedAudioContext, resumeSharedAudio } from './audio-unlock';
 // === JARVIS MOD #54 — persist the number MOD #38 already measured. The
 // p50/p95 ring buffer below dies with the page; the JSONL line survives it. ===
-import { reportTurnLatency } from '@/lib/voice/latency';
+import { reportTurnLatency, type VoicePath } from '@/lib/voice/latency';
 // === END JARVIS MOD #25 ===
 // === JARVIS MOD #85 — barge-in bookkeeping moved into a pure, testable object.
 // MOD #24 already had the right IDEA (baseTurnId + AbortController) but the
@@ -95,6 +95,12 @@ export interface UseTtsResult {
    */
   beginStreamReply: () => { push: (sentence: string) => void; end: () => void };
   // === END MOD #45 ===
+  // === JARVIS MOD #107: which engine's turns this hook is currently measuring.
+  // recordFirstAudible below is THE first-audible clock for anything that speaks
+  // through ElevenLabs — including, as of the Daniel lane, Realtime replies. It
+  // hard-coded path:'fastpath', so those turns were filed under the wrong engine
+  // in the very metrics file the two engines are compared in. ===
+  setLatencyPath: (path: VoicePath) => void;
 }
 
 // NOTE: the Window.__cosmosStats ambient type is declared once in scene.tsx
@@ -249,6 +255,12 @@ export function useTts(): UseTtsResult {
   const knownPathRef = useRef<TtsPath>(null);
   // First-audible metric fires at most once per reply.
   const firstAudibleRecordedRef = useRef(false);
+  // === JARVIS MOD #107: the lane whose turns we are timing. Defaults to the
+  // fast path (the only caller before the Daniel lane existed). ===
+  const latencyPathRef = useRef<VoicePath>('fastpath');
+  const setLatencyPath = useCallback((path: VoicePath) => {
+    latencyPathRef.current = path;
+  }, []);
   // === END JARVIS MOD #24 ===
 
   // Hydrate mute state from localStorage after mount (avoids SSR mismatch).
@@ -446,7 +458,7 @@ export function useTts(): UseTtsResult {
       // === JARVIS MOD #54: same sample, durable — one JSONL line per turn in
       // the fast path's own metrics file so latency is answerable across
       // sessions, not just for the tab that happens to be open. ===
-      reportTurnLatency({ path: 'fastpath', firstAudioMs: ms });
+      reportTurnLatency({ path: latencyPathRef.current, firstAudioMs: ms });
       // === END MOD #54 ===
     }
   }, [guard]); // guard is a stable ref instance
@@ -475,7 +487,16 @@ export function useTts(): UseTtsResult {
       try {
         const res = await fetch('/api/uhs/tts', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            // === JARVIS MOD #107: tell the server WHERE this request is going
+            // to be heard. Tier 2 (`say`) speaks on the Mac's speakers and then
+            // returns 200 — from the phone's point of view a successful,
+            // completely silent reply. The server cannot detect a home-screen
+            // PWA from the UA (standalone is a client-only fact), so the client
+            // has to say so and the route skips the `say` tier. ===
+            'x-tts-client': isIosPwaStandaloneTts() ? 'ios-pwa' : 'browser',
+          },
           body: JSON.stringify({ text: segment }),
           signal: ac.signal,
         });
@@ -996,6 +1017,6 @@ export function useTts(): UseTtsResult {
     return () => stopAllRef.current();
   }, []);
 
-  return { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError, beginStreamReply };
+  return { muted, toggleMute, speak, interrupt, ttsAmplitude, speaking, lastError, beginStreamReply, setLatencyPath };
 }
 // === END JARVIS MOD #21 ===
