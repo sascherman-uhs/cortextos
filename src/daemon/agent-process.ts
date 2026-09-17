@@ -881,7 +881,25 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}.${this.buildDateBlock()} Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+  }
+
+  /**
+   * Boot-time date, stated as a weekday the agent can check against.
+   *
+   * A bare ISO/UTC stamp gives a model nothing to verify a weekday against, so
+   * "put it on Friday" gets resolved from memory — on 2026-09-16 that put a
+   * client appointment on the wrong day ("Saturday, September 20th"; Sep 20,
+   * 2026 is a Sunday). Sessions here can run for days, so the boot date also
+   * says explicitly that it goes stale and must be re-checked.
+   */
+  private buildDateBlock(): string {
+    const now = new Date();
+    const local = now.toLocaleDateString('en-US', {
+      weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+      timeZone: 'America/Los_Angeles',
+    });
+    return ` At session start it is ${local} (Pacific). This session may run for days, so treat that as the START date, not today's date: re-check with \`date '+%A, %B %-d, %Y'\` before writing ANY date, and never compute a weekday from memory. For a relative date ("Friday", "next Tuesday", "the 20th") run scripts/dates/resolve_date.py in uhsJARVIS and use its answer; confirm scheduled items back as "Friday, September 18" — weekday AND date.`;
   }
 
   private buildContinuePrompt(): string {
@@ -890,7 +908,7 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}.${this.buildDateBlock()} Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
   }
 
   /**
