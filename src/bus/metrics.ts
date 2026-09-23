@@ -488,18 +488,70 @@ export function collectTelegramCommands(scanDirs: string[]): { command: string; 
       if (!cmd || seen.has(cmd)) continue;
       seen.add(cmd);
 
-      const description = (parsed.description || `Skill: ${name}`).slice(0, 256);
+      const description = (parsed.description || `Skill: ${name}`).slice(0, TELEGRAM_DESC_MAX);
       commands.push({ command: cmd, description });
     }
   }
-  // LOCAL MOD #51 (2026-08-30): Telegram's setMyCommands rejects >100 entries (BOT_COMMANDS_TOO_MUCH).
-  // scanDirs is [agentDir, frameworkRoot]; the framework tree carries ~210 SKILL.md files, so any agent
-  // with its own skills overflowed and registered NOTHING (jarvis-telegram/vera/vivienne, 94 failures).
-  // Keep the first 100 — agent-dir skills come first, so an agent's own commands always survive.
-  const TELEGRAM_MAX_COMMANDS = 100;
+  return fitTelegramCommands(commands);
+}
+
+// LOCAL MOD #51 (2026-08-30): Telegram's setMyCommands rejects oversized payloads with
+// BOT_COMMANDS_TOO_MUCH. scanDirs is [agentDir, frameworkRoot]; the framework tree carries
+// ~210 SKILL.md files, so any agent with its own skills overflowed and registered NOTHING
+// (jarvis-telegram/vera/vivienne, 94 failures). Keeping the first 100 fixed the count case.
+//
+// LOCAL MOD #52 (2026-09-22): the count cap alone was NOT enough — the error name lies.
+// BOT_COMMANDS_TOO_MUCH is also returned when the serialized payload is too large, whatever
+// the entry count. Measured against the live API with vera's bot: 32 commands / 8608 bytes
+// FAILED, 21 commands / ~7300 bytes FAILED, 32 commands / 6137 bytes SUCCEEDED. Skill
+// descriptions are long prose and were each padded to the old 256-char slice, so ~21 skills
+// were enough to blow the budget and register nothing at all. Telegram's slash menu only
+// renders a short line anyway, so we cap description length and then trim to a byte budget.
+const TELEGRAM_MAX_COMMANDS = 100;
+const TELEGRAM_DESC_MAX = 128;
+const TELEGRAM_PAYLOAD_BUDGET = 6000;
+
+/**
+ * Shrink a collected command list until Telegram will accept it.
+ *
+ * Order matters: we drop entries only as a last resort, and shorten descriptions first,
+ * because a menu of many commands with terse text beats a short list of verbose ones —
+ * and beats the previous behaviour of registering nothing at all.
+ */
+export function fitTelegramCommands(
+  input: { command: string; description: string }[],
+): { command: string; description: string }[] {
+  let commands = input;
+
   if (commands.length > TELEGRAM_MAX_COMMANDS) {
     console.warn(`[telegram-commands] ${commands.length} commands collected; registering the first ${TELEGRAM_MAX_COMMANDS} (Telegram cap)`);
-    return commands.slice(0, TELEGRAM_MAX_COMMANDS);
+    commands = commands.slice(0, TELEGRAM_MAX_COMMANDS);
+  }
+
+  commands = commands.map((c) => ({
+    command: c.command,
+    description: c.description.slice(0, TELEGRAM_DESC_MAX) || c.command,
+  }));
+
+  const size = (c: typeof commands) => JSON.stringify(c).length;
+
+  // Step descriptions down before dropping any command.
+  for (const limit of [TELEGRAM_DESC_MAX, 96, 72, 56, 40]) {
+    if (size(commands) <= TELEGRAM_PAYLOAD_BUDGET) break;
+    commands = commands.map((c) => ({
+      command: c.command,
+      description: c.description.slice(0, limit) || c.command,
+    }));
+  }
+
+  // Still over budget (pathological: very many commands) — drop from the tail, which is
+  // framework-wide skills. Agent-dir skills come first, so an agent's own always survive.
+  while (commands.length > 1 && size(commands) > TELEGRAM_PAYLOAD_BUDGET) {
+    commands = commands.slice(0, commands.length - 1);
+  }
+
+  if (commands.length < input.length) {
+    console.warn(`[telegram-commands] trimmed ${input.length} → ${commands.length} commands to fit Telegram's payload budget`);
   }
 
   return commands;

@@ -7,6 +7,7 @@ import {
   parseUsageOutput,
   storeUsageData,
   collectTelegramCommands,
+  fitTelegramCommands,
   registerTelegramCommands,
 } from '../src/bus/metrics.js';
 
@@ -345,7 +346,11 @@ describe('Sprint 5: Observability & Metrics', () => {
       expect(commands.length).toBe(0);
     });
 
-    it('truncates description to 256 chars', () => {
+    // LOCAL MOD #52 (2026-09-22): descriptions cap at 128, not 256. Telegram allows 256 per
+    // entry, but the whole setMyCommands payload has a size ceiling that 256-char prose blows
+    // through after ~21 skills — and it reports that as BOT_COMMANDS_TOO_MUCH, which reads
+    // like a count problem and sent the previous fix after the wrong limit.
+    it('truncates description to 128 chars', () => {
       const scanDir = join(testDir, 'agent5');
       const skillDir = join(scanDir, 'skills', 'verbose');
       mkdirSync(skillDir, { recursive: true });
@@ -353,7 +358,46 @@ describe('Sprint 5: Observability & Metrics', () => {
       writeFileSync(join(skillDir, 'SKILL.md'), `---\nname: verbose\ndescription: ${longDesc}\n---\n`, 'utf-8');
 
       const commands = collectTelegramCommands([scanDir]);
-      expect(commands[0].description.length).toBe(256);
+      expect(commands[0].description.length).toBe(128);
+    });
+
+    // Regression: vera/vivienne/jarvis-telegram registered ZERO commands for weeks because
+    // the payload exceeded Telegram's size ceiling. Measured live: 8608 bytes rejected,
+    // 6137 bytes accepted. The fitted payload must stay under the budget.
+    it('keeps the serialized payload under Telegram\'s size budget', () => {
+      const many = Array.from({ length: 100 }, (_, i) => ({
+        command: `skill_number_${i}`,
+        description: 'B'.repeat(256),
+      }));
+
+      const fitted = fitTelegramCommands(many);
+
+      expect(JSON.stringify(fitted).length).toBeLessThanOrEqual(6000);
+      // Agent-dir skills are collected first, so the head of the list must always survive.
+      expect(fitted[0].command).toBe('skill_number_0');
+      // Descriptions are shortened before anything is dropped, so most entries survive.
+      expect(fitted.length).toBeGreaterThan(50);
+      // Every entry keeps a non-empty description (Telegram requires 1..256 chars).
+      expect(fitted.every((c) => c.description.length >= 1)).toBe(true);
+    });
+
+    // The realistic fleet shape — ~32 skills per agent — must survive completely intact.
+    // This is the case that was silently registering nothing before LOCAL MOD #52.
+    it('keeps every command for a realistic agent skill set', () => {
+      const realistic = Array.from({ length: 32 }, (_, i) => ({
+        command: `skill_number_${i}`,
+        description: 'B'.repeat(256),
+      }));
+
+      const fitted = fitTelegramCommands(realistic);
+
+      expect(fitted.length).toBe(32);
+      expect(JSON.stringify(fitted).length).toBeLessThanOrEqual(6000);
+    });
+
+    it('never returns an empty description', () => {
+      const fitted = fitTelegramCommands([{ command: 'bare', description: '' }]);
+      expect(fitted[0].description).toBe('bare');
     });
 
     // Issue #329: codex-runtime agents store slash commands under .codex/, not
