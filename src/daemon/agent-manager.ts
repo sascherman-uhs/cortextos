@@ -805,6 +805,17 @@ export class AgentManager {
           if (consecutiveConflictStart === null) consecutiveConflictStart = Date.now();
           if (Date.now() - consecutiveConflictStart > MAX_CONSECUTIVE_CONFLICT_MS) {
             log(`Telegram poller for ${name} could not clear Conflict within 5min of consecutive failures — giving up. Inspect for duplicate bot instance.`);
+            // Giving up here means inbound Telegram is dead for this agent until a
+            // human restarts the daemon — but sendMessage runs on a different code
+            // path and keeps working, so the operator sees a bot that messages them
+            // and never reads their replies. That one-way state went unnoticed for
+            // days (Scott, 2026-09-23). Alert on the way out instead of dying silent.
+            if (telegramApi && chatId) {
+              telegramApi.sendMessage(
+                String(chatId),
+                `${name}: inbound Telegram is DOWN — could not clear a getUpdates Conflict for 5min, so the poller stopped. I can still message you, but I will NOT see your replies until the daemon is restarted. Usual cause: a second poller on the same bot.`,
+              ).catch(() => { /* swallow alert failure; the log line above already captured it */ });
+            }
             return;
           }
           log(`Telegram poller for ${name} exited (${poller.lastExitReason}). Sleeping 30s then restarting to retake getUpdates lock.`);
