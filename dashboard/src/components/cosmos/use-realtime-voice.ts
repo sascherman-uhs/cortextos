@@ -918,6 +918,22 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions = {}): UseVoiceRe
               console.warn('[realtime] cancel-race (benign):', errObj.error.message);
               break;
             }
+            // === MOD #107 ROUND 5 (a) — the race error is PROOF a turn is live.
+            // `conversation_already_has_active_response` means the server refused
+            // OUR create because the previous response is still generating — i.e.
+            // the answer Scott is waiting on is alive and still arriving. Falling
+            // through to the general handler tore that answer up (resetTextLane)
+            // and apologised over the top of it, which is how a create-race the
+            // user should never notice became the apology he hears constantly.
+            // The gate having let the create out at all means it had lost sync,
+            // so re-assert active (preserving the known id) and touch NOTHING
+            // else: no lane reset, no toolGuard, no speech.
+            if (errObj.error?.code === 'conversation_already_has_active_response') {
+              gate.markActive(gate.activeId());
+              console.warn('[realtime] create refused, response already live (benign):', errObj.error.message);
+              mergeStats({ rtcNote: 'create refused — a response is already live (gate re-synced)' });
+              break;
+            }
             console.error('[realtime] OpenAI error event', e.data);
             const detail = errObj.error?.message;
             const failedId = errObj.response_id ?? errObj.error?.response_id ?? null;
@@ -938,6 +954,35 @@ export function useRealtimeVoice(options: RealtimeVoiceOptions = {}): UseVoiceRe
               mergeStats({ rtcNote: `server error ignored (no live turn): ${detail ?? 'unknown'}` });
               break;
             }
+            // === MOD #107 ROUND 5 (b) — an error that names no response must
+            // not be assumed to have killed the live turn. `owns(null)` returns
+            // true by design (response-gate.ts:129, and the null-id window its
+            // header documents at :65-72), so EVERY id-less server error —
+            // rate limits, validation errors on cue/bookkeeping items, anything
+            // — reached the teardown below and discarded an answer that was
+            // still arriving. That is the defect: not the rare genuine race in
+            // a log that rotates daily, but the over-broad reaction to it.
+            //
+            // THE RULE, stated once so it can be argued with:
+            //   An unattributed error is treated as fatal to the turn UNLESS an
+            //   answer is already in the lane. Text already streamed is proof
+            //   the turn was working; throwing it away to apologise is strictly
+            //   worse than letting it finish. With an EMPTY lane there is no
+            //   answer to protect and nothing else will speak, so silence would
+            //   leave Scott waiting on a turn that may already be dead — that
+            //   case keeps the apology.
+            // `gate.clear()` happens either way: it is the anti-stuck-mute
+            // guarantee this module exists for, and never by itself audible.
+            const unattributed = !failedId;
+            const answerInFlight = lane.fullText().trim().length > 0;
+            if (unattributed && answerInFlight) {
+              gate.clear();
+              mergeStats({
+                rtcNote: `server error did not name a response — answer kept: ${detail ?? 'unknown'}`,
+              });
+              break;
+            }
+
             gate.clear();
             resetTextLane();
             // === MOD #107 ROUND 2 (smaller defect c) — supersede the tool

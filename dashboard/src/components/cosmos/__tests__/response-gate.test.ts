@@ -332,6 +332,35 @@ describe('ResponseGate — retired ids close the null-id window', () => {
     expect(g.isActive()).toBe(false);
   });
 
+  // === MOD #107 ROUND 5 — the contract the error handler's
+  // `conversation_already_has_active_response` branch relies on. That error
+  // proves a response is live, so the handler re-syncs with
+  // `gate.markActive(gate.activeId())` instead of tearing the turn down. That
+  // one-liner is only correct if it re-asserts active WITHOUT losing the id we
+  // already know (losing it would reopen the null-id window on purpose) and
+  // WITHOUT consuming a deferred create. Pin both here: the handler cannot be
+  // unit-tested (no jsdom / no RTCDataChannel), so this is where the assumption
+  // is allowed to live.
+  it('re-syncs to active via markActive(activeId()) without losing the id', () => {
+    const g = new ResponseGate();
+    g.request();
+    g.markActive('resp_LIVE');
+    g.clear();                        // the gate has lost sync — this is the bug state
+    expect(g.isActive()).toBe(false);
+
+    const g2 = new ResponseGate();
+    g2.request();
+    g2.markActive('resp_LIVE');
+    g2.request();                     // a second turn arrives → deferred
+    expect(g2.isDeferred()).toBe(true);
+    g2.markActive(g2.activeId());     // the re-sync the error handler performs
+    expect(g2.isActive()).toBe(true);
+    expect(g2.activeId()).toBe('resp_LIVE');
+    expect(g2.isDeferred()).toBe(true);           // deferred create still owed
+    expect(g2.isRetired('resp_LIVE')).toBe(false); // NOT retired — still live
+    expect(g2.close('resp_LIVE')).toBe(true);      // and it still hands the deferred back
+  });
+
   it('bounds the retired set so a long session cannot grow it forever', () => {
     const g = new ResponseGate();
     for (let i = 0; i < 100; i++) {
