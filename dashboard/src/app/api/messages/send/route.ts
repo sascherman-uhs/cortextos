@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import { getCTXRoot, getAllAgents } from '@/lib/config';
+import { getCTXRoot, getAllAgents, getAgentDir } from '@/lib/config';
 import { tryFastReply, tryFastReplyStream } from '@/lib/fastpath/fast-reply';
 import { buildWindow } from '@/lib/fastpath/conversation-window';
 // === JARVIS MOD #53 — shared deterministic goodbye detector ===
@@ -39,14 +39,54 @@ function logInbound(ctxRoot: string, agent: string, entry: Record<string, unknow
   );
 }
 
-function appendOutbound(ctxRoot: string, agent: string, text: string): string {
+// === JARVIS MOD #107 ROUND 5 — stamp chat_id on voice/mobile replies =========
+// The Telegram rail writes `chat_id: String(chatId)` on every outbound row
+// (src/telegram/logging.ts:48). This route did not, so 331 of 1537 rows in
+// outbound-messages.jsonl — every `mobile-reply-*`, i.e. every reply Scott got
+// by voice — carried no channel at all. Any audit of dropped messages then has
+// to match chat-agnostically, which means its drop rate is a FLOOR that
+// undercounts. Same field, same stringified shape, same conversation: this
+// route already exists to put chat-bar replies "in the same channel as Telegram
+// messages for the same user" (see the `from` comment in POST).
+//
+// Source of truth is the agent's own .env CHAT_ID — the value the Telegram rail
+// is configured with — read once per process and cached. Resolved to null (and
+// the field omitted, never written empty) when absent, so an unconfigured agent
+// stays distinguishable from a genuinely channel-less row.
+const chatIdCache = new Map<string, string | null>();
+
+function resolveChatId(agent: string, org: string): string | null {
+  const key = `${org}/${agent}`;
+  const cached = chatIdCache.get(key);
+  if (cached !== undefined) return cached;
+  let chatId: string | null = null;
+  try {
+    const envPath = path.join(getAgentDir(agent, org), '.env');
+    for (const line of fs.readFileSync(envPath, 'utf-8').split('\n')) {
+      const m = line.trim().match(/^(TELEGRAM_CHAT_ID|TG_CHAT_ID|CHAT_ID)=(.*)$/);
+      if (!m) continue;
+      const v = m[2].replace(/^["']|["']$/g, '').trim();
+      if (v) chatId = v;
+    }
+  } catch { /* no agent .env — leave null, the field is omitted */ }
+  if (!chatId) {
+    console.warn(`[api/messages/send] no CHAT_ID for ${key} — outbound rows will carry no chat_id`);
+  }
+  chatIdCache.set(key, chatId);
+  return chatId;
+}
+
+function appendOutbound(ctxRoot: string, agent: string, org: string, text: string): string {
   // Same schema + timestamp format as `cortextos bus send-mobile-reply`
   const logDir = path.join(ctxRoot, 'logs', agent);
   if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
   const messageId = `mobile-reply-${Date.now()}`;
+  const chatId = resolveChatId(agent, org);
   const entry = JSON.stringify({
     timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     agent,
+    // Field order matches the Telegram rail's row so the two are diffable.
+    ...(chatId ? { chat_id: String(chatId) } : {}),
     text,
     message_id: messageId,
     type: 'text',
@@ -192,7 +232,7 @@ export async function POST(request: NextRequest) {
       const line = signoffLine(Date.now());
       let replyId: string | undefined;
       try {
-        replyId = appendOutbound(ctxRoot, agent, line);
+        replyId = appendOutbound(ctxRoot, agent, agentEntry.org, line);
       } catch (err) {
         console.error('[api/messages/send] signoff outbound append failed:', err);
       }
@@ -244,7 +284,7 @@ export async function POST(request: NextRequest) {
             // appendOutbound first — reply is durable even if client is gone.
             let replyId: string | undefined;
             try {
-              replyId = appendOutbound(ctxRoot, agent, result.text);
+              replyId = appendOutbound(ctxRoot, agent, org, result.text);
             } catch (err) {
               console.error('[api/messages/send] stream outbound append failed:', err);
             }
@@ -288,7 +328,7 @@ export async function POST(request: NextRequest) {
         // === JARVIS MOD #38: return the reply synchronously so the client can
         // speak it immediately (replyId lets it dedupe the SSE echo of the
         // same outbound line). ===
-        const replyId = appendOutbound(ctxRoot, agent, result.text);
+        const replyId = appendOutbound(ctxRoot, agent, agentEntry.org, result.text);
         return Response.json(
           {
             success: true,
