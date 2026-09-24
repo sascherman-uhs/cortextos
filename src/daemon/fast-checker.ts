@@ -43,6 +43,28 @@ export class FastChecker {
   private lastMessageInjectedAt: number = 0;
   // Track outbound message log size to detect when agent sends a reply
   private outboundLogSize: number = 0;
+
+  // === Slow-turn acknowledgment (2026-09-24) ================================
+  // Scott: "is this fixed?" — no, because the last gap was silence, not loss.
+  // On 2026-09-24 at 02:51 he sent three messages; all three were received and
+  // injected correctly, and seventeen minutes later he had nothing, because the
+  // agent was mid-turn doing real multi-tool work on a ZPL label. A busy agent
+  // and a dead one are indistinguishable from a phone.
+  //
+  // A typing indicator does not close this: sendChatAction expires in ~5s and
+  // is invisible on a locked screen, which is why it never registered as
+  // "working" during those seventeen minutes.
+  //
+  // So: one plain-text message, once per unanswered turn, only after the turn
+  // has already run long. A turn that answers in five seconds sends nothing —
+  // that is the whole point, and why this is a DELAY and not an on-receipt ack.
+  /** Start of the current unanswered Telegram turn (0 = no turn open). */
+  private ackTurnStartedAt: number = 0;
+  /** Telegram messages injected during the current unanswered turn. */
+  private ackTurnMessageCount: number = 0;
+  /** One ack per turn, never per message — a burst of five gets one. */
+  private ackSentForTurn: boolean = false;
+  // === END slow-turn acknowledgment (fields) ================================
   // Track stdout log size to detect when agent is actively producing output
   private stdoutLogSize: number = -1;
   private frameworkRoot: string;
@@ -296,6 +318,12 @@ export class FastChecker {
         // restart the typing indicator after Stop has cleared it.
         if (hasTelegramMessage) {
           this.lastMessageInjectedAt = Date.now();
+          // Anchor the ack clock to the FIRST unanswered message, not the
+          // latest. Anchoring to the latest would let a steady trickle of
+          // messages push the deadline forever and never acknowledge any of
+          // them — the burst case (2-7 inside ten minutes) is the common one.
+          if (this.ackTurnStartedAt === 0) this.ackTurnStartedAt = Date.now();
+          this.ackTurnMessageCount++;
         }
         // Cooldown after injection
         await sleep(5000);
@@ -309,6 +337,9 @@ export class FastChecker {
     // Typing indicator: send while Claude is actively working
     if (this.chatId && this.telegramApi && this.isAgentActive()) {
       await this.sendTyping(this.telegramApi, this.chatId);
+      // isAgentActive() also resets the ack turn when it observes a reply, so
+      // this must run after it, not before.
+      await this.maybeSendSlowTurnAck(this.telegramApi, this.chatId);
     }
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
@@ -681,6 +712,71 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       await sleep(2000);
     }
     this.log('Bootstrap timeout - proceeding anyway');
+  }
+
+  /** Close the current unanswered-turn window. */
+  private resetAckTurn(): void {
+    this.ackTurnStartedAt = 0;
+    this.ackTurnMessageCount = 0;
+    this.ackSentForTurn = false;
+  }
+
+  /**
+   * How long an unanswered Telegram turn may run before it is acknowledged.
+   * `TELEGRAM_SLOW_ACK_MS=0` disables the ack entirely (the kill switch —
+   * no redeploy, just an env change and a restart).
+   *
+   * 45s by default. Chosen so an ordinary reply NEVER triggers one: the
+   * complaint being fixed is a seventeen-minute silence, not a five-second
+   * one, and an ack on every request would just be a second notification for
+   * Scott to ignore.
+   */
+  private slowAckDelayMs(): number {
+    const raw = process.env.TELEGRAM_SLOW_ACK_MS;
+    if (raw === undefined || raw.trim() === '') return 45_000;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return 45_000;
+    return n;
+  }
+
+  /**
+   * Tell the human the message landed, when the turn is running long enough
+   * that silence would otherwise read as an outage.
+   *
+   * Deliberately sent with `telegramApi.sendMessage` and NOT logged via
+   * `logOutboundMessage`. That asymmetry is load-bearing, not an oversight:
+   * `outbound-messages.jsonl` is the ONLY evidence `isAgentActive()` and
+   * `reply_sla_audit.py` accept for "this message was answered". Logging the
+   * ack there would clear the typing state, delete the durable pending record,
+   * and book a reply Scott never received — manufacturing a spotless delivery
+   * record for exactly the windows he sat repeating himself into a void. An
+   * ack is proof of receipt; it is not an answer, and nothing downstream may
+   * mistake it for one.
+   */
+  private async maybeSendSlowTurnAck(api: TelegramAPI, chatId: string): Promise<void> {
+    if (this.ackSentForTurn || this.ackTurnStartedAt === 0) return;
+    const delay = this.slowAckDelayMs();
+    if (delay === 0) return;
+    if (Date.now() - this.ackTurnStartedAt < delay) return;
+
+    // Set the flag BEFORE awaiting the send. pollCycle runs every ~1s and the
+    // send can take seconds (it now retries), so a flag set afterwards would
+    // let several cycles queue duplicate acks for one turn.
+    this.ackSentForTurn = true;
+
+    const n = this.ackTurnMessageCount;
+    const subject = n > 1 ? `all ${n}` : 'it';
+    const text = `Got ${subject} — this needs a few minutes. Still working; the answer comes here when it's done.`;
+    try {
+      await api.sendMessage(chatId, text);
+      this.log(`Slow-turn ack sent after ${Math.round((Date.now() - this.ackTurnStartedAt) / 1000)}s (${n} message(s) pending)`);
+    } catch (err) {
+      // Never let the ack break the cycle. It is a courtesy; the real reply
+      // still has every other path. Logged, though — a silently failing ack
+      // would recreate the invisibility this whole change exists to remove.
+      this.log(`Slow-turn ack FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      this.ackSentForTurn = false; // let the next cycle try again
+    }
   }
 
   /**
@@ -1616,7 +1712,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     const now = Date.now();
     const tenMinMs = 10 * 60 * 1000;
-    if (now - this.lastMessageInjectedAt > tenMinMs) return false;
+    if (now - this.lastMessageInjectedAt > tenMinMs) {
+      // Turn abandoned rather than answered. Close it so the NEXT message
+      // opens a fresh one and can still be acknowledged; leaving it open would
+      // mark the next slow turn as already-acked.
+      this.resetAckTurn();
+      return false;
+    }
 
     // Clear typing immediately when the agent sends a reply.
     // outbound-messages.jsonl grows each time the agent calls send-telegram.
@@ -1631,6 +1733,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           // New reply sent — clear typing state
           this.outboundLogSize = size;
           this.lastMessageInjectedAt = 0;
+          this.resetAckTurn();
           return false;
         }
       }
