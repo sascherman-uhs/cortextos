@@ -117,7 +117,7 @@ function reportHalted(halted: Array<{ agent: string; since: string; reason: stri
     const age = Number.isFinite(since)
       ? formatUptime(Math.max(0, Math.floor((Date.now() - since) / 1000)))
       : 'unknown';
-    console.log(`    ${m.agent.padEnd(18)}HALTED ${age} ago — ${m.reason}`);
+    console.log(`    ${m.agent.padEnd(20)} HALTED ${age} ago — ${m.reason}`);
   }
   console.log('\n    Clear with: cortextos unhalt <agent>\n');
 }
