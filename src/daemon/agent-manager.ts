@@ -13,7 +13,12 @@ import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
-import { stripControlChars } from '../utils/validate.js';
+import { stripControlChars, sanitizeForPtyInjection } from '../utils/validate.js';
+import {
+  durableQueueEnabled,
+  headerNeedle,
+  newRecord,
+} from '../telegram/pending-queue.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { stripBom } from '../utils/strip-bom.js';
 import { prepareAgentPrompt } from '../utils/secret-refs.js';
@@ -587,7 +592,7 @@ export class AgentManager {
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
-      poller.onMessage((msg) => {
+      poller.onMessage(async (msg, updateId) => {
         // ALLOWED_USER gate: comma-separated list of numeric user IDs.
         // If configured, ignore messages from other users. Always log the
         // rejected user_id + name so operators can discover IDs to whitelist.
@@ -622,6 +627,7 @@ export class AgentManager {
         const agentEntry = this.agents.get(name);
         if (agentEntry) agentEntry.telegramRejectCount = 0;
 
+        const durable = durableQueueEnabled();
         const from = stripControlChars(msg.from?.first_name || msg.from?.username || 'Unknown');
         const msgChatId = msg.chat?.id;
         const effectiveChatId = msgChatId ?? chatId ?? '';
@@ -641,11 +647,41 @@ export class AgentManager {
 
         if (isMedia && telegramApi) {
           const downloadDir = join(agentDir, 'telegram-images');
-          processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
+
+          // Persist the RAW update BEFORE the download/transcribe round trip.
+          // This was the widest loss window in the system: the media block was
+          // queued from an async .then() callback, so the Telegram offset —
+          // an irrevocable claim of delivery — was persisted before the round
+          // trip had even started. A daemon death (or a failed download) in
+          // that window destroyed the message with no trace.
+          if (durable) {
+            const caption = stripControlChars(msg.caption || '');
+            const rec = newRecord({
+              update_id: updateId,
+              chat_id: effectiveChatId,
+              from,
+              text: caption,
+              header: headerNeedle(sanitizeForPtyInjection(from), effectiveChatId),
+              note: 'raw media update persisted before download/transcribe',
+            });
+            if (!checker.persistPendingTelegram(rec)) return false;
+          }
+
+          const mediaPersisted = processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
             if (!media) {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
               const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
+              if (durable) {
+                // No text and no transcript => an EMPTY block, which is
+                // unanswerable by construction. Never inject it; the durable
+                // cycle notifies the sender instead and retains the record.
+                checker.patchPendingTelegram(updateId, {
+                  formatted: text.trim() ? formatted : '',
+                  empty: !text.trim(),
+                });
+                return;
+              }
               if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
               return;
             }
@@ -673,6 +709,25 @@ export class AgentManager {
               formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration);
             }
 
+            if (durable) {
+              // Empty-block guard: media that yielded neither caption nor
+              // transcript must never be injected.
+              const caption = stripControlChars(msg.caption || '');
+              const hasContent = !!(
+                (media.text && media.text.trim()) ||
+                (media.transcript && media.transcript.trim()) ||
+                caption.trim() ||
+                media.image_path ||
+                media.file_path
+              );
+              checker.patchPendingTelegram(updateId, {
+                formatted: hasContent ? formatted : '',
+                text: (media.transcript || media.text || caption || '').trim(),
+                empty: !hasContent,
+              });
+              log(`Media message received: type=${media.type}, durable record ${updateId} updated (empty=${!hasContent})`);
+              return;
+            }
             if (checker.isDuplicate(formatted)) {
               log('Duplicate Telegram media message suppressed');
               return;
@@ -683,8 +738,23 @@ export class AgentManager {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
+            if (durable) {
+              checker.patchPendingTelegram(updateId, {
+                formatted: text.trim() ? formatted : '',
+                empty: !text.trim(),
+                notes: ['media processing error: ' + String(err)],
+              });
+              return;
+            }
             if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
           });
+          if (durable) {
+            // The raw update is already durable, so the offset may advance now;
+            // the formatted block lands via patch when the round trip finishes.
+            void mediaPersisted;
+            return true;
+          }
+          void mediaPersisted;
           return;
         }
 
@@ -704,6 +774,21 @@ export class AgentManager {
           lastSent ?? undefined,
           recentHistory,
         );
+
+        if (durable) {
+          // No content-keyed dedup here on purpose: that check is what
+          // suppressed Scott's verbatim resends. Identity is the update_id.
+          const rec = newRecord({
+            update_id: updateId,
+            chat_id: effectiveChatId,
+            from,
+            text,
+            formatted,
+            header: headerNeedle(sanitizeForPtyInjection(from), effectiveChatId),
+          });
+          // Return value is the ACK: a failed persist holds the Telegram offset.
+          return checker.persistPendingTelegram(rec);
+        }
 
         if (checker.isDuplicate(formatted)) {
           log('Duplicate Telegram message suppressed');
@@ -1270,8 +1355,12 @@ export class AgentManager {
    * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit. The
    * boolean-returning `injectAgent()` is preserved for callers (cron
    * scheduler, fast-checker, fire-cron) that only need pass/fail.
+   *
+   * WRITE_FAILED (2026-09-24) is a paste write that threw before any byte
+   * reached the PTY — previously that throw escaped into a generic catch and
+   * the message was lost.
    */
-  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED' | 'WRITE_FAILED'; message: string } {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };

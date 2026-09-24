@@ -30,9 +30,18 @@ export class MessageDedup {
 
   /**
    * Returns true if this content has been seen before (duplicate).
+   *
+   * `key` re-keys the dedup window off the content and onto a caller-supplied
+   * identity (2026-09-24 durability fix: Telegram passes `tg:<update_id>#<attempt>`).
+   * Content-keyed dedup suppressed Scott's VERBATIM RESENDS — the messages he
+   * sent precisely because the first copy had been ignored — while doing
+   * nothing to stop a genuine double-injection of the same update. Keying on
+   * update_id inverts that: a re-injection of update N attempt A is suppressed,
+   * and a resend (a different update_id) never is. The attempt suffix keeps the
+   * deliberate retry of update N injectable.
    */
-  isDuplicate(content: string): boolean {
-    const hash = createHash('md5').update(content).digest('hex');
+  isDuplicate(content: string, key?: string): boolean {
+    const hash = createHash('md5').update(key ?? content).digest('hex');
     if (this.hashes.includes(hash)) {
       return true;
     }
@@ -59,24 +68,39 @@ export class MessageDedup {
  * @param write Function to write to the PTY (pty.write)
  * @param content The message content to inject
  * @param enterDelay Milliseconds to wait before sending Enter (default 300ms)
+ * @returns false if the paste write itself threw (nothing reached the PTY).
+ *   true means only that bytes were handed to the file descriptor — it is NOT
+ *   evidence the TUI consumed or answered them. See pending-queue.ts.
  */
 export function injectMessage(
   write: (data: string) => void,
   content: string,
   enterDelay: number = 300,
-): void {
+): boolean {
   // For very large messages, chunk the write to avoid overwhelming the PTY buffer
   const MAX_CHUNK = 4096;
 
-  if (content.length <= MAX_CHUNK) {
-    write(PASTE_START + content + PASTE_END);
-  } else {
-    // Chunked write for large messages
-    write(PASTE_START);
-    for (let i = 0; i < content.length; i += MAX_CHUNK) {
-      write(content.slice(i, i + MAX_CHUNK));
+  // The paste write itself was OUTSIDE any try/catch until 2026-09-24. A throw
+  // here (PTY torn down mid-write, EPIPE on a dying child) propagated all the
+  // way out to FastChecker's generic `catch { log('Poll error: ' + err) }`,
+  // where the message — already shifted out of the in-memory queue — was gone
+  // for good. Now a failed paste is reported to the caller, which keeps the
+  // durable pending file eligible for retry.
+  try {
+    if (content.length <= MAX_CHUNK) {
+      write(PASTE_START + content + PASTE_END);
+    } else {
+      // Chunked write for large messages
+      write(PASTE_START);
+      for (let i = 0; i < content.length; i += MAX_CHUNK) {
+        write(content.slice(i, i + MAX_CHUNK));
+      }
+      write(PASTE_END);
     }
-    write(PASTE_END);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[inject] paste write failed: ${msg}`);
+    return false;
   }
 
   // Send Enter after a short delay to submit the pasted content.
@@ -96,6 +120,8 @@ export function injectMessage(
       console.warn(`[inject] deferred Enter failed (pty likely torn down): ${msg}`);
     }
   }, enterDelay);
+
+  return true;
 }
 
 /**

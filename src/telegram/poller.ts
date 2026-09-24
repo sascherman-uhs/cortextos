@@ -4,9 +4,25 @@ import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery, TelegramMe
 import { TelegramAPI } from './api.js';
 import { ensureDir } from '../utils/atomic.js';
 
-export type MessageHandler = (msg: TelegramMessage) => void;
-export type CallbackHandler = (query: TelegramCallbackQuery) => void;
-export type ReactionHandler = (reaction: TelegramMessageReaction) => void;
+/**
+ * A handler's return value is an ACK. `false` (or a rejected promise) means
+ * "I did not durably take this message" and the Telegram offset is left alone
+ * so the update is redelivered.
+ *
+ * Why (2026-09-24): this return value used to be discarded. `pollOnce` called
+ * `handler(update.message)` synchronously, ignored the result, then persisted
+ * the offset — an irrevocable promise of delivery — while the only copy of the
+ * message was an in-memory array entry. On 2026-09-21 a 13-minute window threw
+ * away everything Scott sent, including his verbatim resends. `void` is still
+ * accepted so existing sync handlers behave exactly as before.
+ */
+export type MessageHandler = (
+  msg: TelegramMessage,
+  /** The update's Telegram update_id — the durable queue's primary key. */
+  updateId: number,
+) => void | boolean | Promise<void | boolean>;
+export type CallbackHandler = (query: TelegramCallbackQuery) => void | boolean | Promise<void | boolean>;
+export type ReactionHandler = (reaction: TelegramMessageReaction) => void | boolean | Promise<void | boolean>;
 
 /**
  * Telegram polling loop. Replaces the Telegram portion of fast-checker.sh.
@@ -122,7 +138,8 @@ export class TelegramPoller {
    * Perform a single poll cycle.
    *
    * Offset-after-handler semantics: the offset only advances after every
-   * registered handler for an update returns successfully. If any handler
+   * registered handler for an update has been AWAITED and returned an ACK
+   * that is not `false`. If any handler
    * throws, the update is left un-acknowledged (Telegram will re-deliver it
    * on the next `getUpdates` call) and the remainder of the batch is deferred
    * to preserve ordering. The offset is persisted after each successful
@@ -139,7 +156,18 @@ export class TelegramPoller {
       if (update.message) {
         for (const handler of this.messageHandlers) {
           try {
-            handler(update.message);
+            // AWAIT the handler and honour its ACK. A handler that returns
+            // false has not durably taken the message, so the offset must not
+            // move — the whole point of the 2026-09-24 durability fix.
+            const ack = await handler(update.message, update.update_id);
+            if (ack === false) {
+              console.error(
+                `[telegram-poller] Message handler declined update ${update.update_id} — ` +
+                'offset held so Telegram redelivers it.',
+              );
+              handlerFailed = true;
+              break;
+            }
           } catch (err) {
             console.error('[telegram-poller] Message handler error:', err);
             handlerFailed = true;
@@ -151,7 +179,12 @@ export class TelegramPoller {
       if (!handlerFailed && update.callback_query) {
         for (const handler of this.callbackHandlers) {
           try {
-            handler(update.callback_query);
+            const ack = await handler(update.callback_query);
+            if (ack === false) {
+              console.error(`[telegram-poller] Callback handler declined update ${update.update_id} — offset held.`);
+              handlerFailed = true;
+              break;
+            }
           } catch (err) {
             console.error('[telegram-poller] Callback handler error:', err);
             handlerFailed = true;
@@ -163,7 +196,12 @@ export class TelegramPoller {
       if (!handlerFailed && update.message_reaction) {
         for (const handler of this.reactionHandlers) {
           try {
-            handler(update.message_reaction);
+            const ack = await handler(update.message_reaction);
+            if (ack === false) {
+              console.error(`[telegram-poller] Reaction handler declined update ${update.update_id} — offset held.`);
+              handlerFailed = true;
+              break;
+            }
           } catch (err) {
             console.error('[telegram-poller] Reaction handler error:', err);
             handlerFailed = true;

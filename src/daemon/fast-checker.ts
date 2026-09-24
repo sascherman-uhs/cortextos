@@ -16,6 +16,15 @@ import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
+import {
+  PendingTelegramQueue,
+  admissionText,
+  durableQueueEnabled,
+  readReplyTimestamps,
+  strictPromptGateEnabled,
+  EMPTY_MEDIA_REPLY,
+  type PendingTelegramRecord,
+} from '../telegram/pending-queue.js';
 
 type LogFn = (msg: string) => void;
 
@@ -43,6 +52,12 @@ export class FastChecker {
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
+
+  // Durable pending-Telegram queue (TELEGRAM_DURABLE_QUEUE). Built eagerly so
+  // the daemon's poller handler can persist BEFORE acking the Telegram offset,
+  // but only consulted when the flag is on — with the flag off every Telegram
+  // path in this class behaves exactly as it did before 2026-09-24.
+  private pending: PendingTelegramQueue;
 
   // Persistent dedup: message hashes to prevent duplicate delivery
   private seenHashes: Set<string> = new Set();
@@ -91,6 +106,11 @@ export class FastChecker {
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
     this.allowedUserId = options.allowedUserId;
+
+    this.pending = new PendingTelegramQueue(
+      join(paths.stateDir, 'pending-telegram'),
+      (msg) => this.log(msg),
+    );
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -196,6 +216,31 @@ export class FastChecker {
     this.telegramMessages.push({ formatted, ackIds: [] });
   }
 
+  /** The durable queue, for the daemon's poller handler. */
+  pendingQueue(): PendingTelegramQueue {
+    return this.pending;
+  }
+
+  /**
+   * Durably persist an inbound Telegram message BEFORE the Telegram offset is
+   * acked. Returns false when the write failed, which the poller handler must
+   * propagate so the offset is held and Telegram redelivers the update.
+   */
+  persistPendingTelegram(rec: PendingTelegramRecord): boolean {
+    const ok = this.pending.persist(rec);
+    this.log(
+      ok
+        ? `Persisted pending Telegram update ${rec.update_id} (chat ${rec.chat_id})`
+        : `FAILED to persist pending Telegram update ${rec.update_id} — holding Telegram offset`,
+    );
+    return ok;
+  }
+
+  /** Patch a persisted record (e.g. attach the formatted block after a media round trip). */
+  patchPendingTelegram(updateId: number, fields: Partial<PendingTelegramRecord>): boolean {
+    return this.pending.patch(updateId, fields) !== null;
+  }
+
   /**
    * Single poll cycle: check inbox + queued Telegram messages.
    */
@@ -203,12 +248,21 @@ export class FastChecker {
     let messageBlock = '';
     const ackIds: string[] = [];
 
-    // Process queued Telegram messages
+    // Process queued Telegram messages.
+    //
+    // With TELEGRAM_DURABLE_QUEUE on this array is not used for Telegram at
+    // all: messages come from disk, one file per injection, handled by
+    // durableTelegramCycle() below. Draining an in-memory array with shift()
+    // is loss mode (a) — the only copy of the message became a local string
+    // before the injection was even attempted.
     let hasTelegramMessage = false;
-    while (this.telegramMessages.length > 0) {
-      const msg = this.telegramMessages.shift()!;
-      messageBlock += msg.formatted;
-      hasTelegramMessage = true;
+    const durable = durableQueueEnabled();
+    if (!durable) {
+      while (this.telegramMessages.length > 0) {
+        const msg = this.telegramMessages.shift()!;
+        messageBlock += msg.formatted;
+        hasTelegramMessage = true;
+      }
     }
 
     // Check agent inbox
@@ -248,6 +302,10 @@ export class FastChecker {
       }
     }
 
+    if (durable) {
+      await this.durableTelegramCycle();
+    }
+
     // Typing indicator: send while Claude is actively working
     if (this.chatId && this.telegramApi && this.isAgentActive()) {
       await this.sendTyping(this.telegramApi, this.chatId);
@@ -255,6 +313,139 @@ export class FastChecker {
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
+  }
+
+  /**
+   * One durable Telegram cycle: prove, reap, escalate, then inject exactly ONE
+   * message.
+   *
+   * Ordering matters. Header observation first (it only changes retry
+   * eligibility), then reaping on OBSERVED REPLIES — the sole evidence that
+   * deletes a pending file — then the attempt-cap admission, then at most one
+   * injection. One file, one injection, one accounting row: fusing several
+   * messages into one block made per-message durability incoherent and made a
+   * block count as "answered" when only its last line was.
+   */
+  private async durableTelegramCycle(): Promise<void> {
+    const now = Date.now();
+    const replies = readReplyTimestamps(join(this.paths.logDir, 'outbound-messages.jsonl'));
+
+    // 1. Transcript proof: the header appearing in the stripped PTY output
+    //    proves the TUI CONSUMED the block. unattempted -> in_flight. This
+    //    NEVER deletes the file — see pending-queue.ts for why that is the
+    //    single most important rule in this design.
+    for (const rec of this.pending.list()) {
+      if (rec.state === 'unattempted' && rec.attempts > 0 && rec.header && this.agent.transcriptContains(rec.header)) {
+        this.pending.markInFlight(rec);
+        this.log(`Pending ${rec.update_id}: header seen in transcript — in_flight (consumed, NOT answered)`);
+      }
+    }
+
+    // 2. Only an observed reply to that chat retires a message.
+    const reaped = this.pending.reapAnswered(replies);
+    if (reaped > 0) this.log(`Pending: ${reaped} message(s) answered — files removed`);
+
+    // 3. Attempt cap reached and still unanswered: admit the miss instead of
+    //    repeating an answer. The file is RETAINED as an escalated record.
+    for (const rec of this.pending.escalationCandidates(now, replies)) {
+      const text = admissionText(rec.text);
+      if (this.telegramApi) {
+        try {
+          await this.telegramApi.sendMessage(rec.chat_id, text);
+        } catch (err) {
+          this.log(`Pending ${rec.update_id}: admission send failed: ${String(err)}`);
+        }
+      }
+      this.pending.markEscalated(rec, `escalated after ${rec.attempts} attempts with no observed reply`);
+      this.log(`Pending ${rec.update_id}: ESCALATED after ${rec.attempts} attempts — admitted the miss to chat ${rec.chat_id}`);
+    }
+
+    // 4. Empty media can never be injected — an empty block is unanswerable by
+    //    construction. Tell the sender instead of going silent, and keep the
+    //    record. Both halves ship together: a guard with no notice would turn a
+    //    broken answer into silence, which is worse.
+    for (const rec of this.pending.list()) {
+      if (!rec.empty || rec.state !== 'unattempted') continue;
+      if (this.telegramApi) {
+        try {
+          await this.telegramApi.sendMessage(rec.chat_id, EMPTY_MEDIA_REPLY);
+        } catch (err) {
+          this.log(`Pending ${rec.update_id}: empty-media notice failed: ${String(err)}`);
+        }
+      }
+      this.pending.markFailedNotified(rec, 'media yielded no text and no transcript — sender notified');
+      this.log(`Pending ${rec.update_id}: empty media — sender notified, not injected`);
+    }
+
+    // 5. Inject exactly one.
+    const next = this.pending.nextDeliverable(now, replies);
+    if (!next) return;
+
+    let block = next.formatted;
+    if (!block) {
+      // The daemon died between persisting the raw update and formatting it
+      // (the media round trip). Rebuild a text block from what we durably kept
+      // rather than dropping the message.
+      if (!next.text.trim()) {
+        this.pending.markFailedNotified(next, 'no formatted block and no recoverable text after restart');
+        this.log(`Pending ${next.update_id}: unrecoverable after restart — retained, not injected`);
+        return;
+      }
+      block = FastChecker.formatTelegramTextMessage(
+        next.from,
+        next.chat_id,
+        next.text,
+        this.frameworkRoot,
+      );
+      this.pending.patch(next.update_id, {
+        formatted: block,
+        notes: [...next.notes, 'reformatted from persisted text after restart'],
+      });
+    }
+
+    // Prompt-state gate. SOFT for the first 24h: log what it WOULD have held
+    // and inject anyway, because a heuristic gate that holds messages is a new
+    // way to lose them. TELEGRAM_PROMPT_GATE_STRICT flips it, and ships in this
+    // same commit — never a gate without its satisfier.
+    if (!this.agent.isAtPrompt()) {
+      const why = this.agent.hasModalOpen() ? 'modal open' : 'not at prompt';
+      if (strictPromptGateEnabled()) {
+        this.log(`Pending ${next.update_id}: HELD in queue (${why}) — strict prompt gate`);
+        return;
+      }
+      this.log(`Pending ${next.update_id}: prompt gate would have held (${why}) — injecting anyway (soft mode)`);
+    }
+
+    const attemptNo = next.attempts + 1;
+    let payload = block;
+    if (attemptNo > 1) {
+      const lastSent = FastChecker.readLastSent(this.paths.stateDir, next.chat_id);
+      const lastSentCtx = lastSent
+        ? `[Your last message to this chat: "${sanitizeForPtyInjection(lastSent.slice(0, 500))}"]\n`
+        : '';
+      payload =
+        `[RETRY attempt ${attemptNo}] No reply to chat ${next.chat_id} was observed after the first delivery. ` +
+        `If you ALREADY answered this, say so — do not answer twice.\n${lastSentCtx}${block}`;
+    }
+
+    // Dedup keyed on update_id + attempt, not content: a re-injection of this
+    // attempt is suppressed, Scott's verbatim resend (a different update_id)
+    // never is, and the deliberate retry above stays injectable.
+    const res = this.agent.injectMessageDetailed(payload, `tg:${next.update_id}#${attemptNo}`);
+    if (!res.ok) {
+      // Loss mode (b): this used to be `if (injected)` with no else at all.
+      this.pending.patch(next.update_id, {
+        last_attempt_at: new Date().toISOString(),
+        notes: [...next.notes, `inject failed (${res.code}): ${res.message}`],
+      });
+      this.log(`Pending ${next.update_id}: inject failed (${res.code}) — retained for retry: ${res.message}`);
+      return;
+    }
+
+    this.pending.markAttempt(next);
+    this.lastMessageInjectedAt = Date.now();
+    this.log(`Pending ${next.update_id}: injected attempt ${attemptNo} (${payload.length} bytes) — awaiting a reply before deletion`);
+    await sleep(5000);
   }
 
   // === JARVIS MOD #23 — voice cue loader (2026-07-05) ===

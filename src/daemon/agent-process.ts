@@ -368,18 +368,68 @@ export class AgentProcess {
    * See issue #346 — both used to surface as a bare `false` and got mistaken
    * for "agent not found" by operators investigating restart/cron failures.
    */
-  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectMessageDetailed(
+    content: string,
+    dedupKey?: string,
+  ): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED' | 'WRITE_FAILED'; message: string } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
 
-    if (this.dedup.isDuplicate(content)) {
-      this.log('Dedup: skipping duplicate message');
-      return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
+    // dedupKey re-keys the dedup window off the content (2026-09-24): content
+    // keying silently ate Scott's verbatim resends. See MessageDedup.isDuplicate.
+    if (this.dedup.isDuplicate(content, dedupKey)) {
+      this.log(`Dedup: skipping duplicate message${dedupKey ? ` (key ${dedupKey})` : ''}`);
+      return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — ${dedupKey ? `key ${dedupKey}` : 'content'} matches MessageDedup hash window` };
     }
 
-    injectMessage((data) => this.pty?.write(data), content);
+    const wrote = injectMessage((data) => this.pty?.write(data), content);
+    if (!wrote) {
+      return { ok: false, code: 'WRITE_FAILED', message: `paste write to "${this.name}" PTY threw — nothing reached the terminal` };
+    }
     return { ok: true };
+  }
+
+  /**
+   * The stripped tail of the agent's PTY output — the only channel we have for
+   * observing what the TUI actually did with what we injected.
+   */
+  getStrippedTail(bytes = 4000): string {
+    const raw = this.pty?.getOutputBuffer()?.getRecent(20) ?? '';
+    return raw.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').slice(-bytes);
+  }
+
+  /**
+   * Did the TUI consume a block carrying this header? Proof of CONSUMPTION
+   * only — never proof that anyone answered. See pending-queue.ts for why that
+   * distinction is the load-bearing one.
+   */
+  transcriptContains(needle: string): boolean {
+    if (!needle) return false;
+    return this.getStrippedTail(20000).includes(needle);
+  }
+
+  /**
+   * Is a modal/confirmation dialog on screen? Text pasted into a modal goes
+   * nowhere — or worse, answers the modal.
+   *
+   * Heuristic by necessity: there is no reverse channel from the TUI, so this
+   * reads the rendered tail. Shipped SOFT first (log only) precisely because a
+   * heuristic gate that holds messages would be a new way to lose them.
+   */
+  hasModalOpen(): boolean {
+    const tail = this.getStrippedTail(2500);
+    return /Do you want to |Would you like to |\(y\/n\)|❯ 1\.|Select an option|Choose an option|Press Enter to continue|Trust the files/i.test(tail);
+  }
+
+  /** Is the agent sitting at an idle input prompt, ready to receive a paste? */
+  isAtPrompt(): boolean {
+    if (!this.pty || this.status !== 'running') return false;
+    if (this.hasModalOpen()) return false;
+    const tail = this.getStrippedTail(2500);
+    // "esc to interrupt" = a turn is actively running; a paste lands mid-turn.
+    if (/esc to interrupt/i.test(tail)) return false;
+    return /\? for shortcuts|for shortcuts|│ >|^\s*>\s*$/m.test(tail);
   }
 
   /**
