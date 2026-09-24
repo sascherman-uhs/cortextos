@@ -41,9 +41,25 @@ export async function POST(req: NextRequest) {
     return Response.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const voicePath = body.path === 'realtime' || body.path === 'fastpath' ? body.path : null;
+  // === MOD #107 ROUND 5 — 'realtime-el' was missing from this list. ==========
+  // The Daniel lane has been the shipped engine since MOD #107
+  // (NEXT_PUBLIC_CTX_VOICE_ENGINE=realtime-el), and latency.ts:25 has reported
+  // it as its own VoicePath since then — so every turn Scott has actually
+  // spoken 400'd here and the newest stored latency row was 2026-08-09. Six
+  // weeks blind because one string was not added in two places. The list MUST
+  // stay in sync with VoicePath in src/lib/voice/latency.ts.
+  const VOICE_PATHS = ['realtime', 'realtime-el', 'fastpath'] as const;
+  const voicePath = VOICE_PATHS.find((p) => p === body.path) ?? null;
   const firstAudioMs = Number(body.firstAudioMs);
   if (!voicePath || !Number.isFinite(firstAudioMs) || firstAudioMs < 0 || firstAudioMs > MAX_PLAUSIBLE_MS) {
+    // A monitor that rejects silently is the same failure class as a watchdog
+    // that reports healthy on empty output: the 400s were being counted by
+    // nobody. Name the value that was refused and why, so the next enum drift
+    // shows up in the server log on its FIRST turn instead of six weeks later.
+    console.warn(
+      `[api/uhs/voice/metrics] rejected payload: path=${JSON.stringify(body.path)} ` +
+        `(accepted: ${VOICE_PATHS.join('|')}) firstAudioMs=${JSON.stringify(body.firstAudioMs)}`,
+    );
     return Response.json({ error: 'Invalid metrics payload' }, { status: 400 });
   }
 
