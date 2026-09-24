@@ -528,13 +528,41 @@ export class CodexAppServerPTY {
     });
   }
 
-  private async waitForSocket(timeoutMs = 10000): Promise<void> {
+  /**
+   * How long to wait for the app-server's unix socket to appear.
+   *
+   * fleet-stability §A5: the 10s default is DELIBERATELY unchanged. Rev 1 of
+   * the plan wanted 30s on the strength of orphaned `app-server-broker.mjs`
+   * processes, but that evidence was withdrawn under review — those brokers
+   * belong to Claude Code's own openai-codex plugin, not to cortextos, which
+   * spawns `codex app-server --listen` directly via node-pty with no broker in
+   * the path. So the budget is now measurable (`waitForSocket` logs the wait it
+   * actually achieved) and tunable without a rebuild, and any future change to
+   * the default has to come from that measurement rather than a second guess.
+   */
+  private static socketWaitBudgetMs(): number {
+    const raw = process.env['CTX_CODEX_SOCKET_WAIT_MS'];
+    const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
+  }
+
+  private async waitForSocket(
+    timeoutMs = CodexAppServerPTY.socketWaitBudgetMs(),
+  ): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (existsSync(this._socketPath)) return;
+      if (existsSync(this._socketPath)) {
+        this._outputBuffer.push(
+          `[codex-app-server] socket ready after ${Date.now() - start}ms (budget ${timeoutMs}ms)\n`,
+        );
+        return;
+      }
       await sleep(100);
     }
-    throw new Error(`Timed out waiting for app-server socket: ${this._socketPath}`);
+    throw new Error(
+      `Timed out waiting for app-server socket: ${this._socketPath} ` +
+      `(waited ${Date.now() - start}ms of ${timeoutMs}ms budget)`,
+    );
   }
 
   private async connectRpc(): Promise<void> {
@@ -798,8 +826,34 @@ export class CodexAppServerPTY {
     }
   }
 
+  /**
+   * Issue a JSON-RPC request against the app-server.
+   *
+   * fleet-stability §A2: the CRASH path (`pty.onExit`) sets `_alive = false`
+   * but does NOT null `_rpc` — only `kill()` does that. So the graceful path
+   * was already safe while the crash path was exposed: after the server died
+   * on its own, `thread/resume` and `thread/list` sailed through to a dead
+   * client and waited out the FULL JSON-RPC timeout, producing the misleading
+   * headline
+   *
+   *   [codex-app-server] persisted resume failed: JSON-RPC request timed out: thread/resume
+   *   [codex-app-server] degraded:               JSON-RPC request timed out: thread/list
+   *
+   * instead of "the server exited". Reject immediately, naming the exit.
+   *
+   * `_alive` is set true at the top of spawn(), BEFORE the app-server is
+   * launched, so start-up RPC (initialize, thread/new, thread/resume) is not
+   * affected by this gate.
+   */
   private request<T>(method: string, params: unknown): Promise<JsonRpcResponse<T>> {
-    if (!this._rpc) throw new Error('Codex app-server RPC is not connected');
+    if (!this._alive) {
+      return Promise.reject(new Error(
+        `Codex app-server exited — refusing ${method} (not issuing RPC against a dead server)`,
+      ));
+    }
+    if (!this._rpc) {
+      return Promise.reject(new Error('Codex app-server RPC is not connected'));
+    }
     return this._rpc.request<T>(method, params);
   }
 

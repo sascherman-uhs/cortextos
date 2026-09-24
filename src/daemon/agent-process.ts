@@ -12,6 +12,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { haltMarkerPath, readHaltMarker, writeHaltMarker } from './halt-marker.js';
 import {
   observeClaudeModel,
   observeCodexModel,
@@ -47,6 +48,12 @@ export class AgentProcess {
   private crashWindowMax: number = 0;
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
+  /**
+   * ISO timestamp of the durable halt transition, mirrored from the `.halted`
+   * marker. Surfaced through getStatus() so alerting can fire once per halt
+   * TRANSITION rather than once per crash (fleet-stability §A4.4).
+   */
+  private haltedSince: string | null = null;
   private stopping: boolean = false;
   // BUG-040 fix: persists across stop() return until handleExit clears it.
   // Required because BUG-032's CRLF + 5s wait can cause graceful shutdown to
@@ -104,6 +111,31 @@ export class AgentProcess {
   async start(): Promise<void> {
     if (this.status === 'running') {
       this.log('Already running');
+      return;
+    }
+
+    // ------------------------------------------------------------------
+    // fleet-stability §A4: durable halt gate.
+    //
+    // crashCount/status are instance fields and `new AgentProcess()` runs on
+    // EVERY startAgent() call, so before this check a halted agent was
+    // respawned by daemon boot, a cron, an IPC start-agent, or a plain
+    // `cortextos restart <agent>` — crashing once and halting again each time
+    // (trillion-coder, 2026-09-24: three HALTED lines in ten minutes with
+    // crash_count climbing 10 → 11 → 12 past its own cap, and three Telegram
+    // alerts). Every respawn path funnels through start(), so this single
+    // check cannot be bypassed. Only an operator clears the marker
+    // (`cortextos unhalt <agent>`) — never the daemon, never a cron.
+    // ------------------------------------------------------------------
+    const persistedHalt = readHaltMarker(this.env.ctxRoot, this.name);
+    if (persistedHalt) {
+      this.log(
+        `HALTED since ${persistedHalt.since} — refusing to start (${persistedHalt.reason}). ` +
+        `Clear with: cortextos unhalt ${this.name}`,
+      );
+      this.status = 'halted';
+      this.haltedSince = persistedHalt.since;
+      this.notifyStatusChange();
       return;
     }
 
@@ -462,6 +494,9 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      ...(this.status === 'halted' && this.haltedSince
+        ? { haltedSince: this.haltedSince }
+        : {}),
     };
   }
 
@@ -806,8 +841,9 @@ export class AgentProcess {
           `CRASH_LOOP: ${this.crashTimestamps.length} crashes in ${this.crashWindowMs / 1000}s window — auto-pausing`,
         );
         this.appendCrashToRestartsLog(exitCode, 0, 'CRASH_LOOP');
-        this.status = 'halted';
-        this.notifyStatusChange();
+        this.haltDurably(
+          `crash loop: ${this.crashTimestamps.length} crashes in ${this.crashWindowMs / 1000}s`,
+        );
         return;
       }
     }
@@ -821,8 +857,7 @@ export class AgentProcess {
     if (this.crashCount >= this.maxCrashesPerDay) {
       this.log(`HALTED: exceeded ${this.maxCrashesPerDay} crashes today`);
       this.appendCrashToRestartsLog(exitCode, 0, 'HALTED');
-      this.status = 'halted';
-      this.notifyStatusChange();
+      this.haltDurably(`exceeded ${this.maxCrashesPerDay} crashes today`);
       return;
     }
 
@@ -1152,18 +1187,56 @@ export class AgentProcess {
     }
   }
 
+  /**
+   * Halt this agent DURABLY (fleet-stability §A4): flip in-memory status and
+   * write the `.halted` marker that start() refuses to spawn past. The marker
+   * preserves the timestamp of the FIRST halt, so a re-halt is not a new
+   * transition and does not re-alert; `haltedSince` carries that timestamp out
+   * through getStatus() for the one-alert-per-transition gate in
+   * agent-manager.
+   */
+  private haltDurably(reason: string): void {
+    this.status = 'halted';
+    const marker = writeHaltMarker(this.env.ctxRoot, this.name, {
+      reason,
+      crashCount: this.crashCount,
+      maxCrashes: this.maxCrashesPerDay,
+    });
+    this.haltedSince = marker.since;
+    this.log(
+      `Halt persisted to ${haltMarkerPath(this.env.ctxRoot, this.name)} — ` +
+      `will NOT restart on daemon boot, cron, or restart. ` +
+      `Clear with: cortextos unhalt ${this.name}`,
+    );
+    this.notifyStatusChange();
+  }
+
+  /**
+   * Reconcile the daily crash count with its on-disk record.
+   *
+   * The FILE is authoritative, not `this.crashCount`: the file survives a
+   * daemon restart and `new AgentProcess()` while the instance field does not.
+   * Deriving the new count from the stored value alone makes the caller's
+   * pre-increment a harmless no-op rather than a second count (fleet-stability
+   * §A4.5), and it means an operator deleting the file — which
+   * `cortextos unhalt` does — actually restores the crash budget instead of
+   * leaving a stale in-memory count that re-halts on the very next crash.
+   * The caller's `crashCount++` remains as the fallback for the case where
+   * this whole block throws on a filesystem error.
+   */
   private resetCrashCountIfNewDay(today: string): void {
     const crashFile = join(this.env.ctxRoot, 'logs', this.name, '.crash_count_today');
     try {
+      let storedToday = 0;
       if (existsSync(crashFile)) {
         const content = readFileSync(crashFile, 'utf-8').trim();
         const [storedDate, count] = content.split(':');
         if (storedDate === today) {
-          this.crashCount = parseInt(count, 10) + 1;
-        } else {
-          this.crashCount = 1;
+          const parsed = parseInt(count, 10);
+          if (Number.isFinite(parsed) && parsed > 0) storedToday = parsed;
         }
       }
+      this.crashCount = storedToday + 1;
       ensureDir(join(this.env.ctxRoot, 'logs', this.name));
       writeFileSync(crashFile, `${today}:${this.crashCount}`, 'utf-8');
     } catch { /* ignore */ }

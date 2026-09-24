@@ -27,6 +27,7 @@ import { importAgentCommand } from './import-agent.js';
 import { updateCommand } from './update.js';
 import { modelCommand } from './model.js';
 import { ingressCommand } from './ingress.js';
+import { unhaltCommand } from './unhalt.js';
 
 const program = new Command();
 
@@ -64,6 +65,7 @@ program.addCommand(importAgentCommand);
 program.addCommand(updateCommand);
 program.addCommand(modelCommand);
 program.addCommand(ingressCommand);
+program.addCommand(unhaltCommand);
 
 // crash-alert: SessionEnd hook — cross-platform replacement for crash-alert.sh
 const crashAlertCommand = new Command('crash-alert')

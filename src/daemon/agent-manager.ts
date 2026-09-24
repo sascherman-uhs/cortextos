@@ -11,6 +11,7 @@ import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
+import { listHaltedAgents, readHaltMarker, updateHaltMarker } from './halt-marker.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars, sanitizeForPtyInjection } from '../utils/validate.js';
@@ -60,6 +61,14 @@ export class AgentManager {
   /** OS-07: the daemon-hosted multiplexed Telegram ingress, when any bot uses it. */
   private ingress?: MultiplexedIngress;
   private ingressDrain?: NodeJS.Timeout;
+
+  /**
+   * fleet-stability §A4 escape hatch: Telegram handles kept per agent so the
+   * halt reminder can re-alert about an agent that is NOT running (and
+   * therefore has no live per-agent alert wiring of its own).
+   */
+  private telegramHandles: Map<string, { api: TelegramAPI; chatId: string }> = new Map();
+  private haltReminder?: NodeJS.Timeout;
 
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
@@ -511,7 +520,30 @@ export class AgentManager {
           const crashNum = status.crashCount ?? '?';
           tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
+          // fleet-stability §A4.4: ONE alert per halt TRANSITION, not one per
+          // crash and not one per respawn attempt. prevStatus cannot carry
+          // this: the whole AgentProcess (and this closure) is rebuilt by
+          // every startAgent() call, which is exactly how trillion-coder sent
+          // three identical HALTED pings in ten minutes on 2026-09-24. The
+          // `.halted` marker's alertCount/lastAlertAt is the durable gate; a
+          // halt with no marker (e.g. a model-routing spawn refusal) still
+          // alerts, as it did before.
+          const marker = status.haltedSince
+            ? readHaltMarker(this.ctxRoot, name)
+            : null;
+          if (!marker || !marker.lastAlertAt) {
+            tgApi.sendMessage(tgChatId,
+              `Agent ${name} HALTED — ${marker?.reason || 'exceeded crash limit'}. ` +
+              `It will stay halted (daemon boot, crons and restart will not respawn it). ` +
+              `Clear with: cortextos unhalt ${name}`,
+            ).catch(() => {});
+            if (marker) {
+              updateHaltMarker(this.ctxRoot, name, {
+                lastAlertAt: new Date().toISOString(),
+                alertCount: (marker.alertCount || 0) + 1,
+              });
+            }
+          }
         } else if (status.status === 'running' && prevStatus === 'crashed') {
           tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
         }
@@ -519,7 +551,14 @@ export class AgentManager {
       });
     }
 
+    // fleet-stability §A4: keep the handle so the halt reminder can still
+    // reach Scott about an agent that is no longer running.
+    if (telegramApi && chatId) {
+      this.telegramHandles.set(name, { api: telegramApi, chatId });
+    }
+
     this.agents.set(name, { process: agentProcess, checker });
+    this.startHaltReminder();
 
     // Start agent
     await agentProcess.start();
@@ -1208,7 +1247,66 @@ export class AgentManager {
    * are written synchronously before the async stop loop starts, so by the
    * time `pty.kill()` runs, every agent already has its marker on disk.
    */
+  /**
+   * fleet-stability §A4.3 — the escape hatch that stops a durable halt from
+   * becoming a silent permanent death.
+   *
+   * A durable halt fixes the spam but creates a new risk: an agent that never
+   * comes back and nobody notices. One Telegram ping is not enough — on
+   * 2026-09-24 THREE pings about trillion-coder were missed. So while any
+   * `.halted` marker exists, re-alert on an interval. Tunables:
+   * CTX_HALT_REMINDER_HOURS (default 4, 0 disables) and
+   * CTX_HALT_REMINDER_CHECK_MS (default 15 min).
+   *
+   * The markers themselves are the machine-readable hook: an external briefing
+   * or dashboard script can read every halted agent off disk with
+   * `listHaltedAgents(ctxRoot)`, or by globbing `.halted` under <ctxRoot>/state, with no
+   * daemon involvement.
+   */
+  private startHaltReminder(): void {
+    if (this.haltReminder) return;
+    const hours = Number.parseFloat(process.env['CTX_HALT_REMINDER_HOURS'] || '4');
+    if (!Number.isFinite(hours) || hours <= 0) return;
+    const everyMs = hours * 3600 * 1000;
+    const checkRaw = Number.parseInt(process.env['CTX_HALT_REMINDER_CHECK_MS'] || '', 10);
+    const checkMs = Number.isFinite(checkRaw) && checkRaw > 0 ? checkRaw : 15 * 60 * 1000;
+    this.haltReminder = setInterval(() => {
+      try {
+        this.sendHaltReminders(everyMs);
+      } catch (err) {
+        console.error('[agent-manager] halt reminder sweep failed:', err);
+      }
+    }, checkMs);
+    this.haltReminder.unref?.();
+  }
+
+  /** Re-alert about every agent still halted longer than `everyMs` ago. */
+  private sendHaltReminders(everyMs: number): void {
+    const now = Date.now();
+    for (const marker of listHaltedAgents(this.ctxRoot)) {
+      const lastAt = marker.lastAlertAt ? Date.parse(marker.lastAlertAt) : Date.parse(marker.since);
+      if (Number.isFinite(lastAt) && now - lastAt < everyMs) continue;
+      const handle = this.telegramHandles.get(marker.agent);
+      const heldFor = Math.max(0, Math.round((now - Date.parse(marker.since)) / 3600000));
+      console.log(`[agent-manager] ${marker.agent} still HALTED (${heldFor}h) — ${marker.reason}`);
+      if (handle) {
+        handle.api.sendMessage(handle.chatId,
+          `Reminder: agent ${marker.agent} is STILL HALTED (${heldFor}h) — ${marker.reason}. ` +
+          `Nothing will restart it. Clear with: cortextos unhalt ${marker.agent}`,
+        ).catch(() => {});
+      }
+      updateHaltMarker(this.ctxRoot, marker.agent, {
+        lastAlertAt: new Date().toISOString(),
+        alertCount: (marker.alertCount || 0) + 1,
+      });
+    }
+  }
+
   async stopAll(): Promise<void> {
+    if (this.haltReminder) {
+      clearInterval(this.haltReminder);
+      this.haltReminder = undefined;
+    }
     await this.stopIngress();
     const names = [...this.agents.keys()];
 

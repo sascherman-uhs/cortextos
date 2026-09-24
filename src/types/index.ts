@@ -977,6 +977,13 @@ export interface AgentStatus {
   sessionStart?: string;
   crashCount?: number;
   model?: string;
+  /**
+   * ISO timestamp of a DURABLE halt (fleet-stability §A4). Present only when
+   * status === 'halted' and the agent has a `.halted` marker on disk. Stable
+   * across respawn attempts, so consumers can alert once per halt transition
+   * instead of once per crash.
+   */
+  haltedSince?: string;
 }
 
 // ---------------------------------------------------------------------------

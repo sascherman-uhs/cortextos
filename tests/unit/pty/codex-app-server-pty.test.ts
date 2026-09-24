@@ -116,6 +116,85 @@ describe('CodexAppServerPTY socket path policy', () => {
   });
 });
 
+describe('CodexAppServerPTY dead-RPC gate (fleet-stability A2)', () => {
+  function makePty() {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    return pty;
+  }
+
+  type Requester = { request<T>(m: string, p: unknown): Promise<T> };
+
+  it('refuses a request immediately once the server has exited, naming the exit', async () => {
+    // pty.onExit sets _alive = false but deliberately does NOT null _rpc — only
+    // kill() does. Before the gate, thread/resume and thread/list were issued
+    // against the dead client and waited out the FULL JSON-RPC timeout, so the
+    // operator saw "JSON-RPC request timed out: thread/list" instead of "the
+    // server exited".
+    const pty = makePty();
+    (pty as unknown as { _alive: boolean })._alive = false;
+    requestMock.mockImplementation(() => new Promise(() => { /* never settles */ }));
+
+    await expect((pty as unknown as Requester).request('thread/list', {}))
+      .rejects.toThrow(/Codex app-server exited — refusing thread\/list/);
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
+  it('still forwards the request while the server is alive', async () => {
+    const pty = makePty();
+    (pty as unknown as { _alive: boolean })._alive = true;
+    requestMock.mockResolvedValue({ result: { threads: [] } });
+
+    await expect((pty as unknown as Requester).request('thread/list', { cursor: null }))
+      .resolves.toEqual({ result: { threads: [] } });
+    expect(requestMock).toHaveBeenCalledWith('thread/list', { cursor: null });
+  });
+
+  it('rejects rather than throwing synchronously when the RPC client was never connected', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    await expect((pty as unknown as Requester).request('thread/list', {}))
+      .rejects.toThrow('Codex app-server RPC is not connected');
+  });
+});
+
+describe('CodexAppServerPTY socket wait budget (fleet-stability A5)', () => {
+  it('defaults to 10s and is overridable via CTX_CODEX_SOCKET_WAIT_MS', () => {
+    const budget = () => (CodexAppServerPTY as unknown as {
+      socketWaitBudgetMs(): number;
+    }).socketWaitBudgetMs();
+
+    delete process.env['CTX_CODEX_SOCKET_WAIT_MS'];
+    expect(budget()).toBe(10000);
+
+    process.env['CTX_CODEX_SOCKET_WAIT_MS'] = '30000';
+    expect(budget()).toBe(30000);
+
+    // Garbage falls back to the default rather than to a zero-length wait.
+    process.env['CTX_CODEX_SOCKET_WAIT_MS'] = 'soon';
+    expect(budget()).toBe(10000);
+    process.env['CTX_CODEX_SOCKET_WAIT_MS'] = '-5';
+    expect(budget()).toBe(10000);
+    delete process.env['CTX_CODEX_SOCKET_WAIT_MS'];
+  });
+
+  it('logs the wait it actually achieved so a timeout change can be measured, not guessed', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    fsMocks.existsSync.mockReturnValue(true);
+    await (pty as unknown as { waitForSocket(ms?: number): Promise<void> }).waitForSocket(1000);
+    expect(pty.getOutputBuffer().getRecent()).toMatch(/socket ready after \d+ms \(budget 1000ms\)/);
+  });
+
+  it('names the achieved wait and the budget in the timeout error', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    fsMocks.existsSync.mockReturnValue(false);
+    await expect(
+      (pty as unknown as { waitForSocket(ms?: number): Promise<void> }).waitForSocket(150),
+    ).rejects.toThrow(/waited \d+ms of 150ms budget/);
+  });
+});
+
 describe('CodexAppServerPTY command mapping', () => {
   function makeReadyPty() {
     const pty = new CodexAppServerPTY(mockEnv, {});
@@ -789,6 +868,10 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
@@ -818,6 +901,10 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
 
@@ -842,6 +929,10 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
@@ -1192,6 +1283,10 @@ describe('CodexAppServerPTY capability_profile (WP-7 capability isolation)', () 
     requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
@@ -1210,6 +1305,10 @@ describe('CodexAppServerPTY capability_profile (WP-7 capability isolation)', () 
     requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'full' });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
@@ -1228,6 +1327,10 @@ describe('CodexAppServerPTY capability_profile (WP-7 capability isolation)', () 
     requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'read_only' });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
 
@@ -1250,6 +1353,10 @@ describe('CodexAppServerPTY capability_profile (WP-7 capability isolation)', () 
     requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-thread' } } });
     const pty = new CodexAppServerPTY(mockEnv, { capability_profile: 'read_only' });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    // fleet-stability A2: request() now refuses RPC against a dead server,
+    // so a test driving the thread internals directly must mark the PTY alive
+    // the way spawn() does before it launches the app-server.
+    (pty as unknown as { _alive: boolean })._alive = true;
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
 

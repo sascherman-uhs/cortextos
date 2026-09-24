@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir, platform } from 'os';
 import { execSync, spawn, spawnSync } from 'child_process';
 import { IPCClient } from '../daemon/ipc-server.js';
+import { clearHaltMarker, readHaltMarker } from '../daemon/halt-marker.js';
 
 const IS_WINDOWS = platform() === 'win32';
 const SAFE_CMD = /^[@a-z0-9._/-]+$/i;
@@ -184,6 +185,18 @@ export const startCommand = new Command('start')
         mkdirSync(join(ctxRoot, 'config'), { recursive: true });
         writeFileSync(enabledPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
         console.log(`  Registered ${agent} in enabled-agents.json`);
+      }
+
+      // fleet-stability §A4.2: naming an agent on `cortextos start` IS the
+      // explicit operator action that clears a durable halt. Bare
+      // `cortextos start` (daemon boot / start-all) deliberately does not —
+      // that is the path that used to resurrect trillion-coder. The clear
+      // lives here in the CLI, never in the daemon.
+      const halt = readHaltMarker(ctxRoot, agent);
+      if (halt) {
+        clearHaltMarker(ctxRoot, agent);
+        console.log(`  Cleared durable halt for ${agent} (halted since ${halt.since} — ${halt.reason})`);
+        console.log(`  Tip: \`cortextos unhalt ${agent}\` also resets today's crash count.`);
       }
 
       console.log(`Starting agent: ${agent}`);
