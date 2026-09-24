@@ -475,6 +475,14 @@ export class FastChecker {
 
     this.pending.markAttempt(next);
     this.lastMessageInjectedAt = Date.now();
+    // Arm the slow-turn ack clock (973573e) on the durable path too. That
+    // feature anchors off `hasTelegramMessage`, which is only set by the
+    // in-memory drain above — so with TELEGRAM_DURABLE_QUEUE on, a seventeen-
+    // minute silence would go unacknowledged again. A flag of mine must not
+    // quietly switch off someone else's gate. Same semantics: anchor to the
+    // FIRST unanswered message, count every one.
+    if (this.ackTurnStartedAt === 0) this.ackTurnStartedAt = Date.now();
+    this.ackTurnMessageCount++;
     this.log(`Pending ${next.update_id}: injected attempt ${attemptNo} (${payload.length} bytes) — awaiting a reply before deletion`);
     await sleep(5000);
   }
