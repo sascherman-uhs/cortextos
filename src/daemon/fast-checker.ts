@@ -65,6 +65,19 @@ export class FastChecker {
   private ackTurnMessageCount: number = 0;
   /** One ack per turn, never per message — a burst of five gets one. */
   private ackSentForTurn: boolean = false;
+  /**
+   * True when a message in this turn was injected while the agent was already
+   * mid-turn on something else (the soft prompt-gate path).
+   *
+   * Load-bearing for the ack's WORDING, not for delivery. On 2026-09-24 Scott
+   * asked for a marketing-kit link at 07:06:44; the ack told him "Still
+   * working" at 07:07:30, and the first tool call against his request did not
+   * happen until 07:11:51 — five minutes later. Nothing was "still working" on
+   * his question; the session was busy with unrelated work and his message was
+   * queued behind it. The ack was not slow, it was WRONG, and it bought the
+   * silence four more minutes of credibility.
+   */
+  private ackTurnQueuedBehindWork: boolean = false;
   // === END slow-turn acknowledgment (fields) ================================
   // Track stdout log size to detect when agent is actively producing output
   private stdoutLogSize: number = -1;
@@ -482,6 +495,9 @@ export class FastChecker {
         return;
       }
       this.log(`Pending ${next.update_id}: prompt gate would have held (${why}) — injecting anyway (soft mode)`);
+      // Remember it for the ack: this message landed behind work in progress,
+      // so the ack must not claim anyone is working on IT yet.
+      this.ackTurnQueuedBehindWork = true;
     }
 
     const attemptNo = next.attempts + 1;
@@ -833,6 +849,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ackTurnStartedAt = 0;
     this.ackTurnMessageCount = 0;
     this.ackSentForTurn = false;
+    this.ackTurnQueuedBehindWork = false;
   }
 
   /**
@@ -880,7 +897,21 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     const n = this.ackTurnMessageCount;
     const subject = n > 1 ? `all ${n}` : 'it';
-    const text = `Got ${subject} — this needs a few minutes. Still working; the answer comes here when it's done.`;
+    const waited = Math.round((Date.now() - this.ackTurnStartedAt) / 1000);
+
+    // Say only what this timer actually knows. It knows the message arrived and
+    // that no reply has been logged for `waited` seconds. It does NOT know that
+    // anyone has read the message, and when the soft prompt gate fired it knows
+    // the opposite — so claiming progress ("still working") is a lie the ack is
+    // not entitled to tell. Scott has to be able to trust that a JARVIS status
+    // line reflects a real state; an automatic message that sounds like a person
+    // reporting progress is worse than silence, because it buys the silence time.
+    const text = this.ackTurnQueuedBehindWork
+      ? `Received ${subject} (${waited}s ago) — automatic receipt, not an answer. ` +
+        `The session was mid-turn on other work, so this is queued behind it and ` +
+        `hasn't been read yet. The reply lands here when it's done.`
+      : `Received ${subject} (${waited}s ago) — automatic receipt, not an answer. ` +
+        `The turn is running long. The reply lands here when it's done.`;
     try {
       await api.sendMessage(chatId, text);
       this.log(`Slow-turn ack sent after ${Math.round((Date.now() - this.ackTurnStartedAt) / 1000)}s (${n} message(s) pending)`);

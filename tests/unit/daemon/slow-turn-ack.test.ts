@@ -108,7 +108,43 @@ describe('FastChecker slow-turn ack', () => {
     expect(api.sendMessage).toHaveBeenCalledTimes(1);
     const [chat, text] = api.sendMessage.mock.calls[0];
     expect(chat).toBe(CHAT);
-    expect(text).toMatch(/still working/i);
+    expect(text).toMatch(/automatic receipt/i);
+    expect(text).toMatch(/not an answer/i);
+    expect(text).toContain('60s');
+  });
+
+  // 2026-09-24. The ack used to say "Still working" — which it cannot know, and
+  // which was flatly false the morning Scott's 07:06 request sat unread until
+  // 07:11 while the session finished unrelated work. A timer may report receipt
+  // and elapsed time; it may not report progress.
+  it('never claims progress it cannot observe', async () => {
+    openTurn(60_000);
+    await checker.maybeSendSlowTurnAck(api, CHAT);
+
+    const text = api.sendMessage.mock.calls[0][1];
+    expect(text).not.toMatch(/still working/i);
+    expect(text).not.toMatch(/looking into|working on it|on it now/i);
+  });
+
+  it('says so explicitly when the message is queued behind other work', async () => {
+    openTurn(60_000);
+    checker.ackTurnQueuedBehindWork = true;
+    await checker.maybeSendSlowTurnAck(api, CHAT);
+
+    const text = api.sendMessage.mock.calls[0][1];
+    expect(text).toMatch(/queued behind/i);
+    expect(text).toMatch(/hasn't been read yet/i);
+  });
+
+  it('resetAckTurn clears the queued-behind-work flag, so it cannot leak into the next turn', async () => {
+    openTurn(60_000);
+    checker.ackTurnQueuedBehindWork = true;
+    checker.resetAckTurn();
+    expect(checker.ackTurnQueuedBehindWork).toBe(false);
+
+    openTurn(60_000);
+    await checker.maybeSendSlowTurnAck(api, CHAT);
+    expect(api.sendMessage.mock.calls[0][1]).not.toMatch(/queued behind/i);
   });
 
   it('sends ONE ack per turn, not one per poll cycle', async () => {
