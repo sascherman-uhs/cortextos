@@ -44,6 +44,16 @@ export interface HaltMarker {
   alertCount?: number;
 }
 
+/** A usable string, or '' — never an object, array or number. */
+function str(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+/** A finite number, or undefined — never a numeric-looking string. */
+function num(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
 export function haltMarkerPath(ctxRoot: string, agent: string): string {
   return join(ctxRoot, 'state', agent, HALT_MARKER_FILENAME);
 }
@@ -59,14 +69,20 @@ export function readHaltMarker(ctxRoot: string, agent: string): HaltMarker | nul
       return { agent, since: new Date(0).toISOString(), reason: 'halted (marker unreadable)' };
     }
     const parsed = JSON.parse(raw) as Partial<HaltMarker>;
+    // Coerce every field. A marker is operator-editable and machine-written, so
+    // a wrong TYPE has to be as harmless as a missing field: a non-string
+    // `since` used to travel all the way into `Date.parse()` in the reminder
+    // sweep (NaN → an immediate reminder reading "NaNh") and into the status
+    // table. Halted-ness never depended on this — the reader already failed
+    // closed — but the values it hands out now do.
     return {
-      agent: parsed.agent || agent,
-      since: parsed.since || new Date(0).toISOString(),
-      reason: parsed.reason || 'halted',
-      crashCount: parsed.crashCount,
-      maxCrashes: parsed.maxCrashes,
-      lastAlertAt: parsed.lastAlertAt,
-      alertCount: parsed.alertCount,
+      agent: str(parsed.agent) || agent,
+      since: str(parsed.since) || new Date(0).toISOString(),
+      reason: str(parsed.reason) || 'halted',
+      crashCount: num(parsed.crashCount),
+      maxCrashes: num(parsed.maxCrashes),
+      lastAlertAt: str(parsed.lastAlertAt) || undefined,
+      alertCount: num(parsed.alertCount),
     };
   } catch {
     // Unparseable marker = still halted. Fail closed.

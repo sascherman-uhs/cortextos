@@ -510,6 +510,18 @@ export class CodexAppServerPTY {
       });
 
       this._appServerPty = pty;
+      // fleet-stability §A2 follow-up: RE-ARM liveness for this attempt.
+      //
+      // `startAppServerWithRetry()` makes up to three attempts. When attempt 1's
+      // app-server dies on its own, `pty.onExit` sets `_alive = false` — and
+      // nothing set it back, so a SUCCESSFUL attempt 2 then hit the new dead-RPC
+      // gate on its very first call and `initialize` was refused with "Codex
+      // app-server exited". Without this line the gate turns trillion-coder's
+      // crash-loop (which the retry sometimes recovered) into a deterministic
+      // never-starts. A freshly launched app-server is live-in-intent, exactly
+      // as it is at the top of spawn(); onExit for a superseded pty is already
+      // ignored by the `this._appServerPty !== pty` guard below.
+      this._alive = true;
       pty.onData((data) => {
         this._outputBuffer.push(data);
         if (data.includes('Error:')) {
