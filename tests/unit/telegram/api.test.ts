@@ -204,12 +204,19 @@ describe('TelegramAPI.validateCredentials', () => {
   });
 
   it('network_error: fetch throws -> reason=network_error (caller treats as WARN)', async () => {
-    queue({ throws: new Error('getaddrinfo ENOTFOUND api.telegram.org') });
+    // post() retries a transport failure up to 3 times (2026-09-24 stability
+    // fix), so a PERSISTENT outage has to fail all three before it is
+    // classified. Queue the same throw per attempt; one queued response would
+    // make attempt 2 fail with the mock's own "no queued response" instead.
+    for (let i = 0; i < 3; i++) {
+      queue({ throws: new Error('getaddrinfo ENOTFOUND api.telegram.org') });
+    }
 
     const api = new TelegramAPI('111:AAA');
     const result = await api.validateCredentials('222');
 
     expect(result.ok).toBe(false);
+    expect(callLog.length).toBe(3); // retried, then classified
     if (!result.ok) {
       expect(result.reason).toBe('network_error');
       expect(result.detail).toContain('ENOTFOUND');
@@ -219,10 +226,15 @@ describe('TelegramAPI.validateCredentials', () => {
   });
 
   it('rate_limited: getMe 429 -> reason=rate_limited', async () => {
-    queue({
-      status: 429,
-      body: { ok: false, error_code: 429, description: 'Too Many Requests: retry after 5' },
-    });
+    // Same reason as network_error above: a 429 is retried (honouring
+    // retry_after), so sustained rate-limiting must exhaust all 3 attempts
+    // before the validator reports it.
+    for (let i = 0; i < 3; i++) {
+      queue({
+        status: 429,
+        body: { ok: false, error_code: 429, description: 'Too Many Requests: retry after 5' },
+      });
+    }
 
     const api = new TelegramAPI('111:AAA');
     const result = await api.validateCredentials('222');

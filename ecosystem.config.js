@@ -47,6 +47,14 @@ module.exports = {
       max_restarts: 10,
       restart_delay: 5000,
       autorestart: true,
+      // Prefix every log line with a timestamp. PM2 omits these by default,
+      // which cost real time on the 2026-09-24 Telegram investigation: the
+      // error log held 91 poll failures for the previous day and there was no
+      // way to tell whether they were one 10-minute storm or a blip every
+      // fifteen minutes — two very different faults. Without this, correlating
+      // a daemon log against the watchdog log (which IS timestamped) or
+      // against when Scott says the bot went quiet is guesswork.
+      time: true,
     },
   ],
 };

@@ -80,6 +80,20 @@ export function formatValidateError(result: Extract<ValidateCredentialsResult, {
   }
 }
 
+/**
+ * Internal marker for a failure the Telegram API itself says is worth
+ * retrying, carrying the server-named delay when it gave one. Not exported:
+ * callers of TelegramAPI only ever see a plain Error, exactly as before.
+ */
+class RetryableTelegramError extends Error {
+  retryAfterMs: number | null;
+  constructor(message: string, retryAfterMs: number | null) {
+    super(message);
+    this.name = 'RetryableTelegramError';
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
 export class TelegramAPI {
   private baseUrl: string;
   private lastSendTime: Map<string, number> = new Map();
@@ -621,33 +635,141 @@ export class TelegramAPI {
   }
 
   /**
-   * Make a POST request to the Telegram API.
+   * Make a POST request to the Telegram API, retrying transient failures.
+   *
+   * WHY THIS RETRIES (Scott, 2026-09-24: "Telegram has been extremely unstable
+   * and buggy over the last several days"). Before this, a single transient
+   * failure was thrown straight at the caller with no retry whatsoever. On the
+   * inbound path that was survivable — the poll loop just tries again a second
+   * later. On the OUTBOUND path it meant the message was gone: most
+   * sendMessage() callers are fire-and-forget `.catch(() => {})` alert sends,
+   * so a blip ate the reply and left no trace anywhere. That is what
+   * "unstable" felt like from the outside: a bot that answers most of the time.
+   *
+   * Measured on 2026-09-23 (one day, inbound only, the only path that logs):
+   * 50 `fetch failed`, 17 `Bad Gateway`, 16 15s-timeouts, and 8 `Too Many
+   * Requests: retry after 5` — 91 failures Telegram itself labelled retryable,
+   * including 8 where it told us exactly how long to wait and we threw instead.
+   *
+   * WHAT IS RETRIED: transport errors (`fetch failed`, undici socket resets),
+   * Telegram 5xx (`Bad Gateway`/`Internal Server Error`), and 429 — honouring
+   * `parameters.retry_after` when present. Together those were 75 of the 91.
+   *
+   * WHAT IS NOT, and must never be:
+   *   - 409 Conflict. TelegramPoller.start() matches on /Conflict/i to yield the
+   *     getUpdates lock to a duplicate poller. Retrying here would swallow that
+   *     signal and resurrect the 2026-09-22 conflict storm (358 self-dies).
+   *   - Any other 4xx — BOT_COMMANDS_TOO_MUCH, chat not found, bad token.
+   *     Deterministic; retrying just triples the log noise.
+   *   - Our own 15s timeout. See the TimeoutError branch below for why: it is
+   *     the expensive case and the one that risks a duplicate send.
+   *
+   * DUPLICATE-SEND TRADEOFF: Telegram offers no idempotency key for
+   * sendMessage, so a reply that was accepted but whose response was lost in
+   * transit will be re-sent. Chosen deliberately: for an ops bot a rare
+   * doubled message is a nuisance, a silently dropped one is a missed
+   * instruction. Attempts are capped at 3 to keep that rare.
    */
   private async post(method: string, data: object): Promise<any> {
-    try {
-      const response = await fetch(`${this.baseUrl}/${method}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-        signal: AbortSignal.timeout(15000),
-      });
-      const result = await response.json() as any;
-      if (!result.ok) {
-        throw new Error(`Telegram API error: ${result.description || 'Unknown error'}`);
+    const MAX_ATTEMPTS = 3;
+    // Cap on an honoured retry_after. Telegram floods usually ask for ~5s;
+    // a pathological value must not wedge the poll loop for minutes.
+    const MAX_RETRY_AFTER_MS = 30_000;
+    let lastErr: Error | undefined;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let waitMs: number | null = null;
+      try {
+        const response = await fetch(`${this.baseUrl}/${method}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+          signal: AbortSignal.timeout(15000),
+        });
+
+        // A 5xx from Telegram's edge can be an HTML body, not JSON — json()
+        // then throws and the old code reported it as a generic "request
+        // failed", hiding a perfectly retryable Bad Gateway.
+        let result: any;
+        try {
+          result = await response.json();
+        } catch {
+          if (response.status >= 500) {
+            throw new RetryableTelegramError(
+              `Telegram API error: HTTP ${response.status} (non-JSON body)`,
+              null,
+            );
+          }
+          throw new Error(`Telegram API error: HTTP ${response.status} (unparseable body)`);
+        }
+
+        if (!result.ok) {
+          const description = String(result.description || 'Unknown error');
+          const retryAfterSec = Number(result.parameters?.retry_after);
+          const isConflict = /Conflict/i.test(description);
+          const isRetryable =
+            !isConflict &&
+            (response.status === 429 ||
+              response.status >= 500 ||
+              Number.isFinite(retryAfterSec));
+          const err = new Error(`Telegram API error: ${description}`);
+          if (isRetryable) {
+            throw new RetryableTelegramError(
+              err.message,
+              Number.isFinite(retryAfterSec)
+                ? Math.min(retryAfterSec * 1000, MAX_RETRY_AFTER_MS)
+                : null,
+            );
+          }
+          throw err;
+        }
+
+        if (attempt > 1) {
+          console.warn(`[telegram-api] ${method} succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
+        }
+        return result;
+      } catch (err) {
+        if (err instanceof RetryableTelegramError) {
+          lastErr = new Error(err.message);
+          waitMs = err.retryAfterMs;
+        } else if (err instanceof Error && err.message.startsWith('Telegram API error')) {
+          // Deterministic API rejection (incl. 409 Conflict) — surface now.
+          throw err;
+        } else if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+          // AbortSignal.timeout surfaces as DOMException name=TimeoutError.
+          //
+          // DELIBERATELY NOT RETRIED, unlike every other transient failure:
+          //   - Cost. Each attempt burns the full 15s, so retrying twice turns a
+          //     wedged socket into a ~45s inbound stall. The poll loop already
+          //     re-issues getUpdates a second later for free, so a retry here
+          //     buys nothing it does not already have.
+          //   - Safety. A 15s hang means the request very likely REACHED
+          //     Telegram and we lost the response — the one case where a
+          //     re-sent sendMessage duplicates a real delivery.
+          // Fast failures (`fetch failed` in ms) and Telegram's own 429/5xx
+          // carry neither cost, which is why those do retry.
+          throw new Error(`Telegram API request timed out after 15s: ${method}`);
+        } else {
+          // Transport-level: undici `fetch failed`, socket reset, DNS blip.
+          lastErr = new Error(`Telegram API request failed: ${err}`);
+        }
+
+        if (attempt === MAX_ATTEMPTS) break;
+        // Exponential backoff (1s, 2s) unless Telegram named its own delay.
+        const backoffMs = waitMs ?? 1000 * attempt;
+        console.warn(
+          `[telegram-api] ${method} attempt ${attempt}/${MAX_ATTEMPTS} failed`
+          + ` (${lastErr.message}) — retrying in ${backoffMs}ms`,
+        );
+        await new Promise(r => setTimeout(r, backoffMs));
       }
-      return result;
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('Telegram API error')) {
-        throw err;
-      }
-      // AbortSignal.timeout surfaces as DOMException name=TimeoutError (or AbortError).
-      // Surface as a clean retryable error so the poller loop recovers next tick
-      // instead of silently hanging on a wedged TCP connection.
-      if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-        throw new Error(`Telegram API request timed out after 15s: ${method}`);
-      }
-      throw new Error(`Telegram API request failed: ${err}`);
     }
+
+    // Every attempt failed. Log before throwing: the dominant caller is a
+    // fire-and-forget `.catch(() => {})` alert send, so without this line an
+    // exhausted outbound message leaves no evidence it ever existed.
+    console.error(`[telegram-api] ${method} FAILED after ${MAX_ATTEMPTS} attempts: ${lastErr?.message}`);
+    throw lastErr ?? new Error(`Telegram API request failed: ${method}`);
   }
 
   /**
