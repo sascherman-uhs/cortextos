@@ -344,6 +344,64 @@ describe('send evidence — every rail an agent can answer on', () => {
   });
 });
 
+describe('the live record 462809024 — the exact state that must never escalate', () => {
+  /**
+   * Verbatim shape of Scott's first real message through the durable queue
+   * (2026-09-24 12:44:25Z, text "Test"), which was consumed, answered TWICE on
+   * a rail that writes nothing observable, and would have escalated as
+   * "I may have missed this: «Test»" under the pre-fix logic.
+   */
+  const live = () => ({
+    update_id: 462809024,
+    chat_id: '8727328514',
+    from: 'Scott',
+    text: 'Test',
+    formatted: '=== TELEGRAM from [USER: Scott] (chat_id:8727328514) ===\nTest\n',
+    header: '=== TELEGRAM from [USER: Scott] (chat_id:8727328514) ===',
+    state: 'in_flight' as const,
+    attempts: 2,
+    empty: false,
+    created_at: '2026-09-24T12:44:25.693Z',
+    first_attempt_at: '2026-09-24T12:44:26.087Z',
+    last_attempt_at: '2026-09-24T12:44:56.433Z',
+    in_flight_at: '2026-09-24T12:45:03.880Z',
+    log_offset: null,
+    notes: ['ZZTEST fixture of the 2026-09-24 live record'],
+  });
+
+  const wellAfter = Date.parse('2026-09-24T12:45:03.880Z') + IN_FLIGHT_RETRY_MS + 60_000;
+
+  it('does NOT escalate, is NOT re-injected, and becomes an operator-only record', () => {
+    q.persist(live());
+    expect(q.dropCandidates(wellAfter, noReply)).toEqual([]);            // no message to Scott
+    expect(q.nextDeliverable(wellAfter, noReply)).toBeNull();            // no third copy
+    expect(q.unverifiedCandidates(wellAfter, noReply).map((r) => r.update_id)).toEqual([462809024]);
+  });
+
+  it('is retired outright once any rail shows the reply', () => {
+    q.persist(live());
+    const answered = byOutboundLog(new Map([['8727328514', Date.parse('2026-09-24T12:45:30Z')]]));
+    expect(q.reapAnswered(answered)).toBe(1);
+    expect(q.read(462809024)).toBeNull();
+  });
+
+  it('a null log_offset never counts as transcript evidence (fails closed)', () => {
+    q.persist(live());
+    expect(q.read(462809024)!.log_offset).toBeNull();
+  });
+
+  it("a human's answered_manual resolution is terminal and is never touched again", () => {
+    q.persist({ ...live(), state: 'answered_manual' as any, notes: ['ZZTEST resolved by hand'] });
+    expect(q.dropCandidates(wellAfter, noReply)).toEqual([]);
+    expect(q.unverifiedCandidates(wellAfter, noReply)).toEqual([]);
+    expect(q.nextDeliverable(wellAfter, noReply)).toBeNull();
+    // Not even reply evidence deletes it — the human's note is the audit record.
+    const answered = byOutboundLog(new Map([['8727328514', Date.parse('2026-09-24T12:45:30Z')]]));
+    expect(q.reapAnswered(answered)).toBe(0);
+    expect(q.read(462809024)!.state).toBe('answered_manual');
+  });
+});
+
 describe('durability of the record set', () => {
   it('keeps an unreadable record on disk instead of dropping it', () => {
     q.persist(rec(600));

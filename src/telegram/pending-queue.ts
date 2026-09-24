@@ -56,7 +56,28 @@ export type PendingState =
   | 'in_flight'
   | 'escalated'
   | 'unverified'
-  | 'failed_notified';
+  | 'failed_notified'
+  /**
+   * Closed by a human who confirmed out-of-band that the message WAS answered.
+   * Written by an operator, never by this code (the first one was update
+   * 462809024 on 2026-09-24, resolved by hand to stop a false escalation
+   * reaching Scott). Recognised here so the queue treats it as terminal:
+   * never re-injected, never escalated, never reaped, and its audit note is
+   * left exactly as the human wrote it.
+   */
+  | 'answered_manual';
+
+/** States the queue will not act on again. */
+export const TERMINAL_STATES: readonly PendingState[] = [
+  'escalated',
+  'unverified',
+  'failed_notified',
+  'answered_manual',
+];
+
+function isTerminal(state: PendingState): boolean {
+  return TERMINAL_STATES.includes(state);
+}
 
 export interface PendingTelegramRecord {
   update_id: number;
@@ -86,7 +107,7 @@ export interface PendingTelegramRecord {
    * only reads bytes AFTER this watermark, which gives a rigorous "after the
    * injection" ordering for a rail that writes no timestamps anywhere.
    */
-  log_offset?: number;
+  log_offset?: number | null;
   notes: string[];
 }
 
@@ -291,7 +312,10 @@ export class PendingTelegramQueue {
   reapAnswered(answered: (rec: PendingTelegramRecord) => boolean): number {
     let n = 0;
     for (const rec of this.list()) {
-      if (rec.state === 'failed_notified' || rec.state === 'escalated' || rec.state === 'unverified') continue;
+      // A terminal record is an audit record. Never delete one, even if reply
+      // evidence turns up later — a human's resolution note is the only record
+      // of why it was closed.
+      if (isTerminal(rec.state)) continue;
       if (answered(rec)) {
         this.remove(rec.update_id);
         n++;
@@ -302,7 +326,7 @@ export class PendingTelegramQueue {
 
   isEligible(rec: PendingTelegramRecord, now: number, answered: (rec: PendingTelegramRecord) => boolean): boolean {
     if (rec.empty) return false;
-    if (rec.state === 'escalated' || rec.state === 'failed_notified' || rec.state === 'unverified') return false;
+    if (isTerminal(rec.state)) return false;
     // A consumed block is already in the TUI. Re-injecting it can only produce
     // the duplicate delivery observed live on 2026-09-24 ("Got all two").
     if (rec.state === 'in_flight') return false;
@@ -348,6 +372,8 @@ export class PendingTelegramQueue {
     const out: PendingTelegramRecord[] = [];
     for (const rec of this.list()) {
       if (rec.empty) continue;
+      // ONLY 'unattempted' earns an admission, which also means every terminal
+      // state — including a human's answered_manual — is excluded by construction.
       if (rec.state !== 'unattempted') continue;
       if (rec.attempts < MAX_ATTEMPTS) continue;
       if (answered(rec)) continue;

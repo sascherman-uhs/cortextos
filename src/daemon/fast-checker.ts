@@ -569,7 +569,7 @@ export class FastChecker {
     // prove the evidence came AFTER the injection, and a false "answered" here
     // DELETES a real message. Fail closed: fall back to the timestamped rails
     // only, which at worst leaves the record as `unverified` for the operator.
-    if (rec.log_offset === undefined) return false;
+    if (rec.log_offset === undefined || rec.log_offset === null) return false;
     const offset = rec.log_offset;
     try {
       const path = join(this.paths.logDir, 'stdout.log');
