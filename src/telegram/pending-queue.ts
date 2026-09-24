@@ -29,16 +29,34 @@
  *
  * State machine:
  *   unattempted --header seen--> in_flight --reply seen--> (file deleted)
- *   attempts >= MAX_ATTEMPTS and still unanswered --> escalated (file RETAINED)
- *   media with no text and no transcript          --> failed_notified (RETAINED)
+ *   never consumed + attempts exhausted --> escalated  (RETAINED, Scott is told)
+ *   consumed but no reply we can see    --> unverified (RETAINED, operator only)
+ *   media with no text and no transcript --> failed_notified (RETAINED)
  * Nothing is ever silently dropped.
+ *
+ * Why `unverified` exists (live defect, 2026-09-24 05:45). Scott's first real
+ * message through this queue was answered TWICE ("Got all two"), and the reply
+ * left no row in outbound-messages.jsonl at all: the agent answered via
+ * uhsJARVIS `scripts/telegram-send.sh`, which POSTs straight to
+ * api.telegram.org and records nothing locally. Escalating on the absence of
+ * that row would have told Scott "I may have missed this: «Test»" about a
+ * message he had been answered on twice — the system looking confused is worse
+ * than the deafness we set out to fix. So an admission to Scott now requires
+ * that the message was NEVER CONSUMED (header never appeared). A consumed
+ * message with no observable reply is an OBSERVABILITY gap, not a lost
+ * message, and it is surfaced to the operator, never to Scott.
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync } from '../utils/atomic.js';
 
-export type PendingState = 'unattempted' | 'in_flight' | 'escalated' | 'failed_notified';
+export type PendingState =
+  | 'unattempted'
+  | 'in_flight'
+  | 'escalated'
+  | 'unverified'
+  | 'failed_notified';
 
 export interface PendingTelegramRecord {
   update_id: number;
@@ -63,14 +81,38 @@ export interface PendingTelegramRecord {
   first_attempt_at?: string;
   last_attempt_at?: string;
   in_flight_at?: string;
+  /**
+   * Size of the agent's stdout.log at injection time. Send-evidence scanning
+   * only reads bytes AFTER this watermark, which gives a rigorous "after the
+   * injection" ordering for a rail that writes no timestamps anywhere.
+   */
+  log_offset?: number;
   notes: string[];
 }
 
 /** After this many injections with no observed reply, admit it rather than repeat. */
 export const MAX_ATTEMPTS = 2;
-/** Header never appeared: the block probably never reached the TUI — retry fast. */
-export const UNATTEMPTED_RETRY_MS = 30_000;
-/** Header appeared but no reply: the turn may still be running — wait properly. */
+/**
+ * How long to wait for the header before concluding the block never landed.
+ *
+ * Was a flat 30s, which produced a DOUBLE DELIVERY on the first real message
+ * (2026-09-24): attempt 1 at 05:44:26, attempt 2 at 05:44:56, and the header
+ * for attempt 1 only appeared at 05:45:03 — 37s after injection. The retry
+ * raced the very signal meant to suppress it and Scott's JARVIS replied "Got
+ * all two."
+ *
+ * 180s: ~5x the observed latency, with headroom for a busy agent (the live
+ * case was NOT at a prompt on either attempt, so the TUI was mid-turn and
+ * slower to echo than a quiet one). Telegram itself has already retained the
+ * message, so a three-minute delay costs a little latency; a duplicate costs
+ * Scott's trust in every reply he gets.
+ */
+export const UNATTEMPTED_RETRY_MS = 180_000;
+/**
+ * How long a consumed-but-unanswered message waits before it is recorded as
+ * unverified. It is never RE-INJECTED: the header proves the block is already
+ * in the TUI, so a second copy can only duplicate it.
+ */
 export const IN_FLIGHT_RETRY_MS = 10 * 60_000;
 
 function truthy(v: string | undefined): boolean {
@@ -127,6 +169,32 @@ export function readReplyTimestamps(outboundLogPath: string, maxLines = 400): Ma
     // which is the safe direction — we would rather retry than lose a message.
   }
   return out;
+}
+
+/**
+ * Patterns that prove an agent ATTEMPTED to send to this chat from inside its
+ * own session. Needed because not every reply rail leaves a local record:
+ * uhsJARVIS `scripts/telegram-send.sh` POSTs directly to api.telegram.org and
+ * writes nothing anywhere (that repo is another session's, so the rail is
+ * observed here rather than instrumented there).
+ *
+ * Every rail an agent can use is a command it runs in its PTY, so the PTY
+ * transcript covers all of them. Weaker than an outbound-log row — it proves a
+ * send was attempted, not that Telegram accepted it — which is the right trade
+ * when the alternative is telling the human we missed something we answered.
+ */
+export function sendEvidenceInTranscript(text: string, chatId: string): boolean {
+  if (!text) return false;
+  const patterns: RegExp[] = [
+    /telegram-send\.sh/,
+    /telegram_notify\.py/,
+    /telegram-send\.py/,
+    new RegExp(`send-telegram\\s+['"\`]?${chatId}`),
+    new RegExp(`sendMessage[^\\n]{0,200}${chatId}`),
+    new RegExp(`chat_id['"\\s:=]{1,6}${chatId}`),
+    /api\.telegram\.org\/bot[^\s]*\/sendMessage/,
+  ];
+  return patterns.some((re) => re.test(text));
 }
 
 export class PendingTelegramQueue {
@@ -203,13 +271,15 @@ export class PendingTelegramQueue {
   }
 
   /**
-   * Has a reply to this record's chat been observed since we first injected it?
+   * Reply evidence from the cortextos rail: a row in outbound-messages.jsonl
+   * for this chat, strictly newer than the first attempt. Requires attempts >= 1
+   * so an unrelated earlier outbound can never delete an unattempted record.
    *
-   * Requires attempts >= 1 and a reply strictly newer than the first attempt,
-   * so an unrelated earlier outbound message can never delete a record that
-   * was never even attempted.
+   * This is ONE rail of several — see ReplyEvidence / answeredBy in
+   * fast-checker for the union. It is the strongest (it proves Telegram
+   * accepted the send) but it is NOT complete: telegram-send.sh bypasses it.
    */
-  isAnswered(rec: PendingTelegramRecord, replies: Map<string, number>): boolean {
+  repliedInOutboundLog(rec: PendingTelegramRecord, replies: Map<string, number>): boolean {
     if (rec.attempts < 1) return false;
     const since = Date.parse(rec.first_attempt_at ?? rec.created_at);
     if (Number.isNaN(since)) return false;
@@ -217,12 +287,12 @@ export class PendingTelegramQueue {
     return reply !== undefined && reply > since;
   }
 
-  /** Delete every record whose chat has an observed reply. Returns the count. */
-  reapAnswered(replies: Map<string, number>): number {
+  /** Delete every record with observed reply evidence on ANY rail. Returns the count. */
+  reapAnswered(answered: (rec: PendingTelegramRecord) => boolean): number {
     let n = 0;
     for (const rec of this.list()) {
-      if (rec.state === 'failed_notified' || rec.state === 'escalated') continue;
-      if (this.isAnswered(rec, replies)) {
+      if (rec.state === 'failed_notified' || rec.state === 'escalated' || rec.state === 'unverified') continue;
+      if (answered(rec)) {
         this.remove(rec.update_id);
         n++;
       }
@@ -230,10 +300,13 @@ export class PendingTelegramQueue {
     return n;
   }
 
-  isEligible(rec: PendingTelegramRecord, now: number, replies: Map<string, number>): boolean {
+  isEligible(rec: PendingTelegramRecord, now: number, answered: (rec: PendingTelegramRecord) => boolean): boolean {
     if (rec.empty) return false;
-    if (rec.state === 'escalated' || rec.state === 'failed_notified') return false;
-    if (this.isAnswered(rec, replies)) return false;
+    if (rec.state === 'escalated' || rec.state === 'failed_notified' || rec.state === 'unverified') return false;
+    // A consumed block is already in the TUI. Re-injecting it can only produce
+    // the duplicate delivery observed live on 2026-09-24 ("Got all two").
+    if (rec.state === 'in_flight') return false;
+    if (answered(rec)) return false;
     if (rec.attempts === 0) {
       // attempts stays 0 when an inject FAILED outright (agent down, paste
       // threw). Throttle those so a stopped agent does not spin the poll loop,
@@ -245,8 +318,10 @@ export class PendingTelegramQueue {
     if (rec.attempts >= MAX_ATTEMPTS) return false;
     const last = Date.parse(rec.last_attempt_at ?? rec.created_at);
     if (Number.isNaN(last)) return true;
-    const grace = rec.state === 'in_flight' ? IN_FLIGHT_RETRY_MS : UNATTEMPTED_RETRY_MS;
-    return now - last >= grace;
+    // Retry is gated on the HEADER'S ABSENCE (state still unattempted) plus a
+    // bound comfortably larger than observed header latency — not on a short
+    // fixed timer that races the signal.
+    return now - last >= UNATTEMPTED_RETRY_MS;
   }
 
   /**
@@ -256,27 +331,46 @@ export class PendingTelegramQueue {
    * "unanswered" readings when only the last line of a block got answered.
    * Three queued messages now mean three turns. That cost is accepted.
    */
-  nextDeliverable(now: number, replies: Map<string, number>): PendingTelegramRecord | null {
+  nextDeliverable(now: number, answered: (rec: PendingTelegramRecord) => boolean): PendingTelegramRecord | null {
     for (const rec of this.list()) {
-      if (this.isEligible(rec, now, replies)) return rec;
+      if (this.isEligible(rec, now, answered)) return rec;
     }
     return null;
   }
 
   /**
-   * Records that have used up their attempts and are still unanswered. The
-   * caller admits the miss to the human and marks them `escalated`; the file
-   * is RETAINED for audit either way.
+   * TRUE drops: the header NEVER appeared, so the block never reached the TUI,
+   * and the attempts are spent. Only these earn an admission to the human —
+   * requiring "never consumed" is what stops the queue telling Scott it missed
+   * a message he was answered on twice.
    */
-  escalationCandidates(now: number, replies: Map<string, number>): PendingTelegramRecord[] {
+  dropCandidates(now: number, answered: (rec: PendingTelegramRecord) => boolean): PendingTelegramRecord[] {
     const out: PendingTelegramRecord[] = [];
     for (const rec of this.list()) {
       if (rec.empty) continue;
-      if (rec.state === 'escalated' || rec.state === 'failed_notified') continue;
+      if (rec.state !== 'unattempted') continue;
       if (rec.attempts < MAX_ATTEMPTS) continue;
-      if (this.isAnswered(rec, replies)) continue;
+      if (answered(rec)) continue;
       const last = Date.parse(rec.last_attempt_at ?? rec.created_at);
-      if (!Number.isNaN(last) && now - last < IN_FLIGHT_RETRY_MS) continue;
+      if (!Number.isNaN(last) && now - last < UNATTEMPTED_RETRY_MS) continue;
+      out.push(rec);
+    }
+    return out;
+  }
+
+  /**
+   * Consumed by the TUI, but no reply we can observe on any rail. This is an
+   * OBSERVABILITY gap, not a lost message: it is recorded for the operator and
+   * NOTHING is sent to the human.
+   */
+  unverifiedCandidates(now: number, answered: (rec: PendingTelegramRecord) => boolean): PendingTelegramRecord[] {
+    const out: PendingTelegramRecord[] = [];
+    for (const rec of this.list()) {
+      if (rec.empty) continue;
+      if (rec.state !== 'in_flight') continue;
+      if (answered(rec)) continue;
+      const since = Date.parse(rec.in_flight_at ?? rec.last_attempt_at ?? rec.created_at);
+      if (!Number.isNaN(since) && now - since < IN_FLIGHT_RETRY_MS) continue;
       out.push(rec);
     }
     return out;
@@ -304,6 +398,10 @@ export class PendingTelegramQueue {
 
   markEscalated(rec: PendingTelegramRecord, note: string): PendingTelegramRecord | null {
     return this.patch(rec.update_id, { state: 'escalated', notes: [...rec.notes, note] });
+  }
+
+  markUnverified(rec: PendingTelegramRecord, note: string): PendingTelegramRecord | null {
+    return this.patch(rec.update_id, { state: 'unverified', notes: [...rec.notes, note] });
   }
 
   markFailedNotified(rec: PendingTelegramRecord, note: string): PendingTelegramRecord | null {

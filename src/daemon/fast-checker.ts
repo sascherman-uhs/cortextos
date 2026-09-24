@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync, openSync, readSync, closeSync } from 'fs';
 import { execFile } from 'child_process';
 import { join } from 'path';
 import { createHash } from 'crypto';
@@ -21,6 +21,7 @@ import {
   admissionText,
   durableQueueEnabled,
   readReplyTimestamps,
+  sendEvidenceInTranscript,
   strictPromptGateEnabled,
   EMPTY_MEDIA_REPLY,
   type PendingTelegramRecord,
@@ -361,6 +362,25 @@ export class FastChecker {
     const now = Date.now();
     const replies = readReplyTimestamps(join(this.paths.logDir, 'outbound-messages.jsonl'));
 
+    // Reply evidence is a UNION over every rail an agent can answer on, because
+    // the cortextos rail alone is demonstrably incomplete: on 2026-09-24 Scott
+    // got a real reply that left no row in outbound-messages.jsonl, because the
+    // agent used uhsJARVIS scripts/telegram-send.sh, which POSTs straight to
+    // api.telegram.org and records nothing. Rails covered:
+    //   1. outbound-messages.jsonl (cortextos bus send-telegram) — strongest,
+    //      timestamped, proves Telegram accepted the send.
+    //   2. state/<agent>/last-telegram-<chat>.txt (cacheLastSent) — survives a
+    //      truncated/rotated log.
+    //   3. the PTY transcript after the injection's byte watermark — catches
+    //      EVERY rail, because any send an agent performs is a command it runs
+    //      in its own session.
+    const answered = (rec: PendingTelegramRecord): boolean => {
+      if (rec.attempts < 1) return false;
+      if (this.pending.repliedInOutboundLog(rec, replies)) return true;
+      if (this.lastSentTouchedAfter(rec)) return true;
+      return this.sendObservedInTranscript(rec);
+    };
+
     // 1. Transcript proof: the header appearing in the stripped PTY output
     //    proves the TUI CONSUMED the block. unattempted -> in_flight. This
     //    NEVER deletes the file — see pending-queue.ts for why that is the
@@ -373,12 +393,13 @@ export class FastChecker {
     }
 
     // 2. Only an observed reply to that chat retires a message.
-    const reaped = this.pending.reapAnswered(replies);
-    if (reaped > 0) this.log(`Pending: ${reaped} message(s) answered — files removed`);
+    const reaped = this.pending.reapAnswered(answered);
+    if (reaped > 0) this.log(`Pending: ${reaped} message(s) answered on some rail — files removed`);
 
-    // 3. Attempt cap reached and still unanswered: admit the miss instead of
-    //    repeating an answer. The file is RETAINED as an escalated record.
-    for (const rec of this.pending.escalationCandidates(now, replies)) {
+    // 3a. TRUE drops only: the header never appeared, so the block never reached
+    //     the TUI, and the attempts are spent. These — and ONLY these — earn an
+    //     admission to the human.
+    for (const rec of this.pending.dropCandidates(now, answered)) {
       const text = admissionText(rec.text);
       if (this.telegramApi) {
         try {
@@ -387,8 +408,24 @@ export class FastChecker {
           this.log(`Pending ${rec.update_id}: admission send failed: ${String(err)}`);
         }
       }
-      this.pending.markEscalated(rec, `escalated after ${rec.attempts} attempts with no observed reply`);
-      this.log(`Pending ${rec.update_id}: ESCALATED after ${rec.attempts} attempts — admitted the miss to chat ${rec.chat_id}`);
+      this.pending.markEscalated(rec, `never consumed after ${rec.attempts} attempts — admitted to the human`);
+      this.log(`Pending ${rec.update_id}: DROP CONFIRMED (header never appeared in ${rec.attempts} attempts) — admitted the miss to chat ${rec.chat_id}`);
+    }
+
+    // 3b. Consumed, but no reply we can see on any rail. An observability gap,
+    //     NOT a lost message — recorded for the operator, and deliberately
+    //     nothing is sent to the human. Telling Scott "I may have missed this"
+    //     about a message he was answered on twice is worse than the silence
+    //     this whole change set out to fix (observed live, 2026-09-24 05:45).
+    for (const rec of this.pending.unverifiedCandidates(now, answered)) {
+      this.pending.markUnverified(
+        rec,
+        'consumed by the TUI but no reply observable on any rail — not reported to the human',
+      );
+      this.log(
+        `Pending ${rec.update_id}: UNVERIFIED — block was consumed but no reply is observable on any rail. ` +
+        'Nothing sent to the human; record retained for audit.',
+      );
     }
 
     // 4. Empty media can never be injected — an empty block is unanswerable by
@@ -409,7 +446,7 @@ export class FastChecker {
     }
 
     // 5. Inject exactly one.
-    const next = this.pending.nextDeliverable(now, replies);
+    const next = this.pending.nextDeliverable(now, answered);
     if (!next) return;
 
     let block = next.formatted;
@@ -474,6 +511,9 @@ export class FastChecker {
     }
 
     this.pending.markAttempt(next);
+    // Byte watermark for send-evidence scanning: a rail that writes no
+    // timestamps still gives a rigorous "after the injection" ordering.
+    this.pending.patch(next.update_id, { log_offset: this.stdoutLogSizeNow() });
     this.lastMessageInjectedAt = Date.now();
     // Arm the slow-turn ack clock (973573e) on the durable path too. That
     // feature anchors off `hasTelegramMessage`, which is only set by the
@@ -485,6 +525,72 @@ export class FastChecker {
     this.ackTurnMessageCount++;
     this.log(`Pending ${next.update_id}: injected attempt ${attemptNo} (${payload.length} bytes) — awaiting a reply before deletion`);
     await sleep(5000);
+  }
+
+  /** Current size of the agent's stdout.log, or 0 when it is unreadable. */
+  private stdoutLogSizeNow(): number {
+    try {
+      return statSync(join(this.paths.logDir, 'stdout.log')).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Rail 2: `cacheLastSent` writes state/<agent>/last-telegram-<chat>.txt on
+   * every cortextos send. Its mtime survives a rotated or truncated outbound
+   * log, so it is checked independently.
+   */
+  private lastSentTouchedAfter(rec: PendingTelegramRecord): boolean {
+    const since = Date.parse(rec.first_attempt_at ?? rec.created_at);
+    if (Number.isNaN(since)) return false;
+    try {
+      const f = join(this.paths.stateDir, `last-telegram-${rec.chat_id}.txt`);
+      return statSync(f).mtimeMs > since;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Rail 3: scan the agent's own transcript AFTER the injection's byte
+   * watermark for evidence that it ran a send command for this chat. This is
+   * the only rail that covers telegram-send.sh and anything else an agent
+   * invents, because every send is a command in its session.
+   *
+   * Reads at most 2 MB and falls back to the in-memory ring buffer when the log
+   * is unreadable. Failing to find evidence never deletes anything — it only
+   * leaves the record in place, which is the safe direction.
+   */
+  private sendObservedInTranscript(rec: PendingTelegramRecord): boolean {
+    const MAX_SCAN = 2 * 1024 * 1024;
+    // No watermark => this record predates the change (or the log was
+    // unreadable at injection time). Without a watermark there is no way to
+    // prove the evidence came AFTER the injection, and a false "answered" here
+    // DELETES a real message. Fail closed: fall back to the timestamped rails
+    // only, which at worst leaves the record as `unverified` for the operator.
+    if (rec.log_offset === undefined) return false;
+    const offset = rec.log_offset;
+    try {
+      const path = join(this.paths.logDir, 'stdout.log');
+      const size = statSync(path).size;
+      if (size > offset) {
+        const start = Math.max(offset, size - MAX_SCAN);
+        const fd = openSync(path, 'r');
+        try {
+          const len = size - start;
+          const buf = Buffer.alloc(len);
+          readSync(fd, buf, 0, len, start);
+          const text = buf.toString('utf-8').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
+          if (sendEvidenceInTranscript(text, rec.chat_id)) return true;
+        } finally {
+          closeSync(fd);
+        }
+      }
+    } catch {
+      // fall through to the ring buffer
+    }
+    return sendEvidenceInTranscript(this.agent.getStrippedTail(20000), rec.chat_id);
   }
 
   // === JARVIS MOD #23 — voice cue loader (2026-07-05) ===

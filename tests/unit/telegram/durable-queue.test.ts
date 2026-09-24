@@ -33,6 +33,7 @@ import {
   UNATTEMPTED_RETRY_MS,
   admissionText,
   durableQueueEnabled,
+  sendEvidenceInTranscript,
   strictPromptGateEnabled,
   headerNeedle,
   newRecord,
@@ -45,6 +46,11 @@ import { readFileSync } from 'fs';
 
 let dir: string;
 let q: PendingTelegramQueue;
+
+/** No reply evidence on any rail. */
+const noReply = () => false;
+/** Reply evidence from the outbound-log rail only. */
+const byOutboundLog = (replies: Map<string, number>) => (r: any) => q.repliedInOutboundLog(r, replies);
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'zztest-pending-'));
@@ -110,7 +116,7 @@ describe('persist -> in_flight -> answered', () => {
     expect(r.state).toBe('in_flight');
     // THE load-bearing assertion: the file still exists. Consumption is not an answer.
     expect(existsSync(join(dir, 'pending-telegram', '102.json'))).toBe(true);
-    expect(q.reapAnswered(new Map())).toBe(0);
+    expect(q.reapAnswered(noReply)).toBe(0);
     expect(q.read(102)).not.toBeNull();
   });
 
@@ -121,21 +127,21 @@ describe('persist -> in_flight -> answered', () => {
     const first = Date.parse(q.read(103)!.first_attempt_at!);
 
     // A reply that predates the injection proves nothing.
-    expect(q.reapAnswered(new Map([['8727328514', first - 1000]]))).toBe(0);
+    expect(q.reapAnswered(byOutboundLog(new Map([['8727328514', first - 1000]])))).toBe(0);
     expect(q.read(103)).not.toBeNull();
 
     // A reply to a DIFFERENT chat proves nothing either.
-    expect(q.reapAnswered(new Map([['999', first + 1000]]))).toBe(0);
+    expect(q.reapAnswered(byOutboundLog(new Map([['999', first + 1000]])))).toBe(0);
     expect(q.read(103)).not.toBeNull();
 
     // A reply to this chat after the injection retires it.
-    expect(q.reapAnswered(new Map([['8727328514', first + 1000]]))).toBe(1);
+    expect(q.reapAnswered(byOutboundLog(new Map([['8727328514', first + 1000]])))).toBe(1);
     expect(q.read(103)).toBeNull();
   });
 
   it('never retires a record that was never attempted', () => {
     q.persist(rec(104));
-    expect(q.reapAnswered(new Map([['8727328514', Date.now() + 60_000]]))).toBe(0);
+    expect(q.reapAnswered(byOutboundLog(new Map([['8727328514', Date.now() + 60_000]])))).toBe(0);
     expect(q.read(104)).not.toBeNull();
   });
 });
@@ -145,54 +151,82 @@ describe('one file, one injection', () => {
     q.persist(rec(210));
     q.persist(rec(208));
     q.persist(rec(209));
-    expect(q.nextDeliverable(Date.now(), new Map())?.update_id).toBe(208);
+    expect(q.nextDeliverable(Date.now(), noReply)?.update_id).toBe(208);
     expect(q.list().map((r) => r.update_id)).toEqual([208, 209, 210]);
   });
 });
 
 describe('retry capping and the admission', () => {
-  it('holds a just-attempted record back, then makes it eligible after the grace window', () => {
+  it('NEVER re-injects a consumed (in_flight) record — the live double-delivery bug', () => {
+    // 2026-09-24 05:44: attempt 1 at :26, retry at :56, header for attempt 1 at
+    // 05:45:03. The retry raced the suppressing signal and Scott's JARVIS said
+    // "Got all two." A consumed block is already in the TUI; a second copy can
+    // only duplicate it.
     q.persist(rec(300));
     q.markAttempt(q.read(300)!);
     q.markInFlight(q.read(300)!);
     const now = Date.parse(q.read(300)!.last_attempt_at!);
-    expect(q.isEligible(q.read(300)!, now + 1000, new Map())).toBe(false);
-    expect(q.isEligible(q.read(300)!, now + IN_FLIGHT_RETRY_MS + 1, new Map())).toBe(true);
+    expect(q.isEligible(q.read(300)!, now + 1000, noReply)).toBe(false);
+    expect(q.isEligible(q.read(300)!, now + IN_FLIGHT_RETRY_MS + 1, noReply)).toBe(false);
+    expect(q.nextDeliverable(now + IN_FLIGHT_RETRY_MS + 1, noReply)).toBeNull();
   });
 
-  it('retries an unattempted (header never seen) record on the short window', () => {
+  it('waits longer than the observed 37s header latency before retrying', () => {
     q.persist(rec(301));
     q.markAttempt(q.read(301)!);
     const now = Date.parse(q.read(301)!.last_attempt_at!);
-    expect(q.isEligible(q.read(301)!, now + UNATTEMPTED_RETRY_MS + 1, new Map())).toBe(true);
+    // The old 30s window is what produced the duplicate.
+    expect(UNATTEMPTED_RETRY_MS).toBeGreaterThan(120_000);
+    expect(q.isEligible(q.read(301)!, now + 30_000, noReply)).toBe(false);
+    expect(q.isEligible(q.read(301)!, now + 37_000, noReply)).toBe(false);
+    expect(q.isEligible(q.read(301)!, now + UNATTEMPTED_RETRY_MS + 1, noReply)).toBe(true);
   });
 
-  it('stops injecting at the cap and escalates with an admission, retaining the file', () => {
+  it('admits a TRUE drop — never consumed, attempts spent — and retains the file', () => {
     q.persist(rec(302));
     q.markAttempt(q.read(302)!);
     q.markAttempt(q.read(302)!);
     const r = q.read(302)!;
     expect(r.attempts).toBe(MAX_ATTEMPTS);
-    const later = Date.parse(r.last_attempt_at!) + IN_FLIGHT_RETRY_MS + 1;
-    expect(q.isEligible(r, later, new Map())).toBe(false);
-    expect(q.escalationCandidates(later, new Map()).map((x) => x.update_id)).toEqual([302]);
+    expect(r.state).toBe('unattempted'); // header never appeared
+    const later = Date.parse(r.last_attempt_at!) + UNATTEMPTED_RETRY_MS + 1;
+    expect(q.isEligible(r, later, noReply)).toBe(false);
+    expect(q.dropCandidates(later, noReply).map((x) => x.update_id)).toEqual([302]);
 
     q.markEscalated(r, 'ZZTEST escalation');
     expect(q.read(302)!.state).toBe('escalated');
-    // Retained for audit, never silently dropped.
     expect(existsSync(join(dir, 'pending-telegram', '302.json'))).toBe(true);
-    // And it is not escalated twice.
-    expect(q.escalationCandidates(later, new Map())).toEqual([]);
+    expect(q.dropCandidates(later, noReply)).toEqual([]);
   });
 
-  it('never escalates a message that got an answer', () => {
+  it('never admits a miss for a CONSUMED message — the live false-escalation bug', () => {
+    // 2026-09-24: the reply existed and was delivered twice, but left no row in
+    // outbound-messages.jsonl (telegram-send.sh). Escalating here would have
+    // told Scott "I may have missed this: «Test»" about an answered message.
+    q.persist(rec(305));
+    q.markAttempt(q.read(305)!);
+    q.markAttempt(q.read(305)!);
+    q.markInFlight(q.read(305)!);
+    const r = q.read(305)!;
+    const later = Date.parse(r.last_attempt_at!) + IN_FLIGHT_RETRY_MS + 1;
+    expect(q.dropCandidates(later, noReply)).toEqual([]);
+    // It becomes an operator-only record instead.
+    expect(q.unverifiedCandidates(later, noReply).map((x) => x.update_id)).toEqual([305]);
+    q.markUnverified(r, 'ZZTEST unverified');
+    expect(q.read(305)!.state).toBe('unverified');
+    expect(existsSync(join(dir, 'pending-telegram', '305.json'))).toBe(true);
+    expect(q.unverifiedCandidates(later, noReply)).toEqual([]);
+  });
+
+  it('never escalates or flags a message that got an answer', () => {
     q.persist(rec(303));
     q.markAttempt(q.read(303)!);
     q.markAttempt(q.read(303)!);
     const r = q.read(303)!;
     const later = Date.parse(r.last_attempt_at!) + IN_FLIGHT_RETRY_MS + 1;
-    const replies = new Map([['8727328514', Date.parse(r.first_attempt_at!) + 500]]);
-    expect(q.escalationCandidates(later, replies)).toEqual([]);
+    const answered = byOutboundLog(new Map([['8727328514', Date.parse(r.first_attempt_at!) + 500]]));
+    expect(q.dropCandidates(later, answered)).toEqual([]);
+    expect(q.unverifiedCandidates(later, answered)).toEqual([]);
   });
 
   it('admits the miss rather than repeating an answer', () => {
@@ -208,8 +242,8 @@ describe('retry capping and the admission', () => {
     q.patch(304, { last_attempt_at: failedAt.toISOString() });
     const r = q.read(304)!;
     expect(r.attempts).toBe(0);
-    expect(q.isEligible(r, failedAt.getTime() + 1000, new Map())).toBe(false);
-    expect(q.isEligible(r, failedAt.getTime() + UNATTEMPTED_RETRY_MS + 1, new Map())).toBe(true);
+    expect(q.isEligible(r, failedAt.getTime() + 1000, noReply)).toBe(false);
+    expect(q.isEligible(r, failedAt.getTime() + UNATTEMPTED_RETRY_MS + 1, noReply)).toBe(true);
   });
 });
 
@@ -238,7 +272,7 @@ describe('update_id dedupe vs a verbatim human resend', () => {
 describe('empty media', () => {
   it('is never deliverable and carries a human-legible notice', () => {
     q.persist(rec(500, { empty: true, formatted: '', text: '' }));
-    expect(q.nextDeliverable(Date.now(), new Map())).toBeNull();
+    expect(q.nextDeliverable(Date.now(), noReply)).toBeNull();
     q.markFailedNotified(q.read(500)!, 'ZZTEST no transcript');
     expect(q.read(500)!.state).toBe('failed_notified');
     expect(existsSync(join(dir, 'pending-telegram', '500.json'))).toBe(true);
@@ -248,7 +282,7 @@ describe('empty media', () => {
   it('an empty record is skipped while a later real message still gets through', () => {
     q.persist(rec(501, { empty: true, formatted: '', text: '' }));
     q.persist(rec(502));
-    expect(q.nextDeliverable(Date.now(), new Map())?.update_id).toBe(502);
+    expect(q.nextDeliverable(Date.now(), noReply)?.update_id).toBe(502);
   });
 });
 
@@ -272,6 +306,41 @@ describe('reply observation', () => {
 
   it('a missing log yields no reply evidence, so nothing is deleted', () => {
     expect(readReplyTimestamps(join(dir, 'nope.jsonl')).size).toBe(0);
+  });
+});
+
+describe('send evidence — every rail an agent can answer on', () => {
+  const chat = '8727328514';
+
+  it('recognises the rail that left NO local record at all (telegram-send.sh)', () => {
+    expect(sendEvidenceInTranscript('$ scripts/telegram-send.sh "ZZTEST Got all two."', chat)).toBe(true);
+  });
+
+  it('recognises the cortextos rail and a direct API call', () => {
+    expect(sendEvidenceInTranscript(`cortextos bus send-telegram ${chat} 'ZZTEST reply'`, chat)).toBe(true);
+    expect(sendEvidenceInTranscript('POST https://api.telegram.org/bot123:ABC/sendMessage', chat)).toBe(true);
+    expect(sendEvidenceInTranscript(`{"chat_id": ${chat}, "text": "ZZTEST"}`, chat)).toBe(true);
+  });
+
+  it('does not treat unrelated output, or a send to another chat, as a reply', () => {
+    expect(sendEvidenceInTranscript('Reading files and running tests, nothing sent', chat)).toBe(false);
+    expect(sendEvidenceInTranscript("cortextos bus send-telegram 999 'ZZTEST other chat'", chat)).toBe(false);
+  });
+
+  it('is empty-input safe', () => {
+    expect(sendEvidenceInTranscript('', chat)).toBe(false);
+  });
+
+  it('records a byte watermark at injection so evidence can be ordered after it', () => {
+    q.persist(rec(700));
+    q.markAttempt(q.read(700)!);
+    q.patch(700, { log_offset: 123456 });
+    expect(q.read(700)!.log_offset).toBe(123456);
+    // A record with no watermark must not be retired on transcript evidence:
+    // there is no way to prove the evidence postdates the injection, and a
+    // false positive DELETES a real message.
+    q.persist(rec(701));
+    expect(q.read(701)!.log_offset).toBeUndefined();
   });
 });
 
