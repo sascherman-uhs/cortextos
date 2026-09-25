@@ -204,8 +204,22 @@ export function readReplyTimestamps(outboundLogPath: string, maxLines = 400): Ma
  * send was attempted, not that Telegram accepted it — which is the right trade
  * when the alternative is telling the human we missed something we answered.
  */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function sendEvidenceInTranscript(text: string, chatId: string): boolean {
   if (!text) return false;
+  // The daemon's own injected block names the chat twice — the header
+  // `(chat_id:<id>)` and the footer `Reply using: cortextos bus send-telegram
+  // <id> '<your reply>'` — and the TUI echoes that block into the transcript
+  // AFTER the watermark. Unstripped, every message "proved" its own reply the
+  // moment it was injected and its pending file was deleted within seconds
+  // (2026-09-24: 462809040/41 reaped 6s after injection, no reply ever sent).
+  const id = escapeRegExp(chatId);
+  text = text
+    .replace(new RegExp(`Reply using:\\s*cortextos\\s+bus\\s+send-telegram\\s+${id}\\s+'<your reply>'`, 'g'), '')
+    .replace(new RegExp(`=== TELEGRAM from [^\\n]*?\\(chat_id:\\s*${id}\\)\\s*===`, 'g'), '');
   const patterns: RegExp[] = [
     /telegram-send\.sh/,
     /telegram_notify\.py/,

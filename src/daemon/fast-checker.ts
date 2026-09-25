@@ -587,6 +587,10 @@ export class FastChecker {
     // only, which at worst leaves the record as `unverified` for the operator.
     if (rec.log_offset === undefined || rec.log_offset === null) return false;
     const offset = rec.log_offset;
+    // The unwatermarked ring buffer is consulted ONLY when the log file could
+    // not be read. It holds output from BEFORE the injection, so falling
+    // through to it after a clean scan found nothing let any earlier reply
+    // retire a message that was never answered.
     try {
       const path = join(this.paths.logDir, 'stdout.log');
       const size = statSync(path).size;
@@ -603,6 +607,7 @@ export class FastChecker {
           closeSync(fd);
         }
       }
+      return false;
     } catch {
       // fall through to the ring buffer
     }

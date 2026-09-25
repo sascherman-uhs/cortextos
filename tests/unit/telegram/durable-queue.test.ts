@@ -327,6 +327,20 @@ describe('send evidence — every rail an agent can answer on', () => {
     expect(sendEvidenceInTranscript("cortextos bus send-telegram 999 'ZZTEST other chat'", chat)).toBe(false);
   });
 
+  it('does not count the daemon\'s own injected header/footer as a reply', () => {
+    // Verbatim shape of the block echoed into the PTY on 2026-09-24.
+    const injected = [
+      `=== TELEGRAM from [USER: Scott] (chat_id:${chat}) ===`,
+      '[Recent conversation:]',
+      '[user]: ZZTEST Run the Woodhouse sink',
+      '[user]: ZZTEST What is instinct?',
+      `Reply using: cortextos bus send-telegram ${chat} '<your reply>'`,
+    ].join('\n');
+    expect(sendEvidenceInTranscript(injected, chat)).toBe(false);
+    // ...but a real send after it still counts.
+    expect(sendEvidenceInTranscript(`${injected}\n$ cortextos bus send-telegram ${chat} 'ZZTEST answer'`, chat)).toBe(true);
+  });
+
   it('is empty-input safe', () => {
     expect(sendEvidenceInTranscript('', chat)).toBe(false);
   });
