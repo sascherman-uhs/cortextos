@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "revision": 111,
-  "updated_at": "2026-09-06T14:32:09.511Z",
+  "revision": 112,
+  "updated_at": "2026-09-13T23:21:00.682Z",
   "updated_by": "scott",
-  "_readme": "Single authority for model routing (OS-02b-core). Never hand-edit pins, activation or role capabilities \u2014 use `cortextos model switch|pin|unpin|activation|role-capability`, which does a CAS write and journals an event. Agent config.json `model` fields are LEGACY. TWO DIFFERENT CAPABILITY FIELDS LIVE ON A ROLE AND THEY ARE NOT INTERCHANGEABLE: `required_capabilities` is matched against a model entry's `capability_tags` during resolution, so a value there that no entry carries makes the role UNRESOLVABLE; `role_capabilities` describes the ROLE itself (what it participates in, e.g. `continuous-improvement` for weekly Kaizen enrollment), is never matched against any model, and therefore can never break resolution. Manage it with `cortextos model role-capability add|remove|list` (no restart \u2014 a capability changes no route).",
+  "_readme": "Single authority for model routing (OS-02b-core). Never hand-edit pins, activation or role capabilities — use `cortextos model switch|pin|unpin|activation|role-capability`, which does a CAS write and journals an event. Agent config.json `model` fields are LEGACY. TWO DIFFERENT CAPABILITY FIELDS LIVE ON A ROLE AND THEY ARE NOT INTERCHANGEABLE: `required_capabilities` is matched against a model entry's `capability_tags` during resolution, so a value there that no entry carries makes the role UNRESOLVABLE; `role_capabilities` describes the ROLE itself (what it participates in, e.g. `continuous-improvement` for weekly Kaizen enrollment), is never matched against any model, and therefore can never break resolution. Manage it with `cortextos model role-capability add|remove|list` (no restart — a capability changes no route).",
   "activation": {
     "org_default": "shadow",
     "consumers": {
@@ -742,15 +742,7 @@
     },
     "trillion-coder": {
       "role": "builder",
-      "pin": {
-        "entry_id": "anthropic-sonnet-4-6",
-        "kind": "proposed-invalid",
-        "reason": "Legacy pair is invalid and cannot dispatch: Entry \"anthropic-sonnet-4-6\" runs on adapter \"claude-code\" but the agent config declares runtime \"codex-app-server\"; Entry \"anthropic-sonnet-4-6\" lacks required capabilities: sandbox",
-        "actor": "jarvis",
-        "created_at": "2026-09-06T02:10:45.061Z",
-        "expires_at": "2026-10-06T02:10:45.061Z",
-        "task_id": "task_1788660645066_99659325"
-      }
+      "pin": null
     }
   },
   "callsites": {}
