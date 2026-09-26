@@ -551,11 +551,18 @@ export class CodexAppServerPTY {
    * the path. So the budget is now measurable (`waitForSocket` logs the wait it
    * actually achieved) and tunable without a rebuild, and any future change to
    * the default has to come from that measurement rather than a second guess.
+   *
+   * 2026-09-26 measurement → default raised to 30s. trillion-coder's logged
+   * `socket ready after` waits: n=17, p50 1.5s, p90 5.5s, max 9.6s (96% of the
+   * old budget), plus six misses at 10.0–11.8s clustered in the high-load
+   * overnight/post-reboot windows (load avg ~9). Each miss counted as a crash;
+   * ten of them halted the agent at 04:27 PT. A socket that appears at 11s is
+   * a slow start, not a dead server — 30s gives ~3× the observed max.
    */
   private static socketWaitBudgetMs(): number {
     const raw = process.env['CTX_CODEX_SOCKET_WAIT_MS'];
     const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 30000;
   }
 
   private async waitForSocket(

@@ -160,22 +160,22 @@ describe('CodexAppServerPTY dead-RPC gate (fleet-stability A2)', () => {
 });
 
 describe('CodexAppServerPTY socket wait budget (fleet-stability A5)', () => {
-  it('defaults to 10s and is overridable via CTX_CODEX_SOCKET_WAIT_MS', () => {
+  it('defaults to 30s and is overridable via CTX_CODEX_SOCKET_WAIT_MS', () => {
     const budget = () => (CodexAppServerPTY as unknown as {
       socketWaitBudgetMs(): number;
     }).socketWaitBudgetMs();
 
     delete process.env['CTX_CODEX_SOCKET_WAIT_MS'];
-    expect(budget()).toBe(10000);
-
-    process.env['CTX_CODEX_SOCKET_WAIT_MS'] = '30000';
     expect(budget()).toBe(30000);
+
+    process.env['CTX_CODEX_SOCKET_WAIT_MS'] = '45000';
+    expect(budget()).toBe(45000);
 
     // Garbage falls back to the default rather than to a zero-length wait.
     process.env['CTX_CODEX_SOCKET_WAIT_MS'] = 'soon';
-    expect(budget()).toBe(10000);
+    expect(budget()).toBe(30000);
     process.env['CTX_CODEX_SOCKET_WAIT_MS'] = '-5';
-    expect(budget()).toBe(10000);
+    expect(budget()).toBe(30000);
     delete process.env['CTX_CODEX_SOCKET_WAIT_MS'];
   });
 
