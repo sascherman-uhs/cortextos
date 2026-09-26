@@ -516,7 +516,11 @@ export class AgentManager {
       const tgChatId = chatId;
       let prevStatus: string | null = null;
       agentProcess.onStatusChanged((status) => {
-        if (status.status === 'crashed') {
+        if (status.status === 'crashed' && status.quotaPausedSince) {
+          // Provider quota pause: AgentProcess sends its own single ⏸ alert per
+          // episode. A "crashed — auto-restarting" ping here would repeat every
+          // hourly probe and contradict it (tron, 2026-09-26).
+        } else if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
           tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
         } else if (status.status === 'halted') {

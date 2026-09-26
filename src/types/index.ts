@@ -984,6 +984,12 @@ export interface AgentStatus {
    * instead of once per crash.
    */
   haltedSince?: string;
+  /**
+   * ISO start of a provider-quota pause (usage limit exhausted). Present while
+   * the daemon is parking the agent and re-probing hourly — a pause, not a
+   * crash, so consumers must not send per-probe crash alerts for it.
+   */
+  quotaPausedSince?: string;
 }
 
 // ---------------------------------------------------------------------------

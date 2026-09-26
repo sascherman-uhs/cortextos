@@ -509,6 +509,7 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      ...(this.quotaPausedSince ? { quotaPausedSince: this.quotaPausedSince } : {}),
       ...(this.status === 'halted' && this.haltedSince
         ? { haltedSince: this.haltedSince }
         : {}),
@@ -862,6 +863,7 @@ export class AgentProcess {
     // one after the provider window resets brings the agent back by itself.
     // Alert once per pause episode, not once per probe.
     if (this.detectQuotaExhausted(recentOutput)) {
+      if (this.quotaPausedSince === null) this.quotaPausedSince = this.readFreshQuotaMarkerSince();
       const firstInEpisode = this.quotaPausedSince === null;
       if (firstInEpisode) this.quotaPausedSince = new Date().toISOString();
       this.writeQuotaMarker();
@@ -1150,6 +1152,22 @@ export class AgentProcess {
         'utf-8',
       );
     } catch { /* observability only */ }
+  }
+
+  /**
+   * `since` from a still-fresh `.quota-paused` marker, so an episode survives a
+   * daemon restart (new AgentProcess) without re-sending the ⏸ alert.
+   */
+  private readFreshQuotaMarkerSince(): string | null {
+    try {
+      const p = join(this.env.ctxRoot, 'state', this.name, '.quota-paused');
+      if (!existsSync(p)) return null;
+      const m = JSON.parse(readFileSync(p, 'utf-8'));
+      const age = Date.now() - Date.parse(m.last_probe);
+      return typeof m.since === 'string' && age >= 0 && age <= 2 * QUOTA_RETRY_MS ? m.since : null;
+    } catch {
+      return null;
+    }
   }
 
   private clearQuotaMarker(): void {

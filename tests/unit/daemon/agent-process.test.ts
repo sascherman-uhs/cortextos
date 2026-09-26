@@ -503,3 +503,34 @@ describe('AgentProcess — provider quota exhaustion is a pause, not a crash', (
     expect(String(line)).toMatch(/\] CRASH: exit_code=1 crash_count=1/);
   });
 });
+
+describe('AgentProcess — quota pause status + alert dedupe', () => {
+  const KIMI_403 = `'type': 'access_terminated_error'\n[kimi] exited with code 1 signal 0\n`;
+
+  it('getStatus exposes quotaPausedSince while paused, and alerts only once', async () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({ sendMessage: send } as any, '1');
+    (ap as any).tailStdoutLog = () => KIMI_403;
+    await ap.start();
+    capturedOnExit!(1, 0);
+    expect(ap.getStatus().quotaPausedSince).toMatch(/^\d{4}-/);
+    (ap as any).status = 'running';
+    capturedOnExit!(1, 0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('adopts a fresh marker after a daemon restart and does not re-alert', async () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    fsMocks.existsSync.mockImplementation((p: string) => String(p).endsWith('.quota-paused'));
+    fsMocks.readFileSync.mockImplementation(() =>
+      JSON.stringify({ since: '2026-09-26T12:46:58.562Z', last_probe: new Date().toISOString() }));
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({ sendMessage: send } as any, '1');
+    (ap as any).tailStdoutLog = () => KIMI_403;
+    await ap.start();
+    capturedOnExit!(1, 0);
+    expect(ap.getStatus().quotaPausedSince).toBe('2026-09-26T12:46:58.562Z');
+    expect(send).not.toHaveBeenCalled();
+  });
+});
