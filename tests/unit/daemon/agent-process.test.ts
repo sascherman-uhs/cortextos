@@ -466,3 +466,40 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
     expect(prompt).not.toContain('complete the onboarding protocol');
   });
 });
+
+describe('AgentProcess — provider quota exhaustion is a pause, not a crash', () => {
+  const KIMI_403 = `Error code: 403 - {'error': {'message': "You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.", 'type': 'access_terminated_error'}}\n[kimi] exited with code 1 signal 0\n`;
+
+  it('detectQuotaExhaustion matches known signatures and ignores ordinary errors', async () => {
+    const { detectQuotaExhaustion } = await import('../../../src/daemon/agent-process.js');
+    expect(detectQuotaExhaustion(KIMI_403)).toBe(true);
+    expect(detectQuotaExhaustion('Claude usage limit reached. Your limit will reset at 3pm')).toBe(true);
+    expect(detectQuotaExhaustion('{"error":{"code":"insufficient_quota"}}')).toBe(true);
+    expect(detectQuotaExhaustion('Error code: 429 - rate limit exceeded, retry in 2s')).toBe(false);
+    expect(detectQuotaExhaustion('TypeError: cannot read properties of undefined')).toBe(false);
+    expect(detectQuotaExhaustion('')).toBe(false);
+  });
+
+  it('quota exit logs QUOTA_PAUSED, does not charge the crash counter, and never halts', async () => {
+    const ap = new AgentProcess('alice', mockEnv, { max_crashes_per_day: 2 });
+    (ap as any).tailStdoutLog = () => KIMI_403;
+    await ap.start();
+    for (let i = 0; i < 5; i++) {
+      (ap as any).status = 'running';
+      capturedOnExit!(1, 0);
+      expect(ap.getStatus().status).toBe('crashed');
+    }
+    expect(ap.getStatus().crashCount).toBe(0);
+    const lines = fsMocks.appendFileSync.mock.calls.map(c => String(c[1]));
+    expect(lines.every(l => /\] QUOTA_PAUSED: exit_code=1 backoff_s=3600 \(not counted/.test(l))).toBe(true);
+  });
+
+  it('a quota message older than the scan window does not mask a real crash', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    (ap as any).tailStdoutLog = () => KIMI_403 + 'x'.repeat(8000) + '\nSegfault\n';
+    await ap.start();
+    capturedOnExit!(1, 0);
+    const [, line] = fsMocks.appendFileSync.mock.calls[0];
+    expect(String(line)).toMatch(/\] CRASH: exit_code=1 crash_count=1/);
+  });
+});

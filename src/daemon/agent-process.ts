@@ -40,6 +40,8 @@ export class AgentProcess {
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private crashCount: number = 0;
   private maxCrashesPerDay: number = 10;
+  // ISO start of the current provider-quota pause episode, null when not paused.
+  private quotaPausedSince: string | null = null;
   // CrashLoopPauser (instar-inspired): sliding-window crash detection.
   // Timestamps of recent crashes within the configured window. If the
   // window fills, the agent auto-pauses instead of retrying with backoff.
@@ -252,6 +254,19 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Quota-pause episode closes once a probe survives past the boot window
+      // (a quota-blocked boot dies in <1s, so 2 min up = the quota is back).
+      if (this.quotaPausedSince !== null) {
+        const pty = this.pty;
+        setTimeout(() => {
+          if (this.pty === pty && this.status === 'running' && this.quotaPausedSince !== null) {
+            this.log(`Provider quota restored — resumed after pause since ${this.quotaPausedSince}`);
+            this.quotaPausedSince = null;
+            this.clearQuotaMarker();
+          }
+        }, 120_000).unref?.();
+      }
 
       // Provenance: one attempt record per spawn, then a bounded poll for the
       // runtime-observed model id (never a config-derived label).
@@ -723,6 +738,23 @@ export class AgentProcess {
   }
 
   /**
+   * Match a provider usage-quota exhaustion in recent stdout.
+   *
+   * Kimi Code (2026-09-26, tron): every boot died in <1s with
+   *   `Error code: 403 - {'error': {'message': "You've reached your weekly
+   *    (7-day) usage limit. ...", 'type': 'access_terminated_error'}}`
+   * and exit 1. The daemon counted each as a crash, burned the daily budget of
+   * 10 in 35 minutes and HALTED — twice (09-14 and 09-26). Restarting cannot
+   * help until the provider's window resets, so this is a pause, not a crash.
+   *
+   * Only the last few KB are inspected so a quota message from an earlier,
+   * since-recovered session cannot mask a genuine crash later on.
+   */
+  private detectQuotaExhausted(recentOutput: string): boolean {
+    return detectQuotaExhaustion(recentOutput.slice(-QUOTA_SCAN_BYTES));
+  }
+
+  /**
    * Write the `.force-fresh` marker that AgentProcess.shouldContinue() reads
    * on the next start() to force a fresh Claude Code session (no --continue).
    * Used by the image-poison auto-recovery in handleExit().
@@ -822,6 +854,39 @@ export class AgentProcess {
         }
       }, 5000);
       return;
+    }
+
+    // Provider quota exhausted (weekly/daily usage limit). Not a malfunction:
+    // don't charge the crash window or daily counter, don't halt. Retry on a
+    // long fixed interval — each probe fails in <1s at no cost, and the first
+    // one after the provider window resets brings the agent back by itself.
+    // Alert once per pause episode, not once per probe.
+    if (this.detectQuotaExhausted(recentOutput)) {
+      const firstInEpisode = this.quotaPausedSince === null;
+      if (firstInEpisode) this.quotaPausedSince = new Date().toISOString();
+      this.writeQuotaMarker();
+      this.log(
+        `Provider usage quota exhausted — pausing, next probe in ${QUOTA_RETRY_MS / 60000}m ` +
+        `(paused since ${this.quotaPausedSince}; not counted toward max_crashes)`,
+      );
+      this.appendCrashToRestartsLog(exitCode, QUOTA_RETRY_MS, 'QUOTA_PAUSED');
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      if (firstInEpisode) {
+        this.sendQuotaAlert();
+      }
+      setTimeout(() => {
+        if (this.status === 'crashed') {
+          this.start().catch(err => this.log(`Quota-probe restart failed: ${err}`));
+        }
+      }, QUOTA_RETRY_MS);
+      return;
+    }
+    if (this.quotaPausedSince !== null) {
+      // A different exit after a quota pause — the quota came back (or the
+      // failure changed). Close the episode so a future exhaustion alerts again.
+      this.quotaPausedSince = null;
+      this.clearQuotaMarker();
     }
 
     // CrashLoopPauser (instar-inspired): if a sliding window is configured,
@@ -1069,6 +1134,44 @@ export class AgentProcess {
    *    sends its own contextual "back — ..." reply in that case),
    *  - no Telegram handle has been wired (no chat_id configured).
    */
+  /**
+   * `state/<agent>/.quota-paused` tells external watchdogs (uhsJARVIS
+   * uptime_monitor.py) the agent is deliberately parked — restarting it only
+   * re-hits the quota wall. Refreshed on every probe; cleared once the agent
+   * stays up past the probe window (see start()) or exits for another reason.
+   */
+  private writeQuotaMarker(): void {
+    try {
+      const stateDir = join(this.env.ctxRoot, 'state', this.name);
+      ensureDir(stateDir);
+      writeFileSync(
+        join(stateDir, '.quota-paused'),
+        JSON.stringify({ since: this.quotaPausedSince, last_probe: new Date().toISOString(), retry_ms: QUOTA_RETRY_MS }) + '\n',
+        'utf-8',
+      );
+    } catch { /* observability only */ }
+  }
+
+  private clearQuotaMarker(): void {
+    try {
+      const p = join(this.env.ctxRoot, 'state', this.name, '.quota-paused');
+      if (existsSync(p)) unlinkSync(p);
+    } catch { /* ignore */ }
+  }
+
+  private sendQuotaAlert(): void {
+    if (!this.telegramApi || !this.telegramChatId) return;
+    const model = this.config.model ? ` (${this.config.model})` : '';
+    this.telegramApi
+      .sendMessage(
+        this.telegramChatId,
+        `⏸ ${this.name}${model} paused — provider usage quota exhausted. ` +
+        `Not a crash: the daemon re-probes every ${QUOTA_RETRY_MS / 60000} min and ` +
+        `the agent resumes by itself when the quota window resets.`,
+      )
+      .catch(() => { /* non-fatal: notification is observability only */ });
+  }
+
   private maybeSendCodexBootNotification(): void {
     if (this.config.runtime !== 'codex-app-server') return;
     if (this.lastSpawnWasHandoff) return;
@@ -1168,7 +1271,7 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'QUOTA_PAUSED',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
@@ -1177,7 +1280,7 @@ export class AgentProcess {
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
-          : kind === 'IMAGE_POISON_RECOVERY'
+          : kind === 'IMAGE_POISON_RECOVERY' || kind === 'QUOTA_PAUSED'
             ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
             : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;
@@ -1247,6 +1350,28 @@ export class AgentProcess {
       this.onStatusChange(this.getStatus());
     }
   }
+}
+
+/** Re-probe interval while a provider usage quota is exhausted. */
+export const QUOTA_RETRY_MS = 60 * 60 * 1000;
+/** Only the tail of stdout is scanned so an old, recovered quota error can't mask a real crash. */
+const QUOTA_SCAN_BYTES = 4096;
+
+/**
+ * True when `output` carries a provider usage-quota exhaustion signature.
+ * Deliberately narrow: transient 429 rate limits and 5xx are real crashes for
+ * backoff purposes; only "your plan's usage window is spent" qualifies.
+ */
+export function detectQuotaExhaustion(output: string): boolean {
+  if (!output) return false;
+  // Kimi Code: 403 access_terminated_error / "reached your weekly (7-day) usage limit"
+  if (output.includes('access_terminated_error')) return true;
+  if (/reached your (?:weekly|daily|monthly|5-hour)[^.\n]{0,20} usage limit/i.test(output)) return true;
+  // OpenAI-compatible providers: billing quota spent
+  if (output.includes('insufficient_quota')) return true;
+  // Claude Code subscription limit
+  if (/Claude (?:AI )?usage limit reached/i.test(output)) return true;
+  return false;
 }
 
 function sleep(ms: number): Promise<void> {
