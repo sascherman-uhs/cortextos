@@ -230,12 +230,14 @@ export class CodexAppServerPTY {
       this._rpc = null;
     }
     if (this._appServerPty) {
+      const pid = this._appServerPty.pid;
       try {
         this._appServerPty.kill();
       } catch {
         // Ignore shutdown errors.
       }
       this._appServerPty = null;
+      escalateKill(pid);
     }
     this.removeSocket();
     this._onExitHandler?.(0, undefined);
@@ -1075,6 +1077,7 @@ export class CodexAppServerPTY {
       } catch {
         // Ignore failed attempt cleanup errors.
       }
+      escalateKill(pty.pid);
     }
     this.removeSocket();
   }
@@ -1175,4 +1178,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Grace period between node-pty's SIGHUP and the SIGKILL fallback. */
+export const APP_SERVER_KILL_GRACE_MS = 2000;
+
+/**
+ * SIGKILL the app-server's process group if it outlives the SIGHUP from
+ * node-pty's kill().
+ *
+ * `codex` is a node launcher that forwards SIGHUP/SIGTERM to the native
+ * app-server and then waits on it. An app-server holding a live thread
+ * ignores both (2026-09-27: trillion-coder's pre-restart pid 82773 survived
+ * SIGHUP and a manual SIGTERM), so every stop/restart leaked the old server —
+ * still owning the thread — and the new one died with `thread … already has
+ * an active writer`, burning crash budget. node-pty makes the child a session
+ * leader, so pid == pgid and `-pid` reaches the launcher AND the native binary.
+ */
+export function escalateKill(
+  pid: number | undefined,
+  graceMs: number = APP_SERVER_KILL_GRACE_MS,
+  killFn: (pid: number, signal: NodeJS.Signals | 0) => void = (p, sig) => { process.kill(p, sig); },
+): void {
+  if (!pid || pid <= 0) return;
+  const timer = setTimeout(() => {
+    try {
+      killFn(pid, 0); // still alive? throws ESRCH if not
+    } catch {
+      return;
+    }
+    try {
+      killFn(-pid, 'SIGKILL');
+    } catch {
+      try { killFn(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }, graceMs);
+  timer.unref?.();
 }

@@ -1463,3 +1463,21 @@ describe('CodexAppServerPTY buildMediaPayload — dynamic fence parsing', () => 
     expect(payload).toContain('caption: hello');
   });
 });
+
+describe('escalateKill — app-server that ignores SIGHUP is group-SIGKILLed', () => {
+  it('SIGKILLs the process group when the pid survives the grace period', async () => {
+    const { escalateKill } = await import('../../../src/pty/codex-app-server-pty.js');
+    const calls: Array<[number, string | number]> = [];
+    escalateKill(4242, 5, (p, s) => { calls.push([p, s]); });
+    await new Promise(r => setTimeout(r, 30));
+    expect(calls).toEqual([[4242, 0], [-4242, 'SIGKILL']]);
+  });
+
+  it('does nothing when the pid already exited', async () => {
+    const { escalateKill } = await import('../../../src/pty/codex-app-server-pty.js');
+    const calls: Array<[number, string | number]> = [];
+    escalateKill(4242, 5, (p, s) => { calls.push([p, s]); if (s === 0) throw new Error('ESRCH'); });
+    await new Promise(r => setTimeout(r, 30));
+    expect(calls).toEqual([[4242, 0]]);
+  });
+});
