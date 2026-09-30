@@ -6,7 +6,9 @@ import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { KimiPTY } from '../pty/kimi-pty.js';
-import { MessageDedup, injectMessage } from '../pty/inject.js';
+import { randomUUID } from 'crypto';
+import { MessageDedup, injectPaste } from '../pty/inject.js';
+import { bootMarkerFromPrompt } from '../telegram/submission-proof.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
@@ -91,6 +93,17 @@ export class AgentProcess {
   // daemon should fire the codex-app-server back-online Telegram directly
   // (skipped on handoff restart — the agent sends its own contextual reply).
   private lastSpawnWasHandoff = false;
+  /**
+   * Identity of the live PTY (V5, 2026-09-30): a fresh uuid per successful
+   * spawn. Unlike lifecycleGeneration it never repeats across daemon restarts,
+   * so a record can persist which PTY a paste went to — the stuck gate only
+   * holds messages back from THAT PTY, and a respawn opens it (R4-3).
+   */
+  private ptyInstance: string | null = null;
+  /** When the current PTY was spawned (ms). */
+  private ptySpawnedAt = 0;
+  /** `Current UTC time: <iso>` from this spawn's boot prompt — unique per spawn (R4-4). */
+  private bootMarker: string | null = null;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -239,6 +252,9 @@ export class AgentProcess {
       this.resolveExit = null;
     });
 
+    this.ptyInstance = null;
+    this.ptySpawnedAt = Date.now();
+    this.bootMarker = bootMarkerFromPrompt(prompt);
     try {
       await this.pty.spawn(mode, prompt);
       // Codex exec-per-turn race: the new PTY's onExit can fire BEFORE this
@@ -253,7 +269,8 @@ export class AgentProcess {
       }
       this.status = 'running';
       this.sessionStart = new Date();
-      this.log(`Running (pid: ${this.pty.getPid()})`);
+      this.ptyInstance = randomUUID();
+      this.log(`Running (pid: ${this.pty.getPid()}, pty instance ${this.ptyInstance.slice(0, 8)})`);
 
       // Quota-pause episode closes once a probe survives past the boot window
       // (a quota-blocked boot dies in <1s, so 2 min up = the quota is back).
@@ -418,7 +435,7 @@ export class AgentProcess {
   injectMessageDetailed(
     content: string,
     dedupKey?: string,
-  ): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED' | 'WRITE_FAILED'; message: string } {
+  ): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED' | 'WRITE_FAILED'; message: string; partial?: boolean } {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
@@ -430,9 +447,18 @@ export class AgentProcess {
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — ${dedupKey ? `key ${dedupKey}` : 'content'} matches MessageDedup hash window` };
     }
 
-    const wrote = injectMessage((data) => this.pty?.write(data), content);
-    if (!wrote) {
-      return { ok: false, code: 'WRITE_FAILED', message: `paste write to "${this.name}" PTY threw — nothing reached the terminal` };
+    // Bind the paste AND its deferred Enter to THIS PTY (V5-2b). The old
+    // closure read `this.pty` at call time, so an Enter scheduled for a PTY
+    // that was replaced inside the 300 ms window was pressed into the new one.
+    const pty = this.pty;
+    const instance = this.ptyInstance;
+    const res = injectPaste((data) => pty.write(data), content, {
+      stillCurrent: () => this.pty === pty && this.ptyInstance === instance,
+    });
+    if (!res.ok) {
+      return res.wroteAny
+        ? { ok: false, code: 'WRITE_FAILED', partial: true, message: `paste write to "${this.name}" PTY threw AFTER some bytes were written: ${res.error}` }
+        : { ok: false, code: 'WRITE_FAILED', partial: false, message: `paste write to "${this.name}" PTY threw — nothing reached the terminal: ${res.error}` };
     }
     return { ok: true };
   }
@@ -493,6 +519,21 @@ export class AgentProcess {
    */
   isBootstrapped(): boolean {
     return this.pty?.getOutputBuffer().isBootstrapped() ?? false;
+  }
+
+  /** The live PTY's instance id, or null when no PTY is running (see ptyInstance). */
+  getPtyInstance(): string | null {
+    return this.pty && this.status === 'running' ? this.ptyInstance : null;
+  }
+
+  /** When the current PTY was spawned (ms since epoch; 0 = never). */
+  getPtySpawnedAt(): number {
+    return this.ptySpawnedAt;
+  }
+
+  /** This spawn's unique boot-prompt marker (R4-4 readiness), or null. */
+  getBootMarker(): string | null {
+    return this.bootMarker;
   }
 
   /**

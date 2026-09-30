@@ -57,6 +57,18 @@ export class MessageDedup {
   }
 }
 
+/** What a paste actually did — see injectPaste. */
+export interface PasteResult {
+  /** Every write of the paste succeeded (the Enter is still deferred). */
+  ok: boolean;
+  /**
+   * At least one write reached the PTY. `ok:false, wroteAny:false` is the ONLY
+   * positive evidence of non-delivery (V5-3); a partial paste is UNKNOWN.
+   */
+  wroteAny: boolean;
+  error?: string;
+}
+
 /**
  * Inject a message into a PTY process using bracketed paste mode.
  * Replaces tmux load-buffer + paste-buffer pattern.
@@ -65,20 +77,24 @@ export class MessageDedup {
  * pasted text rather than typed input. This prevents special characters
  * from being interpreted as commands.
  *
- * @param write Function to write to the PTY (pty.write)
- * @param content The message content to inject
- * @param enterDelay Milliseconds to wait before sending Enter (default 300ms)
- * @returns false if the paste write itself threw (nothing reached the PTY).
- *   true means only that bytes were handed to the file descriptor — it is NOT
- *   evidence the TUI consumed or answered them. See pending-queue.ts.
+ * `stillCurrent` (V5-2b, 2026-09-30): checked right before the deferred Enter.
+ * When it returns false — the PTY this paste went to has been replaced — the
+ * Enter is cancelled rather than pressed into whatever PTY is there now. A
+ * stray Enter in a freshly spawned session submits whatever happens to be in
+ * ITS composer.
+ *
+ * `ok:true` means only that bytes were handed to the file descriptor — it is
+ * NOT evidence the TUI consumed or answered them. See pending-queue.ts.
  */
-export function injectMessage(
+export function injectPaste(
   write: (data: string) => void,
   content: string,
-  enterDelay: number = 300,
-): boolean {
+  opts: { enterDelay?: number; stillCurrent?: () => boolean } = {},
+): PasteResult {
+  const enterDelay = opts.enterDelay ?? 300;
   // For very large messages, chunk the write to avoid overwhelming the PTY buffer
   const MAX_CHUNK = 4096;
+  let wroteAny = false;
 
   // The paste write itself was OUTSIDE any try/catch until 2026-09-24. A throw
   // here (PTY torn down mid-write, EPIPE on a dying child) propagated all the
@@ -89,9 +105,11 @@ export function injectMessage(
   try {
     if (content.length <= MAX_CHUNK) {
       write(PASTE_START + content + PASTE_END);
+      wroteAny = true;
     } else {
       // Chunked write for large messages
       write(PASTE_START);
+      wroteAny = true;
       for (let i = 0; i < content.length; i += MAX_CHUNK) {
         write(content.slice(i, i + MAX_CHUNK));
       }
@@ -99,8 +117,8 @@ export function injectMessage(
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.warn(`[inject] paste write failed: ${msg}`);
-    return false;
+    console.warn(`[inject] paste write failed (${wroteAny ? 'PARTIAL — some bytes reached the PTY' : 'nothing written'}): ${msg}`);
+    return { ok: false, wroteAny, error: msg };
   }
 
   // Send Enter after a short delay to submit the pasted content.
@@ -113,6 +131,10 @@ export function injectMessage(
   // but missed worker-process.ts:93. This try/catch is the structural fix
   // that covers every present and future caller.
   setTimeout(() => {
+    if (opts.stillCurrent && !opts.stillCurrent()) {
+      console.warn('[inject] deferred Enter CANCELLED — the PTY this paste went to was replaced');
+      return;
+    }
     try {
       write(KEYS.ENTER);
     } catch (e) {
@@ -121,7 +143,22 @@ export function injectMessage(
     }
   }, enterDelay);
 
-  return true;
+  return { ok: true, wroteAny: true };
+}
+
+/**
+ * Boolean wrapper (back-compat): false if the paste write threw.
+ *
+ * @param write Function to write to the PTY (pty.write)
+ * @param content The message content to inject
+ * @param enterDelay Milliseconds to wait before sending Enter (default 300ms)
+ */
+export function injectMessage(
+  write: (data: string) => void,
+  content: string,
+  enterDelay: number = 300,
+): boolean {
+  return injectPaste(write, content, { enterDelay }).ok;
 }
 
 /**
