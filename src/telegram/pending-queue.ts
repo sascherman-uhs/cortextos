@@ -717,7 +717,7 @@ export class PendingTelegramQueue {
    */
   repliedInOutboundLog(rec: PendingTelegramRecord, replies: Map<string, number>): boolean {
     if (rec.attempts < 1) return false;
-    const since = Date.parse(rec.first_attempt_at ?? rec.created_at);
+    const since = replyReferenceTime(rec);
     if (Number.isNaN(since)) return false;
     const reply = replies.get(rec.chat_id);
     return reply !== undefined && reply > since;
@@ -947,6 +947,19 @@ export class PendingTelegramQueue {
 export function awaitingConsumption(rec: PendingTelegramRecord): boolean {
   if (!rec.token) return false;
   return rec.submit_phase === 'pasted' || rec.submit_phase === 'stuck' || (rec.submit_phase === 'submitted' && !rec.in_flight_at);
+}
+
+/**
+ * The instant a reply must postdate to count as this record's answer, on every
+ * reply rail. A record with a token: when Claude Code recorded it as READ
+ * (in_flight_at) — a reply sent while it sat pasted or queued was about
+ * something else, and must not become its "answer" the moment it is read
+ * (Codex round 16 #2). NaN (never counts) until then. Legacy records: the
+ * first injection, as before.
+ */
+export function replyReferenceTime(rec: PendingTelegramRecord): number {
+  if (rec.token) return rec.in_flight_at ? Date.parse(rec.in_flight_at) : NaN;
+  return Date.parse(rec.first_attempt_at ?? rec.created_at);
 }
 
 /** Build a fresh record. `formatted` may be '' when a media round trip still owes us the block. */

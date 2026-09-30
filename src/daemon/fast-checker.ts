@@ -30,6 +30,7 @@ import {
   NOTIFY_MAX_ATTEMPTS,
   PROOF_WINDOW_MS,
   awaitingConsumption,
+  replyReferenceTime,
   mediaNotArrivedText,
   mediaStillDownloadingNote,
   type PendingTelegramRecord,
@@ -800,7 +801,9 @@ export class FastChecker {
   }
 
   private async sendAckStage(chatId: string, recs: PendingTelegramRecord[], stage: 1 | 2, now: number): Promise<void> {
-    const consumed = (r: PendingTelegramRecord) => !!r.in_flight_at || r.submit_phase === 'submitted';
+    // Consumed = Claude Code recorded the prompt as READ (in_flight_at). An
+    // enqueue-only record is submitted but NOT read (Codex round 16 #4).
+    const consumed = (r: PendingTelegramRecord) => !!r.in_flight_at;
     const n = recs.length;
     const subject = n === 1 ? 'your message' : `your ${n} messages`;
     const oldest = recs.reduce((a, b) => (Date.parse(a.created_at) <= Date.parse(b.created_at) ? a : b));
@@ -809,12 +812,12 @@ export class FastChecker {
     // Say only what the records know: received; whether Claude Code recorded
     // the prompt; no reply observed. Never "working on it".
     const status = all
-      ? (n === 1 ? 'JARVIS has it; no reply yet.' : 'JARVIS has them; no reply yet.')
+      ? (n === 1 ? 'JARVIS has read it; no reply yet.' : 'JARVIS has read them; no reply yet.')
       : none
         ? recs.some((r) => r.submit_phase === 'stuck' || r.submit_phase === 'pasted')
           ? "JARVIS hasn't picked it up yet — the delivery is stuck and has been flagged."
-          : "JARVIS hasn't picked it up yet — it is queued."
-        : 'JARVIS has some of them; no reply yet.';
+          : "JARVIS hasn't read it yet — it is queued."
+        : 'JARVIS has read some of them; no reply yet.';
     const text = stage === 1
       ? `Received ${subject} (${Math.round((now - Date.parse(oldest.created_at)) / 1000)}s ago) — automatic receipt, not an answer. ${status}`
       : `Still no reply observed to ${subject} from ${clockTime(oldest.created_at)} — automatic notice, not an answer. ${status}`;
@@ -1365,7 +1368,7 @@ export class FastChecker {
       renameSync(result.partPath, dest);
     } catch (err) {
       this.log(`ERROR: media completion for ${updateId} gen ${gen}: rename into place failed: ${String(err)} — kept for retry`);
-      this.pendingMediaPatches.set(updateId, { gen, partPath: result.partPath, transcript: result.transcript, attempts: 1 });
+      this.owePatch(updateId, { gen, partPath: result.partPath, transcript: result.transcript, attempts: 1 });
       return 'write_failed';
     }
     return this.landMedia(cur, dest, result.transcript, gen);
@@ -1423,7 +1426,7 @@ export class FastChecker {
     const ok = this.pending.patch(cur.update_id, fields, { expectRev: cur.rev ?? 0 });
     if (!ok) {
       const prev = this.pendingMediaPatches.get(cur.update_id);
-      this.pendingMediaPatches.set(cur.update_id, { gen, partPath: null, transcript, attempts: prev && prev.gen === gen ? prev.attempts : 1 });
+      this.owePatch(cur.update_id, { gen, partPath: null, transcript, attempts: prev && prev.gen === gen ? prev.attempts : 1 });
       this.log(`ERROR: media completion for ${cur.update_id} gen ${gen}: the block could NOT be written — kept in memory, retried next cycle`);
       return 'write_failed';
     }
@@ -1462,6 +1465,22 @@ export class FastChecker {
       }
       this.landMedia(cur, dest, p.transcript, p.gen);
     }
+  }
+
+  /**
+   * Record an owed completion. A different generation already owed for the
+   * same record is SUPERSEDED — its result can never land (only the current gen
+   * may) — so it is discarded explicitly and its job released here. Overwriting
+   * it silently left that job counted forever (Codex round 16 #1).
+   */
+  private owePatch(updateId: number, entry: { gen: number; partPath: string | null; transcript?: string; attempts: number }): void {
+    const prev = this.pendingMediaPatches.get(updateId);
+    if (prev && prev.gen !== entry.gen) {
+      if (prev.partPath) { try { unlinkSync(prev.partPath); } catch { /* gone */ } }
+      this.log(`Owed media completion for ${updateId} gen ${prev.gen} discarded — superseded by gen ${entry.gen}`);
+      this.settleMediaPatch(updateId);
+    }
+    this.pendingMediaPatches.set(updateId, entry);
   }
 
   /** The owed completion for this record is resolved (landed or discarded): release its job. */
@@ -1597,7 +1616,7 @@ export class FastChecker {
    * log, so it is checked independently.
    */
   private lastSentTouchedAfter(rec: PendingTelegramRecord): boolean {
-    const since = Date.parse(rec.first_attempt_at ?? rec.created_at);
+    const since = replyReferenceTime(rec);
     if (Number.isNaN(since)) return false;
     try {
       const f = join(this.paths.stateDir, `last-telegram-${rec.chat_id}.txt`);

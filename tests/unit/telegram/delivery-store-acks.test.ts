@@ -222,7 +222,7 @@ describe('A6 receipt acks by unacknowledged receipt', () => {
     await cycleAt(at('2026-09-30T12:00:56.000Z'));
     expect(api.sendMessage).toHaveBeenCalledTimes(2); // one per chat
     const mine = api.sendMessage.mock.calls.find((c) => c[0] === CHAT)!;
-    expect(mine[1]).toMatch(/^Received your 2 messages \(56s ago\) — automatic receipt, not an answer\. JARVIS hasn't picked it up yet/);
+    expect(mine[1]).toMatch(/^Received your 2 messages \(56s ago\) — automatic receipt, not an answer\. JARVIS hasn't read it yet — it is queued/);
     expect([q.read(30)!.ack_stage, q.read(31)!.ack_stage, q.read(32)!.ack_stage]).toEqual([1, 1, 1]);
     // Never written where replies are looked for.
     expect(existsSync(join(paths.logDir, 'outbound-messages.jsonl'))).toBe(false);

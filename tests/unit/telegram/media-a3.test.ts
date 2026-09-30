@@ -17,6 +17,7 @@ import { FastChecker } from '../../../src/daemon/fast-checker';
 import { PendingTelegramQueue, LATE_MEDIA_PREFIX, MEDIA_GRACE_MS, newRecord, type PendingTelegramRecord } from '../../../src/telegram/pending-queue';
 import { mediaReceipt, partPathFor } from '../../../src/telegram/media';
 import { telegramToken } from '../../../src/telegram/submission-proof';
+import { TelegramIntakeControl } from '../../../src/telegram/intake-control';
 import type { BusPaths } from '../../../src/types';
 
 const CHAT = '8727328514';
@@ -293,6 +294,38 @@ describe('Codex round 15 #3 — an owed completion is settled only when landed o
     await cycleAt(T0 + 2_000);
     expect(settled).toBe(true);
     expect(logs.some((l) => l.includes('discarded'))).toBe(true);
+  });
+});
+
+describe('Codex round 16 #1 — a superseded owed generation is settled, never orphaned', () => {
+  it('gen-1 patch owed, gen-2 patch owed, gen-2 lands => the outstanding job count reaches 0', async () => {
+    const intake = new TelegramIntakeControl(join(root, 'intake'), 'jarvis-telegram', { log: () => {} });
+    /** The daemon's media job exactly as agent-manager runs it. */
+    const job = (gen: number) => {
+      const settle = intake.beginMediaJob();
+      return (async () => {
+        const outcome = checker.completeMediaDownload(ID, gen, { partPath: downloaded(gen) });
+        if (outcome === 'write_failed') await checker.mediaPatchSettled(ID, gen);
+      })().finally(settle);
+    };
+    receive();
+    const real = q.patch.bind(q);
+    let failReady = true;
+    const spy = vi.spyOn(q, 'patch').mockImplementation((id: number, f: any, o?: any) => (failReady && f.media_state === 'ready' ? null : real(id, f, o)));
+    vi.setSystemTime(T0 + 1_000);
+    void job(1); // gen 1 lands on disk but its record patch fails: owed
+    await vi.advanceTimersByTimeAsync(0);
+    await cycleAt(T0 + MEDIA_GRACE_MS + 1); // still failing; deadline => gen 2
+    expect(q.read(ID)!.media_gen).toBe(2);
+    void job(2); // gen 2's patch fails too: owed, replacing gen 1's entry
+    await vi.advanceTimersByTimeAsync(0);
+    expect(intake.outstandingMediaJobs).toBeGreaterThan(0);
+    failReady = false;
+    await cycleAt(T0 + MEDIA_GRACE_MS + 10_000); // gen 2 lands
+    await vi.advanceTimersByTimeAsync(0);
+    spy.mockRestore();
+    expect(q.read(ID)!.media_state).toBe('ready');
+    expect(intake.outstandingMediaJobs).toBe(0);
   });
 });
 

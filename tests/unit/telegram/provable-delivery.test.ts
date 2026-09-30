@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 vi.mock('child_process', () => ({ execFile: vi.fn(), execFileSync: vi.fn() }));
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, utimesSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { FastChecker, bootHoldMaxMs } from '../../../src/daemon/fast-checker';
@@ -403,6 +403,58 @@ describe('Codex round 15 #4 — submitted-only is its own state, never "consumed
     writeFileSync(join(paths.logDir, 'outbound-messages.jsonl'), JSON.stringify({ chat_id: CHAT, timestamp: '2026-09-30T12:40:20.000Z', text: 'ZZTEST reply to something earlier' }) + '\n');
     await cycleAt(at('2026-09-30T12:40:30.000Z'));
     expect(q.read(900071)).not.toBeNull();
+  });
+});
+
+describe('Codex round 16 #2/#4 — consumption, not submission, is the reference point', () => {
+  const enq = (id: number, ts: string) => {
+    const e = E('enqueue_telegram_b7476096');
+    e.content = e.content.replace('(chat_id:8727328514)', `${telegramToken(id)} (chat_id:8727328514)`);
+    e.timestamp = ts;
+    return e;
+  };
+  const qcmd = (id: number, ts: string, uuid: string) => {
+    const e = E('queued_command_telegram_b7476096');
+    e.attachment.prompt = e.attachment.prompt.replace('(chat_id:8727328514)', `${telegramToken(id)} (chat_id:8727328514)`);
+    e.timestamp = ts;
+    e.uuid = uuid;
+    return e;
+  };
+  const outbound = (iso: string) =>
+    appendFileSync(join(paths.logDir, 'outbound-messages.jsonl'), JSON.stringify({ chat_id: CHAT, timestamp: iso, text: 'ZZTEST reply' }) + '\n');
+
+  for (const rail of ['outbound-log', 'last-sent cache'] as const) {
+    it(`a reply sent while the message was queued is NOT its answer once it is read (${rail}); a later reply is`, async () => {
+      q.persist(textRecord(900080, 'ZZTEST queued', '2026-09-30T12:40:00.000Z'));
+      await cycleAt(at('2026-09-30T12:40:02.000Z'));
+      appendFileSync(sessionFile, line(enq(900080, '2026-09-30T12:40:03.000Z')));
+      await cycleAt(at('2026-09-30T12:40:08.000Z'));
+      // An unrelated reply while it sits queued, unread.
+      const lastSent = join(paths.stateDir, `last-telegram-${CHAT}.txt`);
+      if (rail === 'outbound-log') outbound('2026-09-30T12:40:20.000Z');
+      else { writeFileSync(lastSent, 'ZZTEST'); utimesSync(lastSent, new Date('2026-09-30T12:40:20.000Z'), new Date('2026-09-30T12:40:20.000Z')); }
+      // It is read at 12:41:00.
+      appendFileSync(sessionFile, line(qcmd(900080, '2026-09-30T12:41:00.000Z', 'zztest-qc-80')));
+      await cycleAt(at('2026-09-30T12:41:10.000Z'));
+      await cycleAt(at('2026-09-30T12:41:20.000Z'));
+      expect(q.read(900080)).not.toBeNull(); // the 12:40:20 reply predates consumption
+      if (rail === 'outbound-log') outbound('2026-09-30T12:41:30.000Z');
+      else utimesSync(lastSent, new Date('2026-09-30T12:41:30.000Z'), new Date('2026-09-30T12:41:30.000Z'));
+      await cycleAt(at('2026-09-30T12:41:40.000Z'));
+      expect(q.read(900080)).toBeNull();
+    });
+  }
+
+  it('the receipt for a queued-but-unread message says it has not been read — not "JARVIS has it"', async () => {
+    q.persist(textRecord(900081, 'ZZTEST queued ack', '2026-09-30T12:40:00.000Z'));
+    await cycleAt(at('2026-09-30T12:40:02.000Z'));
+    appendFileSync(sessionFile, line(enq(900081, '2026-09-30T12:40:03.000Z')));
+    await cycleAt(at('2026-09-30T12:40:08.000Z'));
+    await cycleAt(at('2026-09-30T12:40:50.000Z'));
+    const acks = sentTexts().filter((t) => t.startsWith('Received'));
+    expect(acks).toHaveLength(1);
+    expect(acks[0]).not.toContain('JARVIS has it');
+    expect(acks[0]).toContain("JARVIS hasn't read it yet — it is queued.");
   });
 });
 
