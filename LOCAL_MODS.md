@@ -5,6 +5,47 @@ so they can be reapplied after framework upgrades.
 
 ---
 
+## MOD #53 — Provable Telegram delivery (A1–A7 + V5, 2026-09-30)
+
+Delivery is now proven from Claude Code's own session record, not the terminal. At 05:38 a long paste
+rendered collapsed (`[Pasted text #1 +9 lines]`), the header needle never showed, Scott got a false "I may
+have missed your message", and the paste sat unsubmitted in the composer. Now:
+- Every Telegram block's header carries `⟦u:<update_id>⟧` (placed before `(chat_id:…)` so A0's stripper
+  still matches). Proof = a JSONL entry carrying the token that is a genuine human prompt (origin/turnOrigin
+  human, promptSource present, no tool result, not compaction/sidechain/meta) or a `queued_command`
+  attachment (a mid-turn submission — 23 of 49 Telegram pastes in the previous session exist ONLY in that
+  form); an `enqueue` row proves submission only. Any file in the agent's `~/.claude/projects/<slug>/`
+  (shared cwd), full rescans ≤ every 5 s, entries older than the attempt never count. Other runtimes: the
+  token in normalized PTY output.
+- Persist-before-write: token, attempt start, deadline, PTY instance are written and verified BEFORE the
+  first byte; a pasted record is `in_flight` and never pasted again. No proof in 60 s ⇒ `submit_phase:
+  'stuck'`: later messages queue behind it in that PTY, ONE truthful receipt to Scott, the watchdog alerts;
+  late proof or a respawn clears the gate. Admissions only on positive non-delivery (nothing written, twice).
+- Boot hold: no Telegram paste until THIS PTY bootstrapped and its boot prompt's turn ended in the JSONL
+  (bounded by `TELEGRAM_BOOT_HOLD_MAX_MS`, default 10 min). The deferred Enter is cancelled if the PTY is
+  replaced. The PTY "at prompt" heuristic matched 0 of 125 injections 9/24–9/30 and is not used for this.
+- Answered records are archived to `pending-telegram-resolved/` (resolved_at + resolution), pruned after 7 d;
+  `insert()` is create-if-absent (redelivery is a no-op); `patch()` carries a `rev` guard.
+- Sender notices are recorded only after they were sent (max 3 tries, then `notify_failed`).
+- Receipt acks come from the records (45 s, then 10 min), independent of agent activity; persisted per record.
+- Media (A3): gen-fenced downloads to `telegram-images/<update_id>-<name>.part.<gen>`, one retry, then one
+  block (caption + note) or a notice; resume + reconciliation on restart.
+- Inbound rows now carry `update_id`. The transcript send-attempt rail no longer counts as a reply.
+Scan cost (R4-5, real uhsJARVIS dir, 5 s cadence): no-cache p95 319 ms (1 h window) / 538 ms (24 h), so the
+(dev, ino, size, mtime_ns) parse cache is ON (p95 21–22 ms); `TELEGRAM_PROOF_SCAN_CACHE=0` disables it.
+
+Modified: src/telegram/{pending-queue,media,logging}.ts, src/daemon/{fast-checker,agent-manager,agent-process}.ts,
+src/pty/inject.ts. New: src/telegram/submission-proof.ts, scripts/measure-proof-scan.ts. Tests:
+tests/unit/telegram/{submission-proof,provable-delivery,delivery-store-acks,media-a3,rollback-compat}.test.ts
+(fixtures recorded: tests/fixtures/telegram/claude-session-entries…, stdout-collapsed-paste…).
+
+Rollback = A0 (16fd942) via MOD #52's drain script, then revert/redeploy + /restart-cortexos. Safe because
+pasted/stuck/submitted records are `in_flight` (A0 never re-injects or admits those), pending A3 media is
+held by A0 and blocks the drain, and every other new field is ignored by A0 (tests/unit/telegram/
+rollback-compat.test.ts runs a frozen copy of A0's queue against records this code wrote).
+
+---
+
 ## MOD #52 — Telegram media race fix + intake pause / rollback drain (A0, 2026-09-30)
 
 The durable queue persisted a raw media record (`formatted=''`) before the download; the checker saw it
