@@ -229,3 +229,85 @@ export async function processMediaMessage(
 
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// A3 (2026-09-30): media identity + a download that lands at a fenced path.
+// ---------------------------------------------------------------------------
+
+export interface MediaReceipt {
+  media_type: string;
+  file_id: string;
+  file_unique_id?: string;
+  /** The sender's file name, when Telegram has one (documents, audio, video). */
+  file_name?: string;
+  duration?: number;
+  /** telegram-images/<update_id>-<sanitized name>, relative to the agent dir. */
+  media_dest: string;
+}
+
+/**
+ * Everything the durable record needs at receipt to (re)download the
+ * attachment later without the original update: its file_id, and a final path
+ * that is unique per update (the update_id prefix) — two photos in the same
+ * second, or two documents with the same name, can never overwrite each other.
+ */
+export function mediaReceipt(msg: TelegramMessage, updateId: number): MediaReceipt | null {
+  const pick = (): { media_type: string; file_id: string; file_unique_id?: string; name: string; file_name?: string; duration?: number } | null => {
+    if (msg.photo && msg.photo.length > 0) {
+      const p = msg.photo[msg.photo.length - 1] as { file_id: string; file_unique_id?: string };
+      return { media_type: 'photo', file_id: p.file_id, file_unique_id: p.file_unique_id, name: `photo-${sanitizeFilename(p.file_unique_id || 'image')}.jpg` };
+    }
+    if (msg.document) {
+      const d = msg.document as { file_id: string; file_unique_id?: string; file_name?: string };
+      return { media_type: 'document', file_id: d.file_id, file_unique_id: d.file_unique_id, name: sanitizeFilename(d.file_name), file_name: sanitizeFilename(d.file_name) };
+    }
+    if (msg.audio) {
+      const a = msg.audio as { file_id: string; file_unique_id?: string; file_name?: string; duration?: number };
+      const name = a.file_name ? sanitizeFilename(a.file_name) : 'audio.ogg';
+      return { media_type: 'audio', file_id: a.file_id, file_unique_id: a.file_unique_id, name, file_name: name, duration: a.duration };
+    }
+    if (msg.voice) {
+      const v = msg.voice as { file_id: string; file_unique_id?: string; duration?: number };
+      return { media_type: 'voice', file_id: v.file_id, file_unique_id: v.file_unique_id, name: 'voice.ogg', duration: v.duration };
+    }
+    if (msg.video) {
+      const v = msg.video as { file_id: string; file_unique_id?: string; file_name?: string; duration?: number };
+      const name = v.file_name ? sanitizeFilename(v.file_name) : 'video.mp4';
+      return { media_type: 'video', file_id: v.file_id, file_unique_id: v.file_unique_id, name, file_name: name, duration: v.duration };
+    }
+    if (msg.video_note) {
+      const v = msg.video_note as { file_id: string; file_unique_id?: string; duration?: number };
+      return { media_type: 'video_note', file_id: v.file_id, file_unique_id: v.file_unique_id, name: 'videonote.mp4', duration: v.duration };
+    }
+    return null;
+  };
+  const p = pick();
+  if (!p) return null;
+  const out: MediaReceipt = { media_type: p.media_type, file_id: p.file_id, media_dest: `telegram-images/${updateId}-${p.name}` };
+  if (p.file_unique_id) out.file_unique_id = p.file_unique_id;
+  if (p.file_name) out.file_name = p.file_name;
+  if (p.duration !== undefined) out.duration = p.duration;
+  return out;
+}
+
+/** `<dest>.part.<gen>` — the only place a download is written before its gen-fenced rename. */
+export function partPathFor(destAbs: string, gen: number): string {
+  return `${destAbs}.part.${gen}`;
+}
+
+/** Matches a part file and yields [update_id, gen]. */
+export const PART_FILE_RE = /^(\d+)-.+\.part\.(\d+)$/;
+
+/**
+ * Download a Telegram file by file_id to `partPath`. Throws on any failure —
+ * the caller (the daemon's media job) reports it to the checker. Never renames:
+ * only a completion whose gen is still current may do that (A3).
+ */
+export async function downloadTelegramFileTo(api: TelegramAPI, fileId: string, partPath: string): Promise<void> {
+  const fileResponse = await api.getFile(fileId);
+  const filePath = fileResponse?.result?.file_path;
+  if (!filePath) throw new Error(`getFile returned no file_path for ${fileId.slice(0, 12)}…`);
+  const data = await api.downloadFile(filePath);
+  ensureDir(path.dirname(partPath));
+  fs.writeFileSync(partPath, data);
+}

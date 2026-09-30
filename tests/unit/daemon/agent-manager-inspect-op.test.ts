@@ -19,7 +19,7 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
   },
 }));
 vi.mock('../../../src/daemon/fast-checker.js', () => ({
-  FastChecker: class { start() {} stop() {} wake() {} },
+  FastChecker: class { start() {} stop() {} wake() {} setMediaDownloader() {} },
 }));
 vi.mock('../../../src/telegram/api.js', () => ({ TelegramAPI: class { constructor() {} } }));
 vi.mock('../../../src/telegram/poller.js', () => ({ TelegramPoller: class { start() {} stop() {} } }));

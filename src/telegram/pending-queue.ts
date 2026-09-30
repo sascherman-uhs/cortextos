@@ -19,19 +19,27 @@
  * This module is the durable thing that must hold a message BEFORE the offset
  * moves. One file per update_id under `state/<agent>/pending-telegram/`.
  *
- * THE LOAD-BEARING RULE: a pending file is deleted ONLY when a reply to that
- * chat is observed. The `=== TELEGRAM from ...` header appearing in the PTY
+ * THE LOAD-BEARING RULE: a pending file is retired (since 2026-09-30:
+ * archived, not deleted) ONLY when a reply to that chat is observed. The `=== TELEGRAM from ...` header appearing in the PTY
  * transcript proves the TUI *consumed* the block — it does NOT prove anyone
  * answered — so the header moves a record `unattempted -> in_flight`, which
  * changes retry eligibility and NOTHING else. Treating the header as deletion
  * would have manufactured a spotless delivery record for exactly the 9/21
  * window in which Scott sat repeating himself into a void.
  *
- * State machine:
- *   unattempted --header seen--> in_flight --reply seen--> (file deleted)
- *   never consumed + attempts exhausted --> escalated  (RETAINED, Scott is told)
- *   consumed but no reply we can see    --> unverified (RETAINED, operator only)
- *   media with no text and no transcript --> failed_notified (RETAINED)
+ * State machine — records with a `token` (written since 2026-09-30):
+ *   unattempted --paste (accounting persisted FIRST)--> in_flight/pasted
+ *   pasted --Claude Code recorded the prompt--> in_flight/submitted (consumed)
+ *   pasted --no such record within SUBMIT_TIMEOUT_MS--> in_flight/stuck
+ *          (UNKNOWN: never re-pasted, one receipt to the human, watchdog alert;
+ *           late proof moves it to submitted)
+ *   paste wrote NOTHING (PTY absent) --> back to unattempted, retried;
+ *          MAX_ATTEMPTS of those --> escalated (the only admission)
+ *   submitted, no reply after 10 min --> unverified (operator only)
+ *   any non-terminal or unverified + reply seen --> archived to
+ *          pending-telegram-resolved/ with resolved_at + resolution
+ *   media with no text and no transcript --> failed_notified (after the notice)
+ * Legacy records (no token) keep the header-needle rules below.
  * Nothing is ever silently dropped.
  *
  * Why `unverified` exists (live defect, 2026-09-24 05:45). Scott's first real
@@ -47,9 +55,22 @@
  * message, and it is surfaced to the operator, never to Scott.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
+import { basename, dirname, join } from 'path';
 import { atomicWriteSync } from '../utils/atomic.js';
+
+/**
+ * SINGLE WRITER (A4, 2026-09-30). Every write to `pending-telegram/` and
+ * `pending-telegram-resolved/` happens in the daemon process, on the agent's
+ * FastChecker/poller thread — there is no second process writing these files.
+ * The `rev` counter therefore guards against ONE hazard: a caller that read a
+ * record, awaited something (a Telegram send, a download), and then writes
+ * back a copy that another step of the same process changed in between. Such a
+ * caller passes `expectRev` and gets `null` instead of clobbering.
+ *
+ * Operators (B1 one-off scripts, a human resolving a record by hand) write
+ * outside this discipline; `rev` is optional so their records still load.
+ */
 
 export type PendingState =
   | 'unattempted'
@@ -118,13 +139,95 @@ export interface PendingTelegramRecord {
   /** Telegram message_id of the inbound media message. */
   message_id?: number;
   /**
-   * Forward-compat with the A3 media state machine. A0 never writes these; it
-   * only HONOURS them, so rolling A1–A8 back to A0 can never re-terminalize a
-   * record whose download the newer code still considers in progress.
+   * A3 media state machine. A0 only HONOURS media_state/media_deadline_at, so
+   * rolling A1–A7 back to A0 can never re-terminalize a record whose download
+   * the newer code still considers in progress.
    */
   media_state?: 'pending' | 'ready' | 'failed';
   media_deadline_at?: string;
+  /** Download generation: only a completion carrying the CURRENT gen may land. */
+  media_gen?: number;
+  /** Re-downloads started after a missed deadline (max 1). */
+  media_retries?: number;
+  /** Final path of the attachment, relative to the agent dir: telegram-images/<update_id>-<name>. */
+  media_dest?: string;
+  file_unique_id?: string;
+  file_name?: string;
+  /** Telegram message `date` (unix seconds). */
+  message_date?: number;
+  /** Voice/audio/video duration (s), for the block. */
+  media_duration?: number;
+
+  // --- Provable delivery (A1/V5, 2026-09-30). Absent on older records. ------
+  /**
+   * `⟦u:<update_id>⟧` — emitted in the formatted block's header line. The
+   * consumption needle: found in Claude Code's session JSONL (V5-1) or, for
+   * runtimes without one, in the normalized PTY output.
+   */
+  token?: string;
+  /**
+   * Where the paste stands (JSONL-proof runtimes only):
+   *   pasted    — bytes were written; no proof of submission yet (UNKNOWN);
+   *   submitted — Claude Code recorded the prompt (see submitted_via);
+   *   stuck     — no proof within SUBMIT_TIMEOUT_MS: the composer probably
+   *               holds it unsent. Never re-pasted; queues later messages.
+   * The uhsJARVIS audit reads `submit_phase === 'stuck'` as STUCK.
+   */
+  submit_phase?: 'pasted' | 'submitted' | 'stuck';
+  /** Persisted BEFORE the first PTY byte; JSONL evidence older than this never counts. */
+  attempt_started_at?: string;
+  submit_deadline_at?: string;
+  /** The PTY instance the paste went to — a respawn opens the stuck gate. */
+  pty_instance?: string;
+  submitted_at?: string;
+  submitted_via?: 'prompt' | 'queued_command' | 'enqueue' | 'pty';
+  /** JSONL entry uuids already counted for this record (R4-1 dedupe). */
+  proof_uuids?: string[];
+  stuck_at?: string;
+  /** The one truthful "hasn't picked it up yet" receipt (V5-2c). */
+  stuck_receipt_at?: string;
+  stuck_receipt_attempts?: number;
+  /** 24 h after the attempt with no proof: scanning stops; the record stays UNKNOWN. */
+  proof_window_closed_at?: string;
+  /** A write error AFTER some bytes reached the PTY (V5-3: UNKNOWN, never DROP). */
+  write_error?: string;
+  /** The token was seen in PTY output — a hint only, never proof, in JSONL mode. */
+  pty_hint_at?: string;
+  /** Pastes that wrote NOTHING (PTY absent / first write threw) — V5-3 positive non-delivery. */
+  nondelivery_failures?: number;
+
+  // --- Store (A4) ------------------------------------------------------------
+  /** Incremented on every patch; see SINGLE WRITER above. */
+  rev?: number;
+  /** Set (with `resolution`) immediately before the record is archived. */
+  resolved_at?: string;
+  /** 'answered' — a reply to this chat was observed after the injection. */
+  resolution?: string;
+  resolved_by?: string;
+
+  // --- Sender notices (A5) --------------------------------------------------
+  /** Set only after the notice was actually sent. */
+  notified_at?: string;
+  notify_attempts?: number;
+  /** The notice failed NOTIFY_MAX_ATTEMPTS times — reported by the audit. */
+  notify_failed?: boolean;
+
+  // --- Receipt acks (A6). Absent (legacy) => never acked. ---------------------
+  ack_stage?: 0 | 1 | 2;
+  ack1_at?: string;
+  ack2_at?: string;
 }
+
+/** Sibling archive dir for resolved records (same filesystem => atomic rename). */
+export const RESOLVED_DIR_NAME = 'pending-telegram-resolved';
+/** Resolved records are pruned after this long (> the audit's lookback). */
+export const RESOLVED_RETENTION_MS = 7 * 24 * 60 * 60_000;
+/** A sender notice is attempted at most this many times, then `notify_failed`. */
+export const NOTIFY_MAX_ATTEMPTS = 3;
+/** V5-2c: no proof of submission within this long => `stuck`. */
+export const SUBMIT_TIMEOUT_MS = 60_000;
+/** Late submission evidence keeps counting this long after the attempt (V5-1). */
+export const PROOF_WINDOW_MS = 24 * 60 * 60_000;
 
 /** After this many injections with no observed reply, admit it rather than repeat. */
 export const MAX_ATTEMPTS = 2;
@@ -251,18 +354,39 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Remove everything the DAEMON injected (A2): every Telegram formatter's header
+ * line (TEXT / PHOTO / DOCUMENT / VOICE / VIDEO / REACTION, with or without the
+ * `⟦u:…⟧` token), the `Reply using: cortextos bus send-telegram <chat>` footer,
+ * the retry preamble and the `[Your last message …]` context line. Each names
+ * the chat, and each is echoed into the transcript AFTER the injection's
+ * watermark — unstripped, a block "proved" its own reply the moment it landed.
+ *
+ * Whitespace-tolerant (`\s*` between every word): the current Claude Code TUI
+ * draws spaces as cursor moves, so the stripped PTY text reads
+ * `Replyusing:cortextosbussend-telegram8727…`. A pattern that needs a literal
+ * space would silently stop stripping.
+ */
+export function stripInjectedScaffolding(text: string, chatId: string): string {
+  const id = escapeRegExp(chatId);
+  const ws = '\\s*';
+  return text
+    .replace(new RegExp(`Reply${ws}using:${ws}cortextos${ws}bus${ws}send-telegram${ws}${id}${ws}'<your${ws}reply>'`, 'g'), '')
+    .replace(new RegExp(`={3}${ws}TELEGRAM${ws}(?:PHOTO|DOCUMENT|VOICE|VIDEO)?${ws}from[^\\n]*?\\(${ws}chat_id${ws}:${ws}${id}${ws}\\)${ws}={3}`, 'g'), '')
+    .replace(new RegExp(`={3}${ws}REACTION${ws}from[^\\n]*?\\(${ws}chat_id${ws}:${ws}${id}${ws}\\)[^\\n]*?={3}`, 'g'), '')
+    .replace(new RegExp(`\\[RETRY${ws}attempt${ws}\\d+\\][^\\n]*`, 'g'), '')
+    .replace(/\[Your\s*last\s*message[^\n]*/g, '');
+}
+
+/**
+ * Did the agent run a send command for this chat? A DIAGNOSTIC HINT ONLY since
+ * 2026-09-30 (A2): a send ATTEMPT in the transcript is not a reply. Reply
+ * evidence is the outbound log (which the shell rail now writes too, V4-6) and
+ * the last-sent cache — both written only after Telegram accepted the send.
+ */
 export function sendEvidenceInTranscript(text: string, chatId: string): boolean {
   if (!text) return false;
-  // The daemon's own injected block names the chat twice — the header
-  // `(chat_id:<id>)` and the footer `Reply using: cortextos bus send-telegram
-  // <id> '<your reply>'` — and the TUI echoes that block into the transcript
-  // AFTER the watermark. Unstripped, every message "proved" its own reply the
-  // moment it was injected and its pending file was deleted within seconds
-  // (2026-09-24: 462809040/41 reaped 6s after injection, no reply ever sent).
-  const id = escapeRegExp(chatId);
-  text = text
-    .replace(new RegExp(`Reply using:\\s*cortextos\\s+bus\\s+send-telegram\\s+${id}\\s+'<your reply>'`, 'g'), '')
-    .replace(new RegExp(`=== TELEGRAM from [^\\n]*?\\(chat_id:\\s*${id}\\)\\s*===`, 'g'), '');
+  text = stripInjectedScaffolding(text, chatId);
   const patterns: RegExp[] = [
     /telegram-send\.sh/,
     /telegram_notify\.py/,
@@ -277,12 +401,15 @@ export function sendEvidenceInTranscript(text: string, chatId: string): boolean 
 
 export class PendingTelegramQueue {
   readonly dir: string;
+  /** Sibling archive (A4/C2): same parent => same filesystem => atomic rename. */
+  readonly resolvedDir: string;
   private log: (msg: string) => void;
   /** See MEDIA_GRACE_MS. Read once at construction; tests pass it explicitly. */
   readonly mediaGraceMs: number;
 
   constructor(dir: string, log?: (msg: string) => void, opts: { mediaGraceMs?: number } = {}) {
     this.dir = dir;
+    this.resolvedDir = join(dirname(dir), RESOLVED_DIR_NAME);
     this.log = log ?? (() => {});
     this.mediaGraceMs = opts.mediaGraceMs ?? mediaGraceMs();
   }
@@ -299,9 +426,13 @@ export class PendingTelegramQueue {
    */
   isMediaHeld(rec: PendingTelegramRecord, now: number): boolean {
     if (isTerminal(rec.state)) return false;
-    if (rec.media_state === 'pending' && rec.media_deadline_at) {
+    if (rec.media_state === 'pending') {
+      // A3: the checker's deadline pass owns this record. A pending record past
+      // its deadline is still held here — the deadline pass retries it or moves
+      // it to 'failed' in the same cycle; it is never injected raw.
+      if (!rec.media_deadline_at) return true;
       const deadline = Date.parse(rec.media_deadline_at);
-      if (!Number.isNaN(deadline) && now < deadline) return true;
+      if (Number.isNaN(deadline) || now < deadline || rec.media_gen !== undefined) return true;
     }
     if (rec.formatted !== '') return false;
     const created = Date.parse(rec.created_at);
@@ -317,19 +448,21 @@ export class PendingTelegramQueue {
    */
   unfinishedMedia(): PendingTelegramRecord[] {
     return this.list().filter(
-      (r) => !isTerminal(r.state) && (r.formatted === '' || r.media_state === 'pending'),
+      (r) => !isTerminal(r.state) && !r.resolved_at && (r.formatted === '' || r.media_state === 'pending'),
     );
   }
 
   /**
    * Captionless raw media whose grace has run out: nothing can be injected, so
    * the checker tells the sender to resend (and only marks the record once that
-   * notice has actually been sent).
+   * notice has actually been sent). A0/legacy shape only — A3 records (they
+   * carry media_state) are owned by the checker's media deadline pass.
    */
   expiredCaptionlessMedia(now: number): PendingTelegramRecord[] {
-    return this.list().filter(
+    return this.active().filter(
       (r) =>
         r.state === 'unattempted' &&
+        r.media_state === undefined &&
         !r.empty &&
         r.formatted === '' &&
         !r.text.trim() &&
@@ -338,7 +471,8 @@ export class PendingTelegramQueue {
   }
 
   /**
-   * Land a finished media round trip on its record.
+   * Land a finished media round trip on its record (A0 / legacy records — A3
+   * records complete through the checker's generation-fenced path).
    *
    * The record may have moved while the download ran:
    *   - still raw / non-terminal       => patch the block in ('updated');
@@ -357,25 +491,24 @@ export class PendingTelegramQueue {
     if (!cur) return 'missing';
     const notes = [...cur.notes, ...(fields.notes ?? [])];
     if (!isTerminal(cur.state)) {
-      const next = { ...cur, formatted: fields.formatted, text: fields.text, empty: fields.empty, notes };
+      const next: Partial<PendingTelegramRecord> = { formatted: fields.formatted, text: fields.text, empty: fields.empty, notes };
       if (cur.formatted && fields.formatted && cur.attempts > 0) {
         // The expiry path already injected the caption. The block is updated so
         // a retry would carry the attachment, but it is NOT re-injected.
         next.notes = [...notes, 'media completed after the caption was injected — not re-injected'];
       }
-      return this.persist(next) ? 'updated' : 'write_failed';
+      return this.patch(updateId, next, { expectRev: cur.rev ?? 0 }) ? 'updated' : 'write_failed';
     }
     if (cur.state === 'failed_notified' && cur.attempts === 0 && !fields.empty && fields.formatted) {
-      const next: PendingTelegramRecord = {
-        ...cur,
+      const next: Partial<PendingTelegramRecord> = {
         state: 'unattempted',
         empty: false,
         formatted: `${LATE_MEDIA_PREFIX}\n${fields.formatted}`,
         text: fields.text,
         notes: [...notes, 'media arrived after the sender was told to resend — re-armed'],
+        last_attempt_at: undefined,
       };
-      delete next.last_attempt_at;
-      return this.persist(next) ? 'rearmed' : 'write_failed';
+      return this.patch(updateId, next, { expectRev: cur.rev ?? 0 }) ? 'rearmed' : 'write_failed';
     }
     return 'discarded';
   }
@@ -384,9 +517,13 @@ export class PendingTelegramQueue {
     return join(this.dir, `${updateId}.json`);
   }
 
+  private resolvedPathFor(updateId: number): string {
+    return join(this.resolvedDir, `${updateId}.json`);
+  }
+
   /**
-   * Durably write a record. Returns false if the write failed — the poller
-   * MUST then leave the Telegram offset alone so the update is redelivered.
+   * Durably write a whole record (overwrite). Returns false if the write
+   * failed. New inbound updates go through insert(), which never overwrites.
    */
   persist(rec: PendingTelegramRecord): boolean {
     try {
@@ -399,6 +536,20 @@ export class PendingTelegramQueue {
     }
   }
 
+  /**
+   * Create-if-absent (A4). A redelivered update — Telegram resends when the
+   * offset was not acked — must never overwrite the record the first delivery
+   * created (it may already be mid-download, pasted, or answered and archived):
+   *   'inserted'     — new record written;
+   *   'exists'       — a record for this update_id is already pending OR in the
+   *                    resolved archive; the redelivery is a no-op (ack it);
+   *   'write_failed' — nothing durable; the caller must hold the offset.
+   */
+  insert(rec: PendingTelegramRecord): 'inserted' | 'exists' | 'write_failed' {
+    if (existsSync(this.pathFor(rec.update_id)) || existsSync(this.resolvedPathFor(rec.update_id))) return 'exists';
+    return this.persist(rec) ? 'inserted' : 'write_failed';
+  }
+
   read(updateId: number): PendingTelegramRecord | null {
     try {
       const p = this.pathFor(updateId);
@@ -409,14 +560,39 @@ export class PendingTelegramQueue {
     }
   }
 
-  patch(updateId: number, fields: Partial<PendingTelegramRecord>): PendingTelegramRecord | null {
-    const cur = this.read(updateId);
-    if (!cur) return null;
-    const next = { ...cur, ...fields };
-    return this.persist(next) ? next : null;
+  /** A record in the resolved archive, or null. */
+  readResolved(updateId: number): PendingTelegramRecord | null {
+    try {
+      const p = this.resolvedPathFor(updateId);
+      if (!existsSync(p)) return null;
+      return JSON.parse(readFileSync(p, 'utf-8')) as PendingTelegramRecord;
+    } catch {
+      return null;
+    }
   }
 
-  /** Every record on disk, oldest update_id first. */
+  /**
+   * Read-modify-write, tmp+rename. `expectRev` (see SINGLE WRITER): when given
+   * and the record on disk has moved on, nothing is written and null is
+   * returned — the caller re-reads and decides again. A field set to
+   * `undefined` is removed.
+   */
+  patch(
+    updateId: number,
+    fields: Partial<PendingTelegramRecord>,
+    opts: { expectRev?: number } = {},
+  ): PendingTelegramRecord | null {
+    const cur = this.read(updateId);
+    if (!cur) return null;
+    if (opts.expectRev !== undefined && (cur.rev ?? 0) !== opts.expectRev) {
+      this.log(`pending-queue: patch of ${updateId} refused — rev ${cur.rev ?? 0} on disk, expected ${opts.expectRev}`);
+      return null;
+    }
+    const next = { ...cur, ...fields, rev: (cur.rev ?? 0) + 1 } as PendingTelegramRecord;
+    return this.persist(next) ? (JSON.parse(JSON.stringify(next)) as PendingTelegramRecord) : null;
+  }
+
+  /** Every record in pending-telegram/, oldest update_id first (includes half-archived ones). */
   list(): PendingTelegramRecord[] {
     let names: string[] = [];
     try {
@@ -436,6 +612,15 @@ export class PendingTelegramQueue {
     return recs.sort((a, b) => a.update_id - b.update_id);
   }
 
+  /**
+   * Records the queue still acts on. A record carrying `resolved_at` is
+   * mid-archive (a crash between the resolution patch and the rename) — it is
+   * never injected, escalated or acked again; finishArchives() completes it.
+   */
+  active(): PendingTelegramRecord[] {
+    return this.list().filter((r) => !r.resolved_at);
+  }
+
   remove(updateId: number): void {
     try {
       unlinkSync(this.pathFor(updateId));
@@ -445,13 +630,79 @@ export class PendingTelegramQueue {
   }
 
   /**
+   * Archive a resolved record (A4/C2): patch `resolved_at` + `resolution`,
+   * THEN rename into pending-telegram-resolved/. A crash between the two
+   * leaves a record with `resolved_at` in pending/, which finishArchives()
+   * completes and which nothing else will act on. The watchdog reads both dirs,
+   * so an answered message is evidence, not an absence.
+   */
+  archive(updateId: number, resolution: string, resolvedBy: string, at = new Date()): boolean {
+    const cur = this.read(updateId);
+    if (!cur) return false;
+    const marked = cur.resolved_at
+      ? cur
+      : this.patch(updateId, { resolved_at: at.toISOString(), resolution, resolved_by: resolvedBy }, { expectRev: cur.rev ?? 0 });
+    if (!marked) return false;
+    return this.renameToResolved(updateId);
+  }
+
+  private renameToResolved(updateId: number): boolean {
+    try {
+      mkdirSync(this.resolvedDir, { recursive: true });
+      renameSync(this.pathFor(updateId), this.resolvedPathFor(updateId));
+      return true;
+    } catch (err) {
+      this.log(`pending-queue: archive rename failed for ${updateId}: ${String(err)} — resolved_at is set, will retry`);
+      return false;
+    }
+  }
+
+  /** V4-3(b): finish any archive a crash interrupted. Returns how many were moved. */
+  finishArchives(): number {
+    let n = 0;
+    for (const r of this.list()) {
+      if (r.resolved_at && this.renameToResolved(r.update_id)) n++;
+    }
+    return n;
+  }
+
+  /** C2: resolved records older than RESOLVED_RETENTION_MS are deleted. */
+  pruneResolved(now: number, retentionMs = RESOLVED_RETENTION_MS): number {
+    let names: string[] = [];
+    try {
+      if (!existsSync(this.resolvedDir)) return 0;
+      names = readdirSync(this.resolvedDir).filter((n) => /^\d+\.json$/.test(n));
+    } catch {
+      return 0;
+    }
+    let n = 0;
+    for (const name of names) {
+      const p = join(this.resolvedDir, name);
+      try {
+        const r = JSON.parse(readFileSync(p, 'utf-8')) as PendingTelegramRecord;
+        // Only records THIS code archived (resolved_at) are pruned. A record an
+        // operator dropped in by hand without one is kept — it is their audit note.
+        const at = Date.parse(r.resolved_at ?? '');
+        if (Number.isNaN(at) || now - at < retentionMs) continue;
+        unlinkSync(p);
+        n++;
+      } catch {
+        // unreadable: leave it for a human
+      }
+    }
+    if (n > 0) this.log(`pending-queue: pruned ${n} resolved record(s) older than ${Math.round(retentionMs / 86_400_000)}d from ${basename(this.resolvedDir)}/`);
+    return n;
+  }
+
+  /**
    * Reply evidence from the cortextos rail: a row in outbound-messages.jsonl
    * for this chat, strictly newer than the first attempt. Requires attempts >= 1
    * so an unrelated earlier outbound can never delete an unattempted record.
    *
    * This is ONE rail of several — see ReplyEvidence / answeredBy in
    * fast-checker for the union. It is the strongest (it proves Telegram
-   * accepted the send) but it is NOT complete: telegram-send.sh bypasses it.
+   * accepted the send). Shell-rail sends (uhsJARVIS telegram-send.sh) append
+   * rows here too since 2026-09-30 (V4-6).
    */
   repliedInOutboundLog(rec: PendingTelegramRecord, replies: Map<string, number>): boolean {
     if (rec.attempts < 1) return false;
@@ -461,25 +712,34 @@ export class PendingTelegramQueue {
     return reply !== undefined && reply > since;
   }
 
-  /** Delete every record with observed reply evidence on ANY rail. Returns the count. */
-  reapAnswered(answered: (rec: PendingTelegramRecord) => boolean): number {
+  /**
+   * Archive every record with observed reply evidence on ANY rail. Returns the
+   * count. `unverified` is resolvable here (V4-2): a reply observed after the
+   * 10-minute mark still resolves it. Every other terminal state is an audit
+   * record and is never touched — a human's resolution note is the only record
+   * of why it was closed.
+   */
+  reapAnswered(answered: (rec: PendingTelegramRecord) => boolean, by = 'reply observed'): number {
     let n = 0;
-    for (const rec of this.list()) {
-      // A terminal record is an audit record. Never delete one, even if reply
-      // evidence turns up later — a human's resolution note is the only record
-      // of why it was closed.
-      if (isTerminal(rec.state)) continue;
-      if (answered(rec)) {
-        this.remove(rec.update_id);
-        n++;
-      }
+    for (const rec of this.active()) {
+      if (isTerminal(rec.state) && rec.state !== 'unverified') continue;
+      if (answered(rec) && this.archive(rec.update_id, 'answered', by)) n++;
     }
     return n;
   }
 
   isEligible(rec: PendingTelegramRecord, now: number, answered: (rec: PendingTelegramRecord) => boolean): boolean {
     if (rec.empty) return false;
+    // V4-2: `unverified` is resolvable but NEVER re-injectable — explicit, not
+    // just implied by TERMINAL_STATES, so a future edit to that list cannot
+    // quietly start re-pasting consumed blocks.
+    if (rec.state === 'unverified') return false;
     if (isTerminal(rec.state)) return false;
+    // Mid-archive (V4-3b): resolved, never injected again.
+    if (rec.resolved_at) return false;
+    // A paste already reached (or may have reached) the PTY. Pasted/stuck are
+    // UNKNOWN, submitted is consumed — none is ever re-pasted (R4-2/R4-3).
+    if (rec.submit_phase !== undefined) return false;
     // A download still owes this record its block (see MEDIA_GRACE_MS).
     if (this.isMediaHeld(rec, now)) return false;
     // Nothing to inject at all (captionless media past grace): the checker's
@@ -502,7 +762,8 @@ export class PendingTelegramQueue {
     if (Number.isNaN(last)) return true;
     // Retry is gated on the HEADER'S ABSENCE (state still unattempted) plus a
     // bound comfortably larger than observed header latency — not on a short
-    // fixed timer that races the signal.
+    // fixed timer that races the signal. (Legacy records only: a record with a
+    // token moves to in_flight the moment any byte is pasted.)
     return now - last >= UNATTEMPTED_RETRY_MS;
   }
 
@@ -514,46 +775,57 @@ export class PendingTelegramQueue {
    * Three queued messages now mean three turns. That cost is accepted.
    */
   nextDeliverable(now: number, answered: (rec: PendingTelegramRecord) => boolean): PendingTelegramRecord | null {
-    for (const rec of this.list()) {
+    for (const rec of this.active()) {
       if (this.isEligible(rec, now, answered)) return rec;
     }
     return null;
   }
 
   /**
-   * TRUE drops: the header NEVER appeared, so the block never reached the TUI,
-   * and the attempts are spent. Only these earn an admission to the human —
-   * requiring "never consumed" is what stops the queue telling Scott it missed
-   * a message he was answered on twice.
+   * TRUE drops earn an admission to the human — and only positive
+   * non-delivery evidence proves a drop (V5-3):
+   *   - a record with a token: the PTY was absent or the paste threw before
+   *     ANY byte was written, on MAX_ATTEMPTS separate attempts. A paste that
+   *     wrote bytes is never a drop, whatever happened next (UNKNOWN instead).
+   *   - a legacy record (no token): the old rule — pasted MAX_ATTEMPTS times,
+   *     header never seen. Kept only for records written before this change.
    */
   dropCandidates(now: number, answered: (rec: PendingTelegramRecord) => boolean): PendingTelegramRecord[] {
     const out: PendingTelegramRecord[] = [];
-    for (const rec of this.list()) {
+    for (const rec of this.active()) {
       if (rec.empty) continue;
       // ONLY 'unattempted' earns an admission, which also means every terminal
       // state — including a human's answered_manual — is excluded by construction.
       if (rec.state !== 'unattempted') continue;
-      if (rec.attempts < MAX_ATTEMPTS) continue;
+      if (rec.submit_phase !== undefined) continue;
       if (answered(rec)) continue;
       const last = Date.parse(rec.last_attempt_at ?? rec.created_at);
       if (!Number.isNaN(last) && now - last < UNATTEMPTED_RETRY_MS) continue;
+      if (rec.token) {
+        if ((rec.nondelivery_failures ?? 0) < MAX_ATTEMPTS || rec.attempts > 0) continue;
+      } else if (rec.attempts < MAX_ATTEMPTS) {
+        continue;
+      }
       out.push(rec);
     }
     return out;
   }
 
   /**
-   * Consumed by the TUI, but no reply we can observe on any rail. This is an
+   * Consumed, but no reply we can observe on any rail. This is an
    * OBSERVABILITY gap, not a lost message: it is recorded for the operator and
-   * NOTHING is sent to the human.
+   * NOTHING is sent to the human. For a record with a token, "consumed" means
+   * Claude Code recorded the prompt (submit_phase 'submitted'); a pasted or
+   * stuck record is UNKNOWN, not consumed, and never becomes unverified.
    */
   unverifiedCandidates(now: number, answered: (rec: PendingTelegramRecord) => boolean): PendingTelegramRecord[] {
     const out: PendingTelegramRecord[] = [];
-    for (const rec of this.list()) {
+    for (const rec of this.active()) {
       if (rec.empty) continue;
       if (rec.state !== 'in_flight') continue;
+      if (rec.token && rec.submit_phase !== 'submitted') continue;
       if (answered(rec)) continue;
-      const since = Date.parse(rec.in_flight_at ?? rec.last_attempt_at ?? rec.created_at);
+      const since = Date.parse(rec.submitted_at ?? rec.in_flight_at ?? rec.last_attempt_at ?? rec.created_at);
       if (!Number.isNaN(since) && now - since < IN_FLIGHT_RETRY_MS) continue;
       out.push(rec);
     }
@@ -571,6 +843,59 @@ export class PendingTelegramQueue {
   }
 
   /**
+   * R4-2 persist-before-write. Everything that describes this paste — its
+   * start time (JSONL evidence older than this never counts), the submission
+   * deadline, the PTY instance, the stdout watermark — is written and read
+   * back BEFORE any byte reaches the PTY. The record is `in_flight` from here
+   * on: a crash after this write can never lead to a second paste of the same
+   * update; the attempt stays UNKNOWN until its token is found (or 24 h pass).
+   * Returns null (=> do not paste this cycle) if the write cannot be verified.
+   */
+  beginPaste(
+    rec: PendingTelegramRecord,
+    opts: { at: Date; ptyInstance: string; logOffset: number | null; submitTimeoutMs?: number },
+  ): PendingTelegramRecord | null {
+    const iso = opts.at.toISOString();
+    const deadline = new Date(opts.at.getTime() + (opts.submitTimeoutMs ?? SUBMIT_TIMEOUT_MS)).toISOString();
+    const fields: Partial<PendingTelegramRecord> = {
+      state: 'in_flight',
+      submit_phase: 'pasted',
+      attempt_started_at: iso,
+      submit_deadline_at: deadline,
+      pty_instance: opts.ptyInstance,
+      attempts: rec.attempts + 1,
+      first_attempt_at: rec.first_attempt_at ?? iso,
+      last_attempt_at: iso,
+      log_offset: opts.logOffset,
+    };
+    const written = this.patch(rec.update_id, fields, { expectRev: rec.rev ?? 0 });
+    if (!written) return null;
+    const back = this.read(rec.update_id);
+    if (!back || back.rev !== written.rev || back.submit_phase !== 'pasted' || back.attempt_started_at !== iso) return null;
+    return back;
+  }
+
+  /**
+   * The paste wrote NOTHING (PTY absent, or the first write threw): positive
+   * non-delivery evidence. Undo beginPaste so the record is retried after the
+   * usual throttle, and count the failure (V5-3 DROP needs MAX_ATTEMPTS of them).
+   */
+  abortPaste(rec: PendingTelegramRecord, note: string, at = new Date()): PendingTelegramRecord | null {
+    return this.patch(rec.update_id, {
+      state: 'unattempted',
+      submit_phase: undefined,
+      attempt_started_at: undefined,
+      submit_deadline_at: undefined,
+      pty_instance: undefined,
+      attempts: Math.max(0, rec.attempts - 1),
+      first_attempt_at: rec.attempts - 1 > 0 ? rec.first_attempt_at : undefined,
+      last_attempt_at: at.toISOString(),
+      nondelivery_failures: (rec.nondelivery_failures ?? 0) + 1,
+      notes: [...rec.notes, note],
+    }, { expectRev: rec.rev ?? 0 });
+  }
+
+  /**
    * The header was seen in the stripped PTY transcript: the TUI consumed the
    * block. Retry eligibility changes; the file is NOT deleted. Only an
    * observed reply deletes it.
@@ -580,16 +905,16 @@ export class PendingTelegramQueue {
     return this.patch(rec.update_id, { state: 'in_flight', in_flight_at: at.toISOString() });
   }
 
-  markEscalated(rec: PendingTelegramRecord, note: string): PendingTelegramRecord | null {
-    return this.patch(rec.update_id, { state: 'escalated', notes: [...rec.notes, note] });
+  markEscalated(rec: PendingTelegramRecord, note: string, extra: Partial<PendingTelegramRecord> = {}): PendingTelegramRecord | null {
+    return this.patch(rec.update_id, { state: 'escalated', notes: [...rec.notes, note], ...extra });
   }
 
   markUnverified(rec: PendingTelegramRecord, note: string): PendingTelegramRecord | null {
     return this.patch(rec.update_id, { state: 'unverified', notes: [...rec.notes, note] });
   }
 
-  markFailedNotified(rec: PendingTelegramRecord, note: string): PendingTelegramRecord | null {
-    return this.patch(rec.update_id, { state: 'failed_notified', notes: [...rec.notes, note] });
+  markFailedNotified(rec: PendingTelegramRecord, note: string, extra: Partial<PendingTelegramRecord> = {}): PendingTelegramRecord | null {
+    return this.patch(rec.update_id, { state: 'failed_notified', notes: [...rec.notes, note], ...extra });
   }
 }
 
@@ -606,6 +931,12 @@ export function newRecord(fields: {
   file_id?: string;
   media_type?: string;
   message_id?: number;
+  /**
+   * The update's `⟦u:<update_id>⟧` token. When given, the record uses the
+   * provable-delivery path: the token is the needle (stored as `header` too,
+   * so A0 code reading `header` still has a needle), and receipt acks apply.
+   */
+  token?: string;
 }): PendingTelegramRecord {
   const rec: PendingTelegramRecord = {
     update_id: fields.update_id,
@@ -613,7 +944,7 @@ export function newRecord(fields: {
     from: fields.from,
     text: fields.text,
     formatted: fields.formatted ?? '',
-    header: fields.header ?? '',
+    header: fields.header ?? fields.token ?? '',
     state: 'unattempted',
     attempts: 0,
     empty: fields.empty ?? false,
@@ -624,6 +955,11 @@ export function newRecord(fields: {
   if (fields.file_id !== undefined) rec.file_id = fields.file_id;
   if (fields.media_type !== undefined) rec.media_type = fields.media_type;
   if (fields.message_id !== undefined) rec.message_id = fields.message_id;
+  if (fields.token !== undefined) {
+    rec.token = fields.token;
+    rec.ack_stage = 0;
+    rec.rev = 0;
+  }
   return rec;
 }
 

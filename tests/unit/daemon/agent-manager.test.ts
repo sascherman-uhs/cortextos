@@ -27,6 +27,7 @@ vi.mock('../../../src/daemon/fast-checker.js', () => ({
     start() { /* no-op */ }
     stop() { /* no-op */ }
     wake() { /* no-op */ }
+    setMediaDownloader() { /* no-op */ }
   },
 }));
 

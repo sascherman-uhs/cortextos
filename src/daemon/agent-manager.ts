@@ -17,10 +17,11 @@ import { collectTelegramCommands, registerTelegramCommands } from '../bus/metric
 import { stripControlChars, sanitizeForPtyInjection } from '../utils/validate.js';
 import {
   durableQueueEnabled,
-  headerNeedle,
   newRecord,
 } from '../telegram/pending-queue.js';
-import { processMediaMessage, mediaIdentity } from '../telegram/media.js';
+import { processMediaMessage, mediaReceipt, partPathFor, downloadTelegramFileTo } from '../telegram/media.js';
+import { transcribeVoice } from '../telegram/transcribe.js';
+import { telegramToken } from '../telegram/submission-proof.js';
 import { TelegramIntakeControl } from '../telegram/intake-control.js';
 import { stripBom } from '../utils/strip-bom.js';
 import { prepareAgentPrompt } from '../utils/secret-refs.js';
@@ -638,6 +639,32 @@ export class AgentManager {
       poller.setIntakeGate(intake);
       intake.publish();
 
+      // A3: every media download — first attempt, deadline retry, or resume
+      // after a restart — runs here, writes <media_dest>.part.<gen>, and hands
+      // the result to the checker, which alone decides (by generation) whether
+      // it may land. Counted as an outstanding media job from start until the
+      // underlying work settles AND the checker handled it (the rollback drain
+      // waits on that count reaching zero).
+      checker.setMediaDownloader({
+        start: (rec, gen) => {
+          const settle = intake.beginMediaJob();
+          if (!rec.file_id || !rec.media_dest) {
+            checker.failMediaDownload(rec.update_id, gen, new Error('record has no file_id/media_dest'));
+            settle();
+            return;
+          }
+          const part = partPathFor(join(agentDir, rec.media_dest), gen);
+          downloadTelegramFileTo(telegramApi, rec.file_id, part)
+            .then(async () => {
+              const transcript = rec.media_type === 'voice' ? (await transcribeVoice(part)) || undefined : undefined;
+              checker.completeMediaDownload(rec.update_id, gen, { partPath: part, transcript });
+            })
+            .catch((err) => checker.failMediaDownload(rec.update_id, gen, err))
+            .catch((err) => log(`ERROR: media job ${rec.update_id} gen ${gen} completion handling threw: ${String(err)}`))
+            .finally(settle);
+        },
+      });
+
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
@@ -689,7 +716,7 @@ export class AgentManager {
         // inbound messages on a window where Eros replied to multiple
         // agents — the JSONL had the data but it never reached the
         // event log.
-        recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log);
+        recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log, updateId);
 
         // Check for media messages (photo, document, voice, audio, video, video_note)
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
@@ -697,27 +724,43 @@ export class AgentManager {
         if (isMedia && telegramApi) {
           const downloadDir = join(agentDir, 'telegram-images');
 
-          // Persist the RAW update BEFORE the download/transcribe round trip.
-          // This was the widest loss window in the system: the media block was
-          // queued from an async .then() callback, so the Telegram offset —
-          // an irrevocable claim of delivery — was persisted before the round
-          // trip had even started. A daemon death (or a failed download) in
-          // that window destroyed the message with no trace.
+          // Persist the RAW update BEFORE the download (A3). This was the
+          // widest loss window in the system: the media block was queued from
+          // an async .then() callback, so the Telegram offset — an irrevocable
+          // claim of delivery — was persisted before the round trip had even
+          // started. The record now carries everything a later retry or a
+          // restarted daemon needs to fetch the attachment again (file_id), a
+          // unique destination, and one deadline.
           if (durable) {
-            const caption = stripControlChars(msg.caption || '');
-            const ident = mediaIdentity(msg);
-            const rec = newRecord({
-              update_id: updateId,
-              chat_id: effectiveChatId,
-              from,
-              text: caption,
-              header: headerNeedle(sanitizeForPtyInjection(from), effectiveChatId),
-              note: 'raw media update persisted before download/transcribe',
-              file_id: ident?.file_id,
-              media_type: ident?.media_type,
-              message_id: msg.message_id,
-            });
-            if (!checker.persistPendingTelegram(rec)) return false;
+            const receipt = mediaReceipt(msg, updateId);
+            if (receipt) {
+              const token = telegramToken(updateId);
+              const rec = newRecord({
+                update_id: updateId,
+                chat_id: effectiveChatId,
+                from,
+                text: stripControlChars(msg.caption || ''),
+                token,
+                note: 'media update persisted before download (A3)',
+                file_id: receipt.file_id,
+                media_type: receipt.media_type,
+                message_id: msg.message_id,
+              });
+              rec.media_state = 'pending';
+              rec.media_gen = 1;
+              rec.media_retries = 0;
+              rec.media_deadline_at = new Date(Date.parse(rec.created_at) + checker.pendingQueue().mediaGraceMs).toISOString();
+              rec.media_dest = receipt.media_dest;
+              if (receipt.file_unique_id) rec.file_unique_id = receipt.file_unique_id;
+              if (receipt.file_name) rec.file_name = receipt.file_name;
+              if (receipt.duration !== undefined) rec.media_duration = receipt.duration;
+              if (typeof msg.date === 'number') rec.message_date = msg.date;
+              const res = checker.insertPendingTelegram(rec);
+              if (res === 'write_failed') return false;
+              // A redelivered update ('exists') must not start a second download.
+              if (res === 'inserted') checker.startMediaJob(rec, 1);
+              return true;
+            }
           }
 
           // Counted from here until the round trip settled AND its completion
@@ -825,6 +868,35 @@ export class AgentManager {
         const replyToText = buildReplyContext(msg.reply_to_message);
 
         const recentHistory = buildRecentHistory(this.ctxRoot, name, effectiveChatId, 6) ?? undefined;
+
+        if (durable) {
+          // No content-keyed dedup here on purpose: that check is what
+          // suppressed Scott's verbatim resends. Identity is the update_id —
+          // carried into the block's header as its token (A1), which is how
+          // delivery is later proven from Claude Code's own record.
+          const token = telegramToken(updateId);
+          const rec = newRecord({
+            update_id: updateId,
+            chat_id: effectiveChatId,
+            from,
+            text,
+            formatted: FastChecker.formatTelegramTextMessage(
+              from,
+              effectiveChatId,
+              text,
+              this.frameworkRoot,
+              replyToText,
+              lastSent ?? undefined,
+              recentHistory,
+              token,
+            ),
+            token,
+          });
+          // Return value is the ACK: a failed persist holds the Telegram offset;
+          // a redelivered update that is already recorded is acked as a no-op.
+          return checker.insertPendingTelegram(rec) !== 'write_failed';
+        }
+
         const formatted = FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,
@@ -834,21 +906,6 @@ export class AgentManager {
           lastSent ?? undefined,
           recentHistory,
         );
-
-        if (durable) {
-          // No content-keyed dedup here on purpose: that check is what
-          // suppressed Scott's verbatim resends. Identity is the update_id.
-          const rec = newRecord({
-            update_id: updateId,
-            chat_id: effectiveChatId,
-            from,
-            text,
-            formatted,
-            header: headerNeedle(sanitizeForPtyInjection(from), effectiveChatId),
-          });
-          // Return value is the ACK: a failed persist holds the Telegram offset.
-          return checker.persistPendingTelegram(rec);
-        }
 
         if (checker.isDuplicate(formatted)) {
           log('Duplicate Telegram message suppressed');

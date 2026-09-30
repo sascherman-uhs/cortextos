@@ -1,6 +1,6 @@
-import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync, openSync, readSync, closeSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync, openSync, readSync, closeSync, renameSync, mkdirSync } from 'fs';
 import { execFile } from 'child_process';
-import { join } from 'path';
+import { join, relative, dirname } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
@@ -23,12 +23,27 @@ import {
   readReplyTimestamps,
   sendEvidenceInTranscript,
   strictPromptGateEnabled,
+  clockTime,
+  mediaNoun,
   EMPTY_MEDIA_REPLY,
   LATE_MEDIA_PREFIX,
+  NOTIFY_MAX_ATTEMPTS,
+  PROOF_WINDOW_MS,
   mediaNotArrivedText,
   mediaStillDownloadingNote,
   type PendingTelegramRecord,
 } from '../telegram/pending-queue.js';
+import {
+  bootTurnEnded,
+  claudeProjectDirFor,
+  findSubmission,
+  latestGenuinePrompt,
+  normalizePtyText,
+  sharedScanner,
+  type ClaudeTranscriptScanner,
+  type ScanSnapshot,
+} from '../telegram/submission-proof.js';
+import { PART_FILE_RE } from '../telegram/media.js';
 
 type LogFn = (msg: string) => void;
 
@@ -98,6 +113,42 @@ export class FastChecker {
   // path in this class behaves exactly as it did before 2026-09-24.
   private pending: PendingTelegramQueue;
 
+  // === Provable delivery (A1–A6 / V5, 2026-09-30) ============================
+  /**
+   * How a paste is proven submitted. 'jsonl' (Claude Code runtime): Claude
+   * Code's own session record — see telegram/submission-proof.ts. 'pty' (every
+   * other runtime): the update's token in the normalized PTY output, the best
+   * signal those runtimes offer.
+   */
+  private proofMode: 'jsonl' | 'pty';
+  private scanner: ClaudeTranscriptScanner | null = null;
+  private lastSnap: { at: number; since: number; snap: ScanSnapshot } | null = null;
+  /** PTY instance whose boot turn was observed to end (R4-4). */
+  private bootReadyInstance: string | null = null;
+  private bootHoldLoggedFor: string | null = null;
+  /** V4-3 startup reconciliation runs once, before the first durable cycle acts. */
+  private reconciled = false;
+  private lastPruneAt = 0;
+  /** R4-1 self-check: newest genuine prompt any scan has seen (ms), and when we last complained. */
+  private lastGenuineSeenAt = 0;
+  private lastSchemaWarnAt = 0;
+  private readonly startedAt = Date.now();
+  /** A3: starts (re)downloads. Wired by the daemon; absent in unit tests that do not need it. */
+  private mediaDownloader: MediaDownloader | null = null;
+  /**
+   * A3: completions whose record patch FAILED. Kept in memory and retried each
+   * cycle — never logged as "updated" (A3: every patch checks its boolean).
+   */
+  private pendingMediaPatches = new Map<number, { gen: number; partPath: string | null; transcript?: string; attempts: number }>();
+  /** update_id:gen of media jobs THIS process started (their part files are live). */
+  private jobsStartedHere = new Set<string>();
+  /** Last PTY-token check per record (ms) — the PTY read is rate-limited like the scan. */
+  private ptyCheckedAt = new Map<number, number>();
+  private stuckGateLogged: string | null = null;
+  /** V4-3(d) resume is owed (set by startupReconcile, done once a downloader is wired). */
+  private resumeDue = false;
+  // === END provable delivery (fields) ========================================
+
   // Persistent dedup: message hashes to prevent duplicate delivery
   private seenHashes: Set<string> = new Set();
   private dedupFilePath: string = '';
@@ -135,7 +186,17 @@ export class FastChecker {
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: {
+      pollInterval?: number;
+      log?: LogFn;
+      telegramApi?: TelegramAPI;
+      chatId?: string;
+      allowedUserId?: number;
+      /** Tests: the Claude project dir to prove submissions from (implies 'jsonl'). */
+      claudeProjectDir?: string;
+      /** Tests: force a proof mode. */
+      proofMode?: 'jsonl' | 'pty';
+    } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -150,6 +211,12 @@ export class FastChecker {
       join(paths.stateDir, 'pending-telegram'),
       (msg) => this.log(msg),
     );
+
+    const projectDir = options.claudeProjectDir ?? FastChecker.claudeProjectDirForAgent(agent);
+    this.proofMode = options.proofMode ?? (projectDir ? 'jsonl' : 'pty');
+    if (this.proofMode === 'jsonl' && projectDir) {
+      this.scanner = sharedScanner(projectDir, (m) => this.log(m));
+    }
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -179,9 +246,24 @@ export class FastChecker {
       process.on('SIGUSR1', sigusr1Handler);
     }
 
-    // Wait for bootstrap
-    await this.waitForBootstrap();
-    this.log('Bootstrap complete. Beginning poll loop.');
+    // V4-3: reconcile the durable queue before the first poll cycle acts
+    // (interrupted archives, media left mid-download by a previous process).
+    if (durableQueueEnabled() && !this.reconciled) {
+      this.reconciled = true;
+      try {
+        this.startupReconcile();
+      } catch (err) {
+        this.log(`Startup reconciliation error: ${String(err)}`);
+      }
+    }
+
+    // Wait for bootstrap. R4-4: the timeout path used to log the same
+    // "Bootstrap complete" line as success. It no longer does, and nothing
+    // treats it as ready — the boot hold checks readiness per PTY itself.
+    const bootstrapped = await this.waitForBootstrap();
+    this.log(bootstrapped
+      ? 'Bootstrap complete. Beginning poll loop.'
+      : 'Bootstrap NOT observed within the wait — beginning poll loop anyway (Telegram injection stays held until this PTY is ready).');
 
     const agentName = this.agent.name;
 
@@ -273,6 +355,25 @@ export class FastChecker {
         : `FAILED to persist pending Telegram update ${rec.update_id} — holding Telegram offset`,
     );
     return ok;
+  }
+
+  /**
+   * Create-if-absent (A4). Returns the poller ACK: true when the update is
+   * durably held — newly inserted, OR already pending / archived (Telegram
+   * redelivered an update we already took; the redelivery is a no-op and must
+   * not overwrite a record that may be mid-download, pasted or answered).
+   * false only when nothing durable could be written.
+   */
+  insertPendingTelegram(rec: PendingTelegramRecord): 'inserted' | 'exists' | 'write_failed' {
+    const res = this.pending.insert(rec);
+    this.log(
+      res === 'inserted'
+        ? `Persisted pending Telegram update ${rec.update_id} (chat ${rec.chat_id})`
+        : res === 'exists'
+          ? `Telegram update ${rec.update_id} redelivered — already recorded, ignored`
+          : `FAILED to persist pending Telegram update ${rec.update_id} — holding Telegram offset`,
+    );
+    return res;
   }
 
   /** Patch a persisted record (e.g. attach the formatted block after a media round trip). */
@@ -386,8 +487,10 @@ export class FastChecker {
     if (this.chatId && this.telegramApi && this.isAgentActive()) {
       await this.sendTyping(this.telegramApi, this.chatId);
       // isAgentActive() also resets the ack turn when it observes a reply, so
-      // this must run after it, not before.
-      await this.maybeSendSlowTurnAck(this.telegramApi, this.chatId);
+      // this must run after it, not before. In durable mode the per-record
+      // receipt acks (A6, durableTelegramCycle step 5) replace this per-turn
+      // ack — running both would acknowledge the same message twice.
+      if (!durable) await this.maybeSendSlowTurnAck(this.telegramApi, this.chatId);
     }
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
@@ -395,68 +498,71 @@ export class FastChecker {
   }
 
   /**
-   * One durable Telegram cycle: prove, reap, escalate, then inject exactly ONE
-   * message.
+   * One durable Telegram cycle: land media, prove submissions, reap, notify,
+   * acknowledge, then inject exactly ONE message.
    *
-   * Ordering matters. Header observation first (it only changes retry
-   * eligibility), then reaping on OBSERVED REPLIES — the sole evidence that
-   * deletes a pending file — then the attempt-cap admission, then at most one
+   * Ordering matters. Media deadlines first (a record may become injectable or
+   * need a notice). Then submission proof (it only changes what a record
+   * awaits, never deletes it), then reaping on OBSERVED REPLIES — the sole
+   * evidence that retires a record, and now into the resolved archive rather
+   * than the bin — then the notices, the receipt acks, and at most one
    * injection. One file, one injection, one accounting row: fusing several
    * messages into one block made per-message durability incoherent and made a
    * block count as "answered" when only its last line was.
    */
   private async durableTelegramCycle(): Promise<void> {
+    if (!this.reconciled) {
+      this.reconciled = true;
+      this.startupReconcile();
+    }
     const now = Date.now();
     const replies = readReplyTimestamps(join(this.paths.logDir, 'outbound-messages.jsonl'));
 
-    // Reply evidence is a UNION over every rail an agent can answer on, because
-    // the cortextos rail alone is demonstrably incomplete: on 2026-09-24 Scott
-    // got a real reply that left no row in outbound-messages.jsonl, because the
-    // agent used uhsJARVIS scripts/telegram-send.sh, which POSTs straight to
-    // api.telegram.org and records nothing. Rails covered:
-    //   1. outbound-messages.jsonl (cortextos bus send-telegram) — strongest,
-    //      timestamped, proves Telegram accepted the send.
+    // Reply evidence = a send Telegram ACCEPTED, on either rail that records one:
+    //   1. outbound-messages.jsonl — the cortextos rail, and since 2026-09-30
+    //      the uhsJARVIS shell rail too (telegram-send.sh appends when a fleet
+    //      agent sends and Telegram answers ok:true — V4-6);
     //   2. state/<agent>/last-telegram-<chat>.txt (cacheLastSent) — survives a
     //      truncated/rotated log.
-    //   3. the PTY transcript after the injection's byte watermark — catches
-    //      EVERY rail, because any send an agent performs is a command it runs
-    //      in its own session.
+    // A send ATTEMPT seen in the PTY transcript is no longer reply evidence
+    // (A2): it proved only that a command ran, and its needle-matching let the
+    // injected block "answer" itself.
     const answered = (rec: PendingTelegramRecord): boolean => {
       if (rec.attempts < 1) return false;
       if (this.pending.repliedInOutboundLog(rec, replies)) return true;
-      if (this.lastSentTouchedAfter(rec)) return true;
-      return this.sendObservedInTranscript(rec);
+      return this.lastSentTouchedAfter(rec);
     };
 
-    // 1. Transcript proof: the header appearing in the stripped PTY output
-    //    proves the TUI CONSUMED the block. unattempted -> in_flight. This
-    //    NEVER deletes the file — see pending-queue.ts for why that is the
-    //    single most important rule in this design.
-    for (const rec of this.pending.list()) {
-      if (rec.state === 'unattempted' && rec.attempts > 0 && rec.header && this.agent.transcriptContains(rec.header)) {
-        this.pending.markInFlight(rec);
-        this.log(`Pending ${rec.update_id}: header seen in transcript — in_flight (consumed, NOT answered)`);
-      }
+    // 0. Media (A3): resume what a previous process left mid-download, retry
+    //    completions whose patch failed last time, then deadlines.
+    this.resumeInterruptedMedia();
+    this.retryPendingMediaPatches();
+    this.processMediaDeadlines(now);
+
+    // 1. Submission / consumption proof. Never deletes anything.
+    this.proveConsumption(now);
+
+    // 2. Only an observed reply to that chat retires a message — into the
+    //    resolved archive (C2), where the watchdog can still see it.
+    const reaped = this.pending.reapAnswered(answered);
+    if (reaped > 0) this.log(`Pending: ${reaped} message(s) answered on some rail — archived to pending-telegram-resolved/`);
+    if (now - this.lastPruneAt > 60 * 60_000) {
+      this.lastPruneAt = now;
+      this.pending.pruneResolved(now);
     }
 
-    // 2. Only an observed reply to that chat retires a message.
-    const reaped = this.pending.reapAnswered(answered);
-    if (reaped > 0) this.log(`Pending: ${reaped} message(s) answered on some rail — files removed`);
-
-    // 3a. TRUE drops only: the header never appeared, so the block never reached
-    //     the TUI, and the attempts are spent. These — and ONLY these — earn an
-    //     admission to the human.
+    // 3a. TRUE drops only (see dropCandidates): positive non-delivery evidence,
+    //     or a legacy record whose header never appeared. These — and ONLY
+    //     these — earn an admission to the human, recorded only once it was
+    //     actually sent (A5).
     for (const rec of this.pending.dropCandidates(now, answered)) {
-      const text = admissionText(rec.text);
-      if (this.telegramApi) {
-        try {
-          await this.telegramApi.sendMessage(rec.chat_id, text);
-        } catch (err) {
-          this.log(`Pending ${rec.update_id}: admission send failed: ${String(err)}`);
-        }
-      }
-      this.pending.markEscalated(rec, `never consumed after ${rec.attempts} attempts — admitted to the human`);
-      this.log(`Pending ${rec.update_id}: DROP CONFIRMED (header never appeared in ${rec.attempts} attempts) — admitted the miss to chat ${rec.chat_id}`);
+      const why = rec.token
+        ? `nothing reached the agent on ${rec.nondelivery_failures ?? 0} attempts (PTY absent / paste failed before any byte)`
+        : `header never appeared in ${rec.attempts} attempts`;
+      await this.notifyThenMark(rec, admissionText(rec.text), 'admission', (cur, sent) =>
+        this.pending.markEscalated(cur, sent ? `never delivered: ${why} — admitted to the human` : `never delivered: ${why} — the admission could NOT be sent`, sent ? {} : {}),
+        () => this.log(`Pending ${rec.update_id}: DROP CONFIRMED (${why}) — admitted the miss to chat ${rec.chat_id}`),
+      );
     }
 
     // 3b. Consumed, but no reply we can see on any rail. An observability gap,
@@ -471,72 +577,270 @@ export class FastChecker {
       );
       this.log(
         `Pending ${rec.update_id}: UNVERIFIED — block was consumed but no reply is observable on any rail. ` +
-        'Nothing sent to the human; record retained for audit.',
+        'Nothing sent to the human; record retained for audit (a later reply still resolves it).',
       );
     }
 
     // 4. Empty media can never be injected — an empty block is unanswerable by
     //    construction. Tell the sender instead of going silent, and keep the
-    //    record. Both halves ship together: a guard with no notice would turn a
-    //    broken answer into silence, which is worse.
-    for (const rec of this.pending.list()) {
+    //    record — marked only once the notice was actually sent (A5).
+    for (const rec of this.pending.active()) {
       if (!rec.empty || rec.state !== 'unattempted') continue;
-      if (this.telegramApi) {
-        try {
-          await this.telegramApi.sendMessage(rec.chat_id, EMPTY_MEDIA_REPLY);
-        } catch (err) {
-          this.log(`Pending ${rec.update_id}: empty-media notice failed: ${String(err)}`);
-        }
-      }
-      this.pending.markFailedNotified(rec, 'media yielded no text and no transcript — sender notified');
-      this.log(`Pending ${rec.update_id}: empty media — sender notified, not injected`);
+      await this.notifyThenMark(rec, EMPTY_MEDIA_REPLY, 'empty-media', (cur, sent) =>
+        this.pending.markFailedNotified(cur, sent
+          ? 'media yielded no text and no transcript — sender notified'
+          : 'media yielded no text and no transcript — the notice could NOT be sent'),
+        () => this.log(`Pending ${rec.update_id}: empty media — sender notified, not injected`),
+      );
     }
 
-    // 4b. Captionless media whose download did not land inside the grace
-    //     window (MEDIA_GRACE_MS) — still in flight, or the daemon really did
-    //     die mid-download. There is nothing to inject, so tell the sender.
-    //     The record is marked ONLY after the notice was actually sent; a
-    //     failed send is retried next cycle. (2026-09-30: this used to be
-    //     marked failed_notified ~1s after receipt, with no notice, while the
-    //     download was still running — 23 of 25 photos lost.)
+    // 4b. Legacy/A0 raw captionless media whose grace ran out (A3 records are
+    //     handled by 4c). Marked ONLY after the notice was sent; a failed send
+    //     is retried next cycle, at most NOTIFY_MAX_ATTEMPTS times (A5).
     for (const rec of this.pending.expiredCaptionlessMedia(now)) {
-      if (!this.telegramApi) continue;
-      try {
-        await this.telegramApi.sendMessage(rec.chat_id, mediaNotArrivedText(rec));
-      } catch (err) {
-        this.log(`Pending ${rec.update_id}: media-not-arrived notice failed — will retry next cycle: ${String(err)}`);
-        continue;
-      }
-      // Re-read: the download may have landed while the send was awaited.
-      const cur = this.pending.read(rec.update_id);
-      if (!cur) continue;
-      if (cur.formatted !== '' && cur.state === 'unattempted') {
-        const ok = this.pending.patch(cur.update_id, {
-          formatted: cur.formatted.startsWith(LATE_MEDIA_PREFIX) ? cur.formatted : `${LATE_MEDIA_PREFIX}\n${cur.formatted}`,
-          notes: [...cur.notes, 'media landed while the resend notice was being sent — delivering it'],
-        });
-        this.log(
-          ok
+      await this.notifyThenMark(rec, mediaNotArrivedText(rec), 'media-not-arrived', (cur, sent) => {
+        // The download may have landed while the send was awaited.
+        if (cur.formatted !== '' && cur.state === 'unattempted') {
+          const ok = this.pending.patch(cur.update_id, {
+            formatted: cur.formatted.startsWith(LATE_MEDIA_PREFIX) ? cur.formatted : `${LATE_MEDIA_PREFIX}\n${cur.formatted}`,
+            notes: [...cur.notes, 'media landed while the resend notice was being sent — delivering it'],
+            ...(sent ? { notified_at: new Date().toISOString() } : {}),
+          }, { expectRev: cur.rev ?? 0 });
+          this.log(ok
             ? `Pending ${cur.update_id}: media landed during the resend notice — delivering it with a late note`
-            : `ERROR: Pending ${cur.update_id}: could not write the late note — record left as it was`,
-        );
-        continue;
-      }
-      if (cur.formatted !== '' || cur.state !== 'unattempted') continue;
-      const marked = this.pending.markFailedNotified(
-        cur,
-        'media did not arrive within the grace window — sender asked to resend',
-      );
-      this.log(
-        marked
-          ? `Pending ${cur.update_id}: media not arrived after grace — sender asked to resend, not injected`
-          : `ERROR: Pending ${cur.update_id}: resend notice SENT but the record could not be marked — it may be sent again`,
-      );
+            : `ERROR: Pending ${cur.update_id}: could not write the late note — record left as it was`);
+          return ok;
+        }
+        if (cur.formatted !== '' || cur.state !== 'unattempted') return cur;
+        return this.pending.markFailedNotified(cur, sent
+          ? 'media did not arrive within the grace window — sender asked to resend'
+          : 'media did not arrive within the grace window — the resend notice could NOT be sent');
+      }, () => this.log(`Pending ${rec.update_id}: media not arrived after grace — sender asked to resend, not injected`));
     }
 
-    // 5. Inject exactly one.
+    // 4c. A3: captionless media that failed for good. Nothing to inject; tell the sender.
+    for (const rec of this.pending.active()) {
+      if (rec.media_state !== 'failed' || rec.state !== 'unattempted' || rec.formatted !== '' || rec.text.trim()) continue;
+      await this.notifyThenMark(rec, mediaNotArrivedText(rec), 'media-failed', (cur, sent) => {
+        if (cur.media_state === 'ready' && cur.state === 'unattempted' && cur.attempts === 0) {
+          // It landed while the notice was in flight: the sender WAS told it
+          // hadn't come through, so the block must say it arrived late.
+          if (!sent || cur.formatted.startsWith(LATE_MEDIA_PREFIX)) return cur;
+          return this.pending.patch(cur.update_id, {
+            formatted: `${LATE_MEDIA_PREFIX}\n${cur.formatted}`,
+            notes: [...cur.notes, 'media landed while the resend notice was being sent — delivering it with a late note'],
+          }, { expectRev: cur.rev ?? 0 });
+        }
+        if (cur.media_state !== 'failed' || cur.state !== 'unattempted') return cur; // landed late meanwhile
+        return this.pending.markFailedNotified(cur, sent
+          ? 'media failed to download after a retry — sender asked to resend'
+          : 'media failed to download after a retry — the resend notice could NOT be sent');
+      }, () => this.log(`Pending ${rec.update_id}: media FAILED (no caption) — sender asked to resend, not injected`));
+    }
+
+    // 4d. V5-2c: one truthful receipt per stuck paste.
+    for (const rec of this.pending.active()) {
+      if (rec.submit_phase !== 'stuck' || rec.stuck_receipt_at || rec.notify_failed) continue;
+      await this.sendStuckReceipt(rec);
+    }
+
+    // 5. A6: receipt acks by unacknowledged receipt, independent of the agent.
+    await this.processReceiptAcks(now);
+
+    // 6. Inject exactly one.
+    await this.injectNext(now, answered);
+  }
+
+  /**
+   * A5: send a notice about ONE record and only then record it.
+   *
+   * `mark(cur, sent)` runs after the await on a FRESH read of the record (it
+   * may have changed while the send was in flight) and returns the patched
+   * record, or null if the write failed. A failed send is retried next cycle;
+   * after NOTIFY_MAX_ATTEMPTS the record is marked anyway, with
+   * `notify_failed: true`, which the watchdog reports — so a dead Telegram API
+   * cannot keep a record spinning forever, and cannot hide either.
+   */
+  private async notifyThenMark(
+    rec: PendingTelegramRecord,
+    text: string,
+    what: string,
+    mark: (cur: PendingTelegramRecord, sent: boolean) => PendingTelegramRecord | null | boolean,
+    onSent: () => void,
+  ): Promise<void> {
+    let sent = false;
+    let error = '';
+    if (!this.telegramApi) {
+      error = 'no Telegram API configured';
+    } else {
+      try {
+        await this.telegramApi.sendMessage(rec.chat_id, text);
+        sent = true;
+      } catch (err) {
+        error = String(err);
+      }
+    }
+    const cur = this.pending.read(rec.update_id);
+    if (!cur) return;
+    if (sent) {
+      const marked = mark(cur, true);
+      if (!marked) {
+        this.log(`ERROR: Pending ${cur.update_id}: ${what} notice SENT but the record could not be marked — it may be sent again`);
+        return;
+      }
+      const after = this.pending.read(cur.update_id);
+      if (after && !after.notified_at) this.pending.patch(after.update_id, { notified_at: new Date().toISOString() }, { expectRev: after.rev ?? 0 });
+      onSent();
+      return;
+    }
+    const attempts = (cur.notify_attempts ?? 0) + 1;
+    if (attempts >= NOTIFY_MAX_ATTEMPTS || !this.telegramApi) {
+      const marked = mark(cur, false);
+      const after = this.pending.read(cur.update_id);
+      if (after) {
+        this.pending.patch(after.update_id, {
+          notify_attempts: attempts,
+          notify_failed: true,
+          notes: [...after.notes, `${what} notice failed ${attempts} time(s) — giving up: ${error}`],
+        }, { expectRev: after.rev ?? 0 });
+      }
+      this.log(`ERROR: Pending ${cur.update_id}: ${what} notice FAILED ${attempts} time(s) — notify_failed recorded${marked ? '' : ' (and the record could not be marked)'}: ${error}`);
+      return;
+    }
+    this.pending.patch(cur.update_id, { notify_attempts: attempts }, { expectRev: cur.rev ?? 0 });
+    this.log(`Pending ${cur.update_id}: ${what} notice failed — will retry next cycle (attempt ${attempts}/${NOTIFY_MAX_ATTEMPTS}): ${error}`);
+  }
+
+  /** V5-2c: "received — JARVIS hasn't picked it up yet", once, recorded only when sent. */
+  private async sendStuckReceipt(rec: PendingTelegramRecord): Promise<void> {
+    const text =
+      `Received your message from ${clockTime(rec.created_at)} — JARVIS hasn't picked it up yet. ` +
+      'Automatic receipt, not an answer; the stuck delivery has been flagged.';
+    let error = '';
+    if (this.telegramApi) {
+      try {
+        await this.telegramApi.sendMessage(rec.chat_id, text);
+        const cur = this.pending.read(rec.update_id);
+        if (!cur) return;
+        const ok = this.pending.patch(cur.update_id, { stuck_receipt_at: new Date().toISOString() }, { expectRev: cur.rev ?? 0 });
+        this.log(ok
+          ? `Pending ${rec.update_id}: stuck receipt sent to chat ${rec.chat_id}`
+          : `ERROR: Pending ${rec.update_id}: stuck receipt SENT but not recorded — it may be sent again`);
+        return;
+      } catch (err) {
+        error = String(err);
+      }
+    } else {
+      error = 'no Telegram API configured';
+    }
+    const cur = this.pending.read(rec.update_id);
+    if (!cur) return;
+    const attempts = (cur.stuck_receipt_attempts ?? 0) + 1;
+    const giveUp = attempts >= NOTIFY_MAX_ATTEMPTS || !this.telegramApi;
+    this.pending.patch(cur.update_id, {
+      stuck_receipt_attempts: attempts,
+      ...(giveUp ? { notify_failed: true, notes: [...cur.notes, `stuck receipt failed ${attempts} time(s) — giving up: ${error}`] } : {}),
+    }, { expectRev: cur.rev ?? 0 });
+    this.log(giveUp
+      ? `ERROR: Pending ${rec.update_id}: stuck receipt FAILED ${attempts} time(s) — notify_failed recorded: ${error}`
+      : `Pending ${rec.update_id}: stuck receipt failed (attempt ${attempts}/${NOTIFY_MAX_ATTEMPTS}) — will retry: ${error}`);
+  }
+
+  /**
+   * A6 — receipt acks driven by the records themselves, not by agent activity.
+   *
+   * The old slow-turn ack fired only while isAgentActive() said a turn was
+   * open, so a message queued behind a strict gate, a boot window or a stuck
+   * paste got no ack at all. Now, per chat, every cycle:
+   *   stage 1 — records with ack_stage 0 older than the ack delay (45 s) get
+   *             ONE ack covering all of them;
+   *   stage 2 — records with ack_stage 1 older than 10 min get ONE follow-up.
+   * A record's stage is persisted ONLY after its ack was sent, so a failed
+   * send retries next cycle and a restart never repeats an ack — except the
+   * documented crash window between a successful send and the persist, which
+   * can repeat ONE ack. Stages are per record: an old acked record cannot
+   * suppress a new one. Acks are never written to outbound-messages.jsonl — an
+   * ack is proof of receipt, not an answer.
+   *
+   * Records written before this change carry no ack_stage and are never acked.
+   */
+  private async processReceiptAcks(now: number): Promise<void> {
+    if (!this.telegramApi) return;
+    const delay = this.slowAckDelayMs();
+    if (delay === 0) return;
+    const live = (r: PendingTelegramRecord) =>
+      r.ack_stage !== undefined && !r.empty && (r.state === 'unattempted' || r.state === 'in_flight' || r.state === 'unverified');
+    const byChat = new Map<string, PendingTelegramRecord[]>();
+    for (const r of this.pending.active()) {
+      if (!live(r)) continue;
+      const list = byChat.get(r.chat_id) ?? [];
+      list.push(r);
+      byChat.set(r.chat_id, list);
+    }
+    for (const [chatId, recs] of byChat) {
+      const age = (r: PendingTelegramRecord) => now - Date.parse(r.created_at);
+      const stage1 = recs.filter((r) => r.ack_stage === 0 && r.state !== 'unverified' && age(r) >= delay);
+      if (stage1.length > 0) await this.sendAckStage(chatId, stage1, 1, now);
+      const stage2 = recs.filter((r) => r.ack_stage === 1 && age(r) >= ACK_FOLLOWUP_MS);
+      if (stage2.length > 0) await this.sendAckStage(chatId, stage2, 2, now);
+    }
+  }
+
+  private async sendAckStage(chatId: string, recs: PendingTelegramRecord[], stage: 1 | 2, now: number): Promise<void> {
+    const consumed = (r: PendingTelegramRecord) => !!r.in_flight_at || r.submit_phase === 'submitted';
+    const n = recs.length;
+    const subject = n === 1 ? 'your message' : `your ${n} messages`;
+    const oldest = recs.reduce((a, b) => (Date.parse(a.created_at) <= Date.parse(b.created_at) ? a : b));
+    const all = recs.every(consumed);
+    const none = !recs.some(consumed);
+    // Say only what the records know: received; whether Claude Code recorded
+    // the prompt; no reply observed. Never "working on it".
+    const status = all
+      ? (n === 1 ? 'JARVIS has it; no reply yet.' : 'JARVIS has them; no reply yet.')
+      : none
+        ? "JARVIS hasn't picked it up yet — it is queued."
+        : 'JARVIS has some of them; no reply yet.';
+    const text = stage === 1
+      ? `Received ${subject} (${Math.round((now - Date.parse(oldest.created_at)) / 1000)}s ago) — automatic receipt, not an answer. ${status}`
+      : `Still no reply observed to ${subject} from ${clockTime(oldest.created_at)} — automatic notice, not an answer. ${status}`;
+    try {
+      await this.telegramApi!.sendMessage(chatId, text);
+    } catch (err) {
+      this.log(`Receipt ack (stage ${stage}) FAILED for ${n} message(s) in chat ${chatId} — will retry next cycle: ${String(err)}`);
+      return;
+    }
+    const at = new Date().toISOString();
+    let persisted = 0;
+    for (const r of recs) {
+      const cur = this.pending.read(r.update_id);
+      if (!cur || cur.ack_stage === undefined || cur.ack_stage >= stage) continue;
+      const ok = this.pending.patch(cur.update_id, stage === 1 ? { ack_stage: 1, ack1_at: at } : { ack_stage: 2, ack2_at: at }, { expectRev: cur.rev ?? 0 });
+      if (ok) persisted++;
+      else this.log(`ERROR: Pending ${cur.update_id}: ack stage ${stage} SENT but not persisted — a restart may repeat it`);
+    }
+    this.log(`Receipt ack stage ${stage} sent for ${n} message(s) in chat ${chatId} (${persisted} persisted)`);
+  }
+
+  /** Step 6: gates, persist-before-write, then ONE paste. */
+  private async injectNext(now: number, answered: (rec: PendingTelegramRecord) => boolean): Promise<void> {
     const next = this.pending.nextDeliverable(now, answered);
     if (!next) return;
+
+    // V5-2a: the boot window of THIS PTY (JSONL runtimes).
+    if (this.bootHoldActive(now)) return;
+
+    // V5-2c: a paste into this PTY is still unproven (pasted) or stuck — later
+    // messages queue rather than pile into a composer that may not be submitting.
+    const inst = this.currentPtyInstance();
+    const gate = this.stuckGate(inst);
+    if (gate) {
+      const key = `${gate.update_id}:${gate.submit_phase}:${next.update_id}`;
+      if (this.stuckGateLogged !== key) {
+        this.stuckGateLogged = key;
+        this.log(`Pending ${next.update_id}: HELD — update ${gate.update_id} is ${gate.submit_phase} in this PTY (no proof of submission yet)`);
+      }
+      return;
+    }
 
     let block = next.formatted;
     if (!block) {
@@ -545,19 +849,26 @@ export class FastChecker {
       // returns a raw record inside the grace window, and never one with no
       // caption (step 4b handles those), so this carries the caption plus a
       // note that the attachment is still owed. A later completion re-arms or
-      // updates the record (applyMediaCompletion).
+      // updates the record (applyMediaCompletion). Legacy/A0 shape only.
       if (!next.text.trim()) return; // defensive: never inject an empty block
       block = FastChecker.formatTelegramTextMessage(
         next.from,
         next.chat_id,
         `${next.text}\n${mediaStillDownloadingNote(next.media_type)}`,
         this.frameworkRoot,
+        undefined,
+        undefined,
+        undefined,
+        next.token,
       );
       const ok = this.pending.patch(next.update_id, {
         formatted: block,
         notes: [...next.notes, 'media not arrived after grace — injecting the caption with a still-downloading note'],
       });
-      if (!ok) this.log(`ERROR: Pending ${next.update_id}: could not persist the caption block — injecting it anyway`);
+      if (!ok) {
+        this.log(`ERROR: Pending ${next.update_id}: could not persist the caption block — ${next.token ? 'NOT injecting this cycle' : 'injecting it anyway'}`);
+        if (next.token) return;
+      }
     }
 
     // Prompt-state gate. SOFT for the first 24h: log what it WOULD have held
@@ -576,6 +887,12 @@ export class FastChecker {
       this.ackTurnQueuedBehindWork = true;
     }
 
+    if (next.token) {
+      await this.pasteWithAccounting(next, block, inst);
+      return;
+    }
+
+    // ---- Legacy record (written before 2026-09-30): the old header-needle path.
     const attemptNo = next.attempts + 1;
     let payload = block;
     if (attemptNo > 1) {
@@ -606,17 +923,573 @@ export class FastChecker {
     // Byte watermark for send-evidence scanning: a rail that writes no
     // timestamps still gives a rigorous "after the injection" ordering.
     this.pending.patch(next.update_id, { log_offset: this.stdoutLogSizeNow() });
-    this.lastMessageInjectedAt = Date.now();
-    // Arm the slow-turn ack clock (973573e) on the durable path too. That
-    // feature anchors off `hasTelegramMessage`, which is only set by the
-    // in-memory drain above — so with TELEGRAM_DURABLE_QUEUE on, a seventeen-
-    // minute silence would go unacknowledged again. A flag of mine must not
-    // quietly switch off someone else's gate. Same semantics: anchor to the
-    // FIRST unanswered message, count every one.
-    if (this.ackTurnStartedAt === 0) this.ackTurnStartedAt = Date.now();
-    this.ackTurnMessageCount++;
+    this.noteTelegramInjected();
     this.log(`Pending ${next.update_id}: injected attempt ${attemptNo} (${payload.length} bytes) — awaiting a reply before deletion`);
     await sleep(5000);
+  }
+
+  /**
+   * R4-2 + V5-3 for a record with a token: write the attempt's accounting
+   * (verified), THEN paste. A paste that wrote nothing is positive
+   * non-delivery and is undone for a later retry; anything else — including a
+   * paste that threw after some bytes — is UNKNOWN until Claude Code's record
+   * shows the token, and is never pasted again.
+   */
+  private async pasteWithAccounting(next: PendingTelegramRecord, block: string, inst: string | null): Promise<void> {
+    const watermark = this.stdoutLogSizeNow();
+    const begun = this.pending.beginPaste(next, { at: new Date(), ptyInstance: inst ?? 'none', logOffset: watermark });
+    if (!begun) {
+      this.log(`ERROR: Pending ${next.update_id}: could not persist the paste accounting — NOT injecting this cycle`);
+      return;
+    }
+    const key = `tg:${next.update_id}#${begun.attempts}.${next.nondelivery_failures ?? 0}`;
+    const res = this.agent.injectMessageDetailed(block, key);
+    if (!res.ok) {
+      const partial = res.code === 'WRITE_FAILED' && (res as { partial?: boolean }).partial === true;
+      if (partial) {
+        // Bytes reached the PTY: we cannot know what the TUI has. UNKNOWN — the
+        // record stays `pasted`; proof or the stuck timer decides what happens.
+        this.pending.patch(begun.update_id, { write_error: res.message, notes: [...begun.notes, `paste threw after some bytes were written: ${res.message}`] }, { expectRev: begun.rev ?? 0 });
+        this.log(`Pending ${next.update_id}: paste PARTIALLY written (${res.message}) — delivery state UNKNOWN, not retried`);
+        return;
+      }
+      const undone = this.pending.abortPaste(begun, `inject failed (${res.code}) before any byte reached the PTY: ${res.message}`);
+      this.log(undone
+        ? `Pending ${next.update_id}: inject failed (${res.code}) — nothing reached the PTY; retained for retry: ${res.message}`
+        : `ERROR: Pending ${next.update_id}: inject failed (${res.code}) and the accounting could not be undone — it stays UNKNOWN: ${res.message}`);
+      return;
+    }
+    this.noteTelegramInjected();
+    this.log(`Pending ${next.update_id}: pasted ${telegramTokenLabel(begun)} (${block.length} bytes) into PTY ${(inst ?? 'none').slice(0, 8)} — awaiting proof of submission`);
+    await sleep(5000);
+  }
+
+  /** Typing indicator + legacy slow-turn ack bookkeeping after any Telegram paste. */
+  private noteTelegramInjected(): void {
+    this.lastMessageInjectedAt = Date.now();
+    // Arm the slow-turn ack clock (973573e) on the durable path too. Same
+    // semantics: anchor to the FIRST unanswered message, count every one.
+    if (this.ackTurnStartedAt === 0) this.ackTurnStartedAt = Date.now();
+    this.ackTurnMessageCount++;
+  }
+
+  private currentPtyInstance(): string | null {
+    const a = this.agent as unknown as { getPtyInstance?: () => string | null };
+    return typeof a.getPtyInstance === 'function' ? a.getPtyInstance() : 'unknown';
+  }
+
+  /** A paste in THIS PTY with no proof of submission yet, or stuck (V5-2c). */
+  private stuckGate(inst: string | null): PendingTelegramRecord | null {
+    if (!inst) return null;
+    return (
+      this.pending.active().find(
+        (r) =>
+          !!r.token &&
+          r.pty_instance === inst &&
+          (r.submit_phase === 'pasted' || r.submit_phase === 'stuck') &&
+          !r.proof_window_closed_at,
+      ) ?? null
+    );
+  }
+
+  /**
+   * V5-2a / R4-4: hold Telegram injection while THIS PTY is booting.
+   *
+   * Released for a PTY instance only when (1) its output shows a successful
+   * bootstrap (the ring buffer is per PTY, so a previous generation's output
+   * cannot count, and the bootstrap-TIMEOUT path never marks anything ready),
+   * and (2) Claude Code's session record shows this spawn's boot prompt (by
+   * its unique `Current UTC time:` marker) followed by a turn end. Every
+   * respawn is a new instance and starts held again. BOOT_HOLD_MAX_MS bounds
+   * the hold: a hold that can last forever is a new way to lose messages.
+   */
+  private bootHoldActive(now: number): boolean {
+    if (this.proofMode !== 'jsonl' || !this.scanner) return false;
+    const a = this.agent as unknown as {
+      getPtyInstance?: () => string | null;
+      getPtySpawnedAt?: () => number;
+      getBootMarker?: () => string | null;
+    };
+    if (typeof a.getPtyInstance !== 'function') return false;
+    const inst = a.getPtyInstance();
+    if (!inst) return false; // no PTY: the paste itself reports NOT_RUNNING
+    if (this.bootReadyInstance === inst) return false;
+    const spawnedAt = a.getPtySpawnedAt?.() ?? 0;
+    const marker = a.getBootMarker?.() ?? null;
+    const held = (why: string): boolean => {
+      if (this.bootHoldLoggedFor !== `${inst}:${why}`) {
+        this.bootHoldLoggedFor = `${inst}:${why}`;
+        this.log(`Telegram injection HELD — boot window of PTY ${inst.slice(0, 8)}: ${why}`);
+      }
+      return true;
+    };
+    const release = (why: string): boolean => {
+      this.bootReadyInstance = inst;
+      this.log(`Telegram injection RELEASED for PTY ${inst.slice(0, 8)}: ${why}`);
+      return false;
+    };
+    const overdue = spawnedAt > 0 && now - spawnedAt >= bootHoldMaxMs();
+    if (!this.agent.isBootstrapped()) {
+      if (overdue) return release(`LOUD: no successful bootstrap observed ${Math.round((now - spawnedAt) / 1000)}s after spawn — releasing on the ${Math.round(bootHoldMaxMs() / 60_000)}-min bound; stuck detection still guards every paste`);
+      return held('bootstrap not observed for this PTY');
+    }
+    if (!marker) return release('bootstrap observed; this spawn has no boot marker to bind a turn end to');
+    const snap = this.transcriptSnapshot(spawnedAt - 60_000, now);
+    const r = bootTurnEnded(snap, marker);
+    if (r.ready) return release(`boot turn ended at ${new Date(r.turnEndTs!).toISOString()} (Claude Code session record)`);
+    if (overdue) {
+      return release(
+        r.promptTs
+          ? `LOUD: the boot turn has not ended ${Math.round((now - spawnedAt) / 1000)}s after spawn — releasing on the bound`
+          : `LOUD: this spawn's boot prompt was never recorded as a genuine prompt in ${this.scanner.projectDir} — ` +
+            'the Claude Code JSONL schema may have changed, and submission proof will read UNKNOWN',
+      );
+    }
+    return held(r.promptTs ? 'boot turn still running' : 'boot prompt not recorded yet');
+  }
+
+  /** One scan per ≤5 s, shared by the boot hold and the proof pass (R4-5 cadence). */
+  private transcriptSnapshot(sinceMs: number, now: number): ScanSnapshot {
+    const last = this.lastSnap;
+    if (last && now - last.at < PROOF_SCAN_MIN_INTERVAL_MS && last.since <= sinceMs) return last.snap;
+    const snap = this.scanner!.scan(sinceMs);
+    this.lastSnap = { at: now, since: sinceMs, snap };
+    if (snap.error) this.log(`Submission proof: ${snap.error}`);
+    const newest = latestGenuinePrompt(snap);
+    if (newest > this.lastGenuineSeenAt) this.lastGenuineSeenAt = newest;
+    // R4-1 self-check: scans are running, yet no genuine prompt anywhere in the
+    // project dir for 24 h => the provenance schema probably changed.
+    if (
+      now - this.startedAt > PROOF_WINDOW_MS &&
+      now - this.lastGenuineSeenAt > PROOF_WINDOW_MS &&
+      now - this.lastSchemaWarnAt > 60 * 60_000
+    ) {
+      this.lastSchemaWarnAt = now;
+      this.log(
+        `LOUD: no genuine submitted prompt has matched the Claude Code JSONL provenance schema in 24 h (${this.scanner!.projectDir}). ` +
+        'Every submission will read UNKNOWN until the schema rules in telegram/submission-proof.ts are updated.',
+      );
+    }
+    if (snap.durationMs > 250) this.log(`Submission proof scan took ${Math.round(snap.durationMs)} ms (${snap.filesRead} read / ${snap.filesConsidered} files; p95 ${Math.round(this.scanner!.p95())} ms)`);
+    return snap;
+  }
+
+  /**
+   * Step 1: move pastes forward on evidence only.
+   *
+   * Records with a token: proof comes from Claude Code's record ('jsonl') or,
+   * for runtimes without one, the token in normalized PTY output ('pty'); in
+   * jsonl mode the PTY is a logged hint and nothing more. No evidence within
+   * SUBMIT_TIMEOUT_MS of the paste => `stuck` (only after a scan that ran past
+   * the deadline, so a slow scan can never manufacture one). Late evidence
+   * keeps counting for 24 h and clears stuck. Legacy records: the old
+   * header-needle rule.
+   */
+  private proveConsumption(now: number): void {
+    const recs = this.pending.active();
+    for (const rec of recs) {
+      if (!rec.token && rec.state === 'unattempted' && rec.attempts > 0 && rec.header && this.agent.transcriptContains(rec.header)) {
+        this.pending.markInFlight(rec);
+        this.log(`Pending ${rec.update_id}: header seen in transcript — in_flight (consumed, NOT answered)`);
+      }
+    }
+    const awaiting = recs.filter(
+      (r) =>
+        !!r.token &&
+        r.state === 'in_flight' &&
+        !!r.attempt_started_at &&
+        !r.proof_window_closed_at &&
+        (r.submit_phase === 'pasted' || r.submit_phase === 'stuck' || (r.submit_phase === 'submitted' && !r.in_flight_at)),
+    );
+    if (awaiting.length === 0) return;
+
+    let snap: ScanSnapshot | null = null;
+    if (this.proofMode === 'jsonl' && this.scanner) {
+      const since = Math.min(...awaiting.map((r) => Date.parse(r.attempt_started_at!)).filter((t) => !Number.isNaN(t)));
+      snap = this.transcriptSnapshot(since, now);
+    }
+
+    for (const rec of awaiting) {
+      const started = Date.parse(rec.attempt_started_at!);
+      let finding: { consumed: boolean; via: NonNullable<PendingTelegramRecord['submitted_via']>; uuid: string; ts: number } | null = null;
+      if (snap) {
+        const f = findSubmission(snap, rec.token!, started, rec.proof_uuids ?? []);
+        if (f) finding = { consumed: f.phase === 'consumed', via: f.evidence.kind, uuid: f.evidence.uuid, ts: f.evidence.ts };
+      }
+      const lastPty = this.ptyCheckedAt.get(rec.update_id) ?? 0;
+      const ptyDue = this.proofMode === 'pty'
+        ? (rec.submit_phase === 'pasted' || now - lastPty >= PROOF_SCAN_MIN_INTERVAL_MS)
+        : (!rec.pty_hint_at && now - lastPty >= PROOF_SCAN_MIN_INTERVAL_MS);
+      let ptySeen = false;
+      if (ptyDue) {
+        this.ptyCheckedAt.set(rec.update_id, now);
+        ptySeen = this.ptyTokenSeen(rec);
+      }
+      if (ptySeen && this.proofMode === 'jsonl' && !rec.pty_hint_at) {
+        this.pending.patch(rec.update_id, { pty_hint_at: new Date(now).toISOString() });
+        this.log(`Pending ${rec.update_id}: token seen in PTY output — a hint only; proof comes from Claude Code's record`);
+      }
+      if (!finding && ptySeen && this.proofMode === 'pty') finding = { consumed: true, via: 'pty', uuid: `pty:${rec.pty_instance ?? '?'}`, ts: now };
+
+      const cur = this.pending.read(rec.update_id);
+      if (!cur) continue;
+      if (finding) {
+        this.recordSubmission(cur, finding);
+        continue;
+      }
+      if (!Number.isNaN(started) && now - started > PROOF_WINDOW_MS) {
+        this.pending.patch(cur.update_id, { proof_window_closed_at: new Date(now).toISOString() }, { expectRev: cur.rev ?? 0 });
+        this.log(`Pending ${cur.update_id}: no proof of submission within 24 h — delivery state stays UNKNOWN; no longer scanning`);
+        continue;
+      }
+      if (cur.submit_phase === 'pasted') {
+        const deadline = Date.parse(cur.submit_deadline_at ?? '');
+        const scannedPastDeadline = this.proofMode === 'pty' || (this.lastSnap !== null && this.lastSnap.at >= deadline);
+        if (!Number.isNaN(deadline) && now >= deadline && scannedPastDeadline) {
+          this.pending.patch(cur.update_id, { submit_phase: 'stuck', stuck_at: new Date(now).toISOString() }, { expectRev: cur.rev ?? 0 });
+          this.log(
+            `Pending ${cur.update_id}: STUCK — no submitted prompt carrying ${cur.token} in ${Math.round((now - started) / 1000)}s ` +
+            `(${this.proofMode === 'jsonl' ? "Claude Code's session record" : 'PTY output'}). Not re-pasted; later messages queue behind it in this PTY.`,
+          );
+        }
+      }
+    }
+  }
+
+  private recordSubmission(
+    cur: PendingTelegramRecord,
+    f: { consumed: boolean; via: NonNullable<PendingTelegramRecord['submitted_via']>; uuid: string; ts: number },
+  ): void {
+    const iso = new Date(f.ts).toISOString();
+    const fields: Partial<PendingTelegramRecord> = {
+      submit_phase: 'submitted',
+      proof_uuids: [...(cur.proof_uuids ?? []), f.uuid],
+    };
+    if (!cur.submitted_at) fields.submitted_at = iso;
+    if (f.consumed) {
+      fields.in_flight_at = iso;
+      fields.submitted_via = f.via;
+    } else if (!cur.submitted_via) {
+      fields.submitted_via = f.via;
+    }
+    const ok = this.pending.patch(cur.update_id, fields, { expectRev: cur.rev ?? 0 });
+    const late = cur.submit_phase === 'stuck' ? ' — LATE submission, stuck cleared' : '';
+    const what = f.consumed ? 'consumed (NOT answered)' : 'accepted into the input queue (not yet read)';
+    this.log(ok
+      ? `Pending ${cur.update_id}: submission PROVEN via ${f.via} (${f.uuid.slice(0, 12)} at ${iso}) — ${what}${late}`
+      : `ERROR: Pending ${cur.update_id}: submission proof found but could not be recorded — will retry`);
+  }
+
+  /**
+   * A1: is this record's token in the PTY output after its watermark?
+   * Normalized (every ANSI/OSC sequence and ALL whitespace removed), because
+   * the TUI draws spaces as cursor moves and wraps long lines. The watermark
+   * was captured BEFORE the paste; if the log is now smaller (rotated, or a
+   * restart truncated it) the current file is searched from 0 — never from a
+   * stale offset.
+   */
+  private ptyTokenSeen(rec: PendingTelegramRecord): boolean {
+    if (!rec.token) return false;
+    const needle = normalizePtyText(rec.token);
+    const MAX_SCAN = 2 * 1024 * 1024;
+    try {
+      const path = join(this.paths.logDir, 'stdout.log');
+      const size = statSync(path).size;
+      const mark = typeof rec.log_offset === 'number' && rec.log_offset <= size ? rec.log_offset : 0;
+      const start = Math.max(mark, size - MAX_SCAN);
+      if (size <= start) return false;
+      const fd = openSync(path, 'r');
+      try {
+        const buf = Buffer.alloc(size - start);
+        readSync(fd, buf, 0, size - start, start);
+        return normalizePtyText(buf.toString('utf-8')).includes(needle);
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      return normalizePtyText(this.agent.getStrippedTail(20000)).includes(needle);
+    }
+  }
+
+  // === A3 media ===========================================================
+
+  /** Wire the daemon's downloader (agent-manager). */
+  setMediaDownloader(d: MediaDownloader): void {
+    this.mediaDownloader = d;
+  }
+
+  /** Start (or restart) a download as generation `gen`. Every start goes through here. */
+  startMediaJob(rec: PendingTelegramRecord, gen: number): void {
+    if (!this.mediaDownloader) {
+      this.log(`Pending ${rec.update_id}: no media downloader wired — gen ${gen} not started; the deadline pass will fail it`);
+      return;
+    }
+    this.jobsStartedHere.add(`${rec.update_id}:${gen}`);
+    this.mediaDownloader.start(rec, gen);
+  }
+
+  /**
+   * A3 deadline pass. A pending download past its deadline gets ONE retry
+   * (new generation, new deadline — the old generation's late completion is
+   * then fenced out). After that it is `failed`: a caption is injected with a
+   * note (ONE block), a captionless record is left for the notice pass (4c).
+   * The failure transition requires the expected gen AND media_state pending.
+   */
+  private processMediaDeadlines(now: number): void {
+    for (const rec of this.pending.active()) {
+      if (rec.media_state !== 'pending' || rec.media_gen === undefined || rec.state !== 'unattempted') continue;
+      const deadline = Date.parse(rec.media_deadline_at ?? '');
+      if (!Number.isNaN(deadline) && now < deadline) continue;
+      if ((rec.media_retries ?? 0) < 1 && this.mediaDownloader) {
+        const gen = rec.media_gen + 1;
+        const next = this.pending.patch(rec.update_id, {
+          media_gen: gen,
+          media_retries: (rec.media_retries ?? 0) + 1,
+          media_deadline_at: new Date(now + this.pending.mediaGraceMs).toISOString(),
+          notes: [...rec.notes, `download gen ${rec.media_gen} missed its deadline — re-downloading as gen ${gen}`],
+        }, { expectRev: rec.rev ?? 0 });
+        if (!next) {
+          this.log(`ERROR: Pending ${rec.update_id}: could not record the media retry — will try again next cycle`);
+          continue;
+        }
+        this.log(`Pending ${rec.update_id}: ${mediaNoun(rec.media_type)} download gen ${rec.media_gen} missed its deadline — retrying as gen ${gen}`);
+        this.startMediaJob(next, gen);
+        continue;
+      }
+      const caption = rec.text.trim();
+      const fields: Partial<PendingTelegramRecord> = {
+        media_state: 'failed',
+        notes: [...rec.notes, `download failed after ${(rec.media_retries ?? 0) + 1} attempt(s)${caption ? ' — injecting the caption with a note' : ' — no caption; the sender will be told'}`],
+      };
+      if (caption) {
+        fields.formatted = FastChecker.formatTelegramTextMessage(
+          rec.from,
+          rec.chat_id,
+          `${caption}\n${mediaFailedNote(rec)}`,
+          this.frameworkRoot,
+          undefined,
+          undefined,
+          undefined,
+          rec.token,
+        );
+      }
+      const ok = this.pending.patch(rec.update_id, fields, { expectRev: rec.rev ?? 0 });
+      this.log(ok
+        ? `Pending ${rec.update_id}: ${mediaNoun(rec.media_type)} download FAILED for good (gen ${rec.media_gen})${caption ? ' — caption will be delivered with a note' : ''}`
+        : `ERROR: Pending ${rec.update_id}: could not mark the media failure — will try again next cycle`);
+    }
+  }
+
+  /**
+   * A3 completion from the daemon's media job. Only the CURRENT generation of
+   * a record that is still pending (or failed — a late success) may rename its
+   * part file into place and patch the block; anything else is stale and is
+   * discarded (logged, part file removed).
+   */
+  completeMediaDownload(
+    updateId: number,
+    gen: number,
+    result: { partPath: string; transcript?: string },
+  ): 'landed' | 'rearmed' | 'dropped' | 'stale' | 'missing' | 'write_failed' {
+    const cur = this.pending.read(updateId);
+    const discardPart = () => {
+      try { unlinkSync(result.partPath); } catch { /* already gone */ }
+    };
+    if (!cur) {
+      discardPart();
+      this.log(`Media completion for ${updateId} gen ${gen}: record no longer exists — discarded`);
+      return 'missing';
+    }
+    if (cur.media_gen !== gen || (cur.media_state !== 'pending' && cur.media_state !== 'failed') || !cur.media_dest) {
+      discardPart();
+      this.log(`Media completion for ${updateId} gen ${gen} is STALE (record gen ${cur.media_gen}, state ${cur.media_state}) — discarded`);
+      return 'stale';
+    }
+    const dest = join(this.agentDirOr(), cur.media_dest);
+    try {
+      mkdirSync(dirname(dest), { recursive: true });
+      renameSync(result.partPath, dest);
+    } catch (err) {
+      this.log(`ERROR: media completion for ${updateId} gen ${gen}: rename into place failed: ${String(err)} — kept for retry`);
+      this.pendingMediaPatches.set(updateId, { gen, partPath: result.partPath, transcript: result.transcript, attempts: 1 });
+      return 'write_failed';
+    }
+    return this.landMedia(cur, dest, result.transcript, gen);
+  }
+
+  /** Immediate failure from the job: pull the deadline in so the next cycle retries or fails it. */
+  failMediaDownload(updateId: number, gen: number, err: unknown): void {
+    const cur = this.pending.read(updateId);
+    if (!cur || cur.media_gen !== gen || cur.media_state !== 'pending') {
+      this.log(`Media download for ${updateId} gen ${gen} failed after it was superseded — ignored: ${String(err)}`);
+      return;
+    }
+    const ok = this.pending.patch(updateId, {
+      media_deadline_at: new Date().toISOString(),
+      notes: [...cur.notes, `download gen ${gen} failed: ${String(err)}`],
+    }, { expectRev: cur.rev ?? 0 });
+    this.log(`Media download for ${updateId} gen ${gen} FAILED: ${String(err)}${ok ? ' — retry/failure decided next cycle' : ' (could not record; the deadline will decide)'}`);
+  }
+
+  /** Patch the block for a file that is already at its final path. */
+  private landMedia(
+    cur: PendingTelegramRecord,
+    destAbs: string,
+    transcript: string | undefined,
+    gen: number,
+  ): 'landed' | 'rearmed' | 'dropped' | 'write_failed' {
+    const block = this.buildMediaBlock(cur, destAbs, transcript);
+    const text = (transcript || cur.text || '').trim();
+    let fields: Partial<PendingTelegramRecord>;
+    let outcome: 'landed' | 'rearmed' | 'dropped';
+    if (cur.media_state === 'pending' && cur.state === 'unattempted') {
+      fields = { formatted: block, text, empty: false, media_state: 'ready' };
+      outcome = 'landed';
+    } else if (cur.media_state === 'failed' && cur.attempts === 0 && (cur.state === 'unattempted' || cur.state === 'failed_notified')) {
+      // V4-4: a late success always delivers if nothing was injected yet — even
+      // after the resend notice went out. The block says it arrived late when
+      // the sender was told otherwise (a notice still in flight gets the same
+      // prefix from the notice pass once its send returns).
+      const noticeSent = cur.state === 'failed_notified' || !!cur.notified_at;
+      fields = {
+        state: 'unattempted',
+        empty: false,
+        media_state: 'ready',
+        formatted: noticeSent ? `${LATE_MEDIA_PREFIX}\n${block}` : block,
+        text,
+        notes: [...cur.notes, `gen ${gen} landed after the download was marked failed — re-armed with a late note`],
+      };
+      outcome = 'rearmed';
+    } else {
+      // The caption (with its "failed to download" note) was already pasted.
+      // Re-pasting would duplicate it; the file is kept on disk and noted.
+      fields = { notes: [...cur.notes, `gen ${gen} landed after the caption was already delivered — file kept at ${cur.media_dest}, not re-injected`] };
+      outcome = 'dropped';
+    }
+    const ok = this.pending.patch(cur.update_id, fields, { expectRev: cur.rev ?? 0 });
+    if (!ok) {
+      this.pendingMediaPatches.set(cur.update_id, { gen, partPath: null, transcript, attempts: 1 });
+      this.log(`ERROR: media completion for ${cur.update_id} gen ${gen}: the block could NOT be written — kept in memory, retried next cycle`);
+      return 'write_failed';
+    }
+    this.pendingMediaPatches.delete(cur.update_id);
+    this.log(
+      outcome === 'landed'
+        ? `Media message received: type=${cur.media_type}, durable record ${cur.update_id} ready (gen ${gen})`
+        : outcome === 'rearmed'
+          ? `Media message received LATE: type=${cur.media_type}, durable record ${cur.update_id} re-armed for delivery (gen ${gen})`
+          : `Media for ${cur.update_id} landed after its caption was delivered — logged, not re-injected`,
+    );
+    return outcome;
+  }
+
+  private retryPendingMediaPatches(): void {
+    for (const [updateId, p] of [...this.pendingMediaPatches]) {
+      const cur = this.pending.read(updateId);
+      if (!cur || cur.media_gen !== p.gen) {
+        this.pendingMediaPatches.delete(updateId);
+        continue;
+      }
+      p.attempts++;
+      if (p.partPath) {
+        this.pendingMediaPatches.delete(updateId);
+        this.completeMediaDownload(updateId, p.gen, { partPath: p.partPath, transcript: p.transcript });
+        continue;
+      }
+      if (!cur.media_dest) continue;
+      this.landMedia(cur, join(this.agentDirOr(), cur.media_dest), p.transcript, p.gen);
+    }
+  }
+
+  /** The block for a downloaded attachment — same formatters, token in the header. */
+  private buildMediaBlock(rec: PendingTelegramRecord, destAbs: string, transcript?: string): string {
+    const cfg = (this.agent as unknown as { getConfig?: () => { working_directory?: string } }).getConfig?.();
+    const launchDir = cfg?.working_directory || this.agentDirOr();
+    const rel = relative(launchDir, destAbs);
+    const caption = rec.text;
+    const name = rec.file_name || rec.media_dest?.replace(/^.*?\d+-/, '') || '';
+    switch (rec.media_type) {
+      case 'photo':
+        return FastChecker.formatTelegramPhotoMessage(rec.from, rec.chat_id, caption, rel, rec.token);
+      case 'document':
+        return FastChecker.formatTelegramDocumentMessage(rec.from, rec.chat_id, caption, rel, name, rec.token);
+      case 'voice':
+      case 'audio':
+        return FastChecker.formatTelegramVoiceMessage(rec.from, rec.chat_id, rel, rec.media_duration, transcript, rec.token);
+      default:
+        return FastChecker.formatTelegramVideoMessage(rec.from, rec.chat_id, caption, rel, name, rec.media_duration, rec.token);
+    }
+  }
+
+  private agentDirOr(): string {
+    const a = this.agent as unknown as { getAgentDir?: () => string };
+    return typeof a.getAgentDir === 'function' ? a.getAgentDir() : this.paths.stateDir;
+  }
+
+  /**
+   * V4-3 startup reconciliation — once, before the first durable cycle acts:
+   *   (a) a pending download whose final file exists => rebuild the block from
+   *       the file and mark it ready (crash between rename and patch); voice/
+   *       audio are re-downloaded instead, to get their transcript back;
+   *   (b) a record carrying resolved_at still in pending/ => finish the archive;
+   *   (c) stray `.part.*` files no job of THIS process owns => deleted;
+   *   (d) any other pending download => resumed via file_id as a new gen.
+   * Pasted/stuck records need nothing: their state is on disk, they are never
+   * re-pasted, and a new PTY instance opens the stuck gate (R4-2/R4-3).
+   */
+  private startupReconcile(): void {
+    const moved = this.pending.finishArchives();
+    if (moved > 0) this.log(`Startup: finished ${moved} interrupted archive(s)`);
+    const agentDir = this.agentDirOr();
+    let rebuilt = 0;
+    for (const rec of this.pending.active()) {
+      if (rec.media_state !== 'pending' || rec.media_gen === undefined || !rec.media_dest || rec.state !== 'unattempted') continue;
+      if (this.jobsStartedHere.has(`${rec.update_id}:${rec.media_gen}`)) continue;
+      const dest = join(agentDir, rec.media_dest);
+      const textual = rec.media_type === 'voice' || rec.media_type === 'audio';
+      if (existsSync(dest) && !textual && this.landMedia(rec, dest, undefined, rec.media_gen) !== 'write_failed') rebuilt++;
+    }
+    let stray = 0;
+    try {
+      const imgDir = join(agentDir, 'telegram-images');
+      if (existsSync(imgDir)) {
+        for (const name of readdirSync(imgDir)) {
+          const m = name.match(PART_FILE_RE);
+          if (!m) continue;
+          if (this.jobsStartedHere.has(`${m[1]}:${m[2]}`)) continue;
+          try { unlinkSync(join(imgDir, name)); stray++; } catch { /* gone */ }
+        }
+      }
+    } catch { /* unreadable dir: nothing to reconcile */ }
+    const uncertain = this.pending.active().filter((r) => r.submit_phase === 'pasted' || r.submit_phase === 'stuck').length;
+    if (rebuilt || stray || uncertain) {
+      this.log(`Startup reconciliation: ${rebuilt} media block(s) rebuilt from disk, ${stray} stray part file(s) removed, ${uncertain} paste(s) still awaiting proof (never re-pasted)`);
+    }
+    // (d) needs the daemon's downloader, which is wired after start() begins;
+    // resumeInterruptedMedia() runs on the first cycle that has it.
+    this.resumeDue = true;
+  }
+
+  /** V4-3(d): pending downloads left by a previous process resume as a new gen. */
+  private resumeInterruptedMedia(): void {
+    if (!this.resumeDue || !this.mediaDownloader) return;
+    this.resumeDue = false;
+    let resumed = 0;
+    for (const rec of this.pending.active()) {
+      if (rec.media_state !== 'pending' || rec.media_gen === undefined || !rec.media_dest || rec.state !== 'unattempted') continue;
+      if (this.jobsStartedHere.has(`${rec.update_id}:${rec.media_gen}`)) continue;
+      const gen = rec.media_gen + 1;
+      const next = this.pending.patch(rec.update_id, {
+        media_gen: gen,
+        media_deadline_at: new Date(Date.now() + this.pending.mediaGraceMs).toISOString(),
+        notes: [...rec.notes, `daemon restarted mid-download — resumed as gen ${gen}`],
+      }, { expectRev: rec.rev ?? 0 });
+      if (next) {
+        this.startMediaJob(next, gen);
+        resumed++;
+      }
+    }
+    if (resumed > 0) this.log(`Startup: resumed ${resumed} interrupted media download(s) via file_id`);
   }
 
   /** Current size of the agent's stdout.log, or 0 when it is unreadable. */
@@ -645,49 +1518,57 @@ export class FastChecker {
   }
 
   /**
-   * Rail 3: scan the agent's own transcript AFTER the injection's byte
-   * watermark for evidence that it ran a send command for this chat. This is
-   * the only rail that covers telegram-send.sh and anything else an agent
-   * invents, because every send is a command in its session.
-   *
-   * Reads at most 2 MB and falls back to the in-memory ring buffer when the log
-   * is unreadable. Failing to find evidence never deletes anything — it only
-   * leaves the record in place, which is the safe direction.
+   * Diagnostic only (A2): did the agent run a send command for this chat after
+   * the injection? NOT reply evidence — kept so an operator can see "a send was
+   * attempted" next to an unverified record.
    */
-  private sendObservedInTranscript(rec: PendingTelegramRecord): boolean {
-    const MAX_SCAN = 2 * 1024 * 1024;
-    // No watermark => this record predates the change (or the log was
-    // unreadable at injection time). Without a watermark there is no way to
-    // prove the evidence came AFTER the injection, and a false "answered" here
-    // DELETES a real message. Fail closed: fall back to the timestamped rails
-    // only, which at worst leaves the record as `unverified` for the operator.
+  sendAttemptObserved(rec: PendingTelegramRecord): boolean {
     if (rec.log_offset === undefined || rec.log_offset === null) return false;
-    const offset = rec.log_offset;
-    // The unwatermarked ring buffer is consulted ONLY when the log file could
-    // not be read. It holds output from BEFORE the injection, so falling
-    // through to it after a clean scan found nothing let any earlier reply
-    // retire a message that was never answered.
     try {
       const path = join(this.paths.logDir, 'stdout.log');
       const size = statSync(path).size;
-      if (size > offset) {
-        const start = Math.max(offset, size - MAX_SCAN);
-        const fd = openSync(path, 'r');
-        try {
-          const len = size - start;
-          const buf = Buffer.alloc(len);
-          readSync(fd, buf, 0, len, start);
-          const text = buf.toString('utf-8').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-          if (sendEvidenceInTranscript(text, rec.chat_id)) return true;
-        } finally {
-          closeSync(fd);
-        }
+      if (size <= rec.log_offset) return false;
+      const start = Math.max(rec.log_offset, size - 2 * 1024 * 1024);
+      const fd = openSync(path, 'r');
+      try {
+        const buf = Buffer.alloc(size - start);
+        readSync(fd, buf, 0, size - start, start);
+        return sendEvidenceInTranscript(buf.toString('utf-8').replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, ''), rec.chat_id);
+      } finally {
+        closeSync(fd);
       }
-      return false;
     } catch {
-      // fall through to the ring buffer
+      return false;
     }
-    return sendEvidenceInTranscript(this.agent.getStrippedTail(20000), rec.chat_id);
+  }
+
+  /**
+   * The Claude project dir for a claude-code agent (V5-1), or null for other
+   * runtimes / agents whose config cannot be read. CLAUDE_CONFIG_DIR (from the
+   * daemon env or the agent's .env) moves `projects/` with it.
+   */
+  static claudeProjectDirForAgent(agent: AgentProcess): string | null {
+    const a = agent as unknown as { getConfig?: () => { runtime?: string; working_directory?: string }; getAgentDir?: () => string };
+    if (typeof a.getConfig !== 'function' || typeof a.getAgentDir !== 'function') return null;
+    let cfg: { runtime?: string; working_directory?: string } | undefined;
+    try {
+      cfg = a.getConfig();
+    } catch {
+      return null;
+    }
+    if (!cfg || (cfg.runtime !== undefined && cfg.runtime !== 'claude-code')) return null;
+    const agentDir = a.getAgentDir();
+    const cwd = cfg.working_directory || agentDir;
+    if (!cwd) return null;
+    let configDir = process.env.CLAUDE_CONFIG_DIR;
+    try {
+      const envFile = join(agentDir, '.env');
+      if (existsSync(envFile)) {
+        const m = readFileSync(envFile, 'utf-8').match(/^\s*CLAUDE_CONFIG_DIR\s*=\s*(.+?)\s*$/m);
+        if (m) configDir = m[1].replace(/^['"]|['"]$/g, '');
+      }
+    } catch { /* keep the daemon's */ }
+    return configDir ? claudeProjectDirFor(cwd, join(configDir, 'projects')) : claudeProjectDirFor(cwd);
   }
 
   // === JARVIS MOD #23 — voice cue loader (2026-07-05) ===
@@ -750,6 +1631,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     replyToText?: string,
     lastSentText?: string,
     recentHistory?: string,
+    token?: string,
   ): string {
     // Every externally-influenced field below is untrusted (the sender controls
     // text/display-name; reply-context, last-sent and recent-history are built
@@ -781,7 +1663,7 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     const body = isSlashCommand
       ? sanitizeForPtyInjection(text).trim()
       : wrapFenceSafe(text);
-    return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
+    return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}]${tokenPart(token)} (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
@@ -828,8 +1710,9 @@ ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     chatId: string | number,
     caption: string,
     imagePath: string,
+    token?: string,
   ): string {
-    return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
+    return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)}${tokenPart(token)} (chat_id:${chatId}) ===
 caption:
 ${wrapFenceSafe(caption)}
 local_file: ${imagePath}
@@ -848,8 +1731,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     filePath: string,
     fileName: string,
+    token?: string,
   ): string {
-    return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
+    return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)}${tokenPart(token)} (chat_id:${chatId}) ===
 caption:
 ${wrapFenceSafe(caption)}
 local_file: ${filePath}
@@ -874,12 +1758,13 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     duration: number | undefined,
     transcript?: string,
+    token?: string,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
       ? `transcript:\n${wrapFenceSafe(transcript.trim())}\n`
       : '';
-    return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
+    return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)}${tokenPart(token)} (chat_id:${chatId}) ===
 duration: ${dur}s
 local_file: ${filePath}
 ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
@@ -898,9 +1783,10 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     filePath: string,
     fileName: string,
     duration: number | undefined,
+    token?: string,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
-    return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
+    return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)}${tokenPart(token)} (chat_id:${chatId}) ===
 caption:
 ${wrapFenceSafe(caption)}
 duration: ${dur}s
@@ -914,15 +1800,16 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
   /**
    * Wait for the agent to finish bootstrapping.
    */
-  private async waitForBootstrap(timeoutMs: number = 30000): Promise<void> {
+  private async waitForBootstrap(timeoutMs: number = 30000): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (this.agent.isBootstrapped()) {
-        return;
+        return true;
       }
       await sleep(2000);
     }
     this.log('Bootstrap timeout - proceeding anyway');
+    return false;
   }
 
   /** Close the current unanswered-turn window. */
@@ -1983,4 +2870,42 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * ` ⟦u:<id>⟧` in a header line (A1). Placed BEFORE `(chat_id:…)` on purpose:
+ * A0's reply-evidence stripper matches `=== TELEGRAM from … (chat_id:<id>) ===`
+ * with a lazy wildcard in front of `(chat_id:`, so a block written by this code
+ * is still stripped if the daemon is rolled back to A0.
+ */
+function tokenPart(token?: string): string {
+  return token ? ` ${token}` : '';
+}
+
+/** R4-5 cadence: at most one transcript scan (and one PTY token read per record) per 5 s. */
+const PROOF_SCAN_MIN_INTERVAL_MS = 5_000;
+/** A6 stage-2 follow-up: "received, no reply observed yet". */
+const ACK_FOLLOWUP_MS = 10 * 60_000;
+
+/** Upper bound on the boot-window hold (TELEGRAM_BOOT_HOLD_MAX_MS; default 10 min). */
+export function bootHoldMaxMs(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number((env.TELEGRAM_BOOT_HOLD_MAX_MS ?? '').trim());
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10 * 60_000;
+}
+
+/** The note on a caption whose attachment failed for good (A3). */
+function mediaFailedNote(rec: Pick<PendingTelegramRecord, 'media_type' | 'from'>): string {
+  return `(a ${mediaNoun(rec.media_type)} came with this but failed to download — ask ${rec.from} to resend it)`;
+}
+
+function telegramTokenLabel(rec: PendingTelegramRecord): string {
+  return rec.token ?? `update ${rec.update_id}`;
+}
+
+/**
+ * A daemon-side media job (A3). Started by FastChecker.startMediaJob; must end
+ * in completeMediaDownload or failMediaDownload for the same generation.
+ */
+export interface MediaDownloader {
+  start(rec: PendingTelegramRecord, gen: number): void;
 }

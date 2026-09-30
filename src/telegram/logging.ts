@@ -93,9 +93,18 @@ export function recordInboundTelegram(
   fromName: string,
   msg: TelegramMessage,
   log?: (m: string) => void,
+  /**
+   * The Telegram update_id (C1, 2026-09-30): the join key between this row and
+   * the durable delivery record (state/<agent>/pending-telegram[-resolved]/
+   * <update_id>.json). The uhsJARVIS watchdog joins on it and de-duplicates
+   * redelivered updates by it; rows without it fall back to an APPROXIMATE
+   * timestamp match.
+   */
+  updateId?: number,
 ): void {
   const text = (msg.text || msg.caption || '').toString();
   logInboundMessage(ctxRoot, agentName, {
+    ...(updateId !== undefined ? { update_id: updateId } : {}),
     message_id: msg.message_id,
     from: msg.from?.id,
     from_name: fromName,

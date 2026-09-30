@@ -26,6 +26,7 @@ vi.mock('../../../src/daemon/fast-checker.js', () => ({
     start() { return Promise.resolve(); }
     stop() {}
     wake() {}
+    setMediaDownloader() {}
     static formatTelegramTextMessage() { return ''; }
     static readLastSent() { return null; }
   },

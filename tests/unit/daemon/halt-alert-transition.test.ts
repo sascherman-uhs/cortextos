@@ -36,7 +36,7 @@ vi.mock('../../../src/telegram/poller.js', () => ({
 }));
 
 vi.mock('../../../src/daemon/fast-checker.js', () => ({
-  FastChecker: class { async start() { /* no-op */ } stop() {} wake() {} },
+  FastChecker: class { async start() { /* no-op */ } stop() {} wake() {} setMediaDownloader() {} },
 }));
 
 // AgentProcess stub that reproduces the real durable-halt gate: start() reads
