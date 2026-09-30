@@ -334,6 +334,78 @@ describe('R4-3 stuck gate vs record retry', () => {
   });
 });
 
+describe('Codex round 15 #2 — the stuck gate persists until submission evidence or a new PTY', () => {
+  it('a later reply to the same chat does NOT archive an unsubmitted paste or open the gate', async () => {
+    q.persist(textRecord(900060, 'ZZTEST stuck', '2026-09-30T12:40:00.000Z'));
+    q.persist(textRecord(900061, 'ZZTEST behind it', '2026-09-30T12:40:01.000Z'));
+    await cycleAt(at('2026-09-30T12:40:02.000Z'));
+    await cycleAt(at('2026-09-30T12:41:10.000Z'));
+    expect(q.read(900060)!.submit_phase).toBe('stuck');
+    // JARVIS answers something else in the same chat (an earlier message).
+    writeFileSync(join(paths.logDir, 'outbound-messages.jsonl'), JSON.stringify({ chat_id: CHAT, timestamp: '2026-09-30T12:41:30.000Z', text: 'ZZTEST unrelated reply' }) + '\n');
+    await cycleAt(at('2026-09-30T12:41:40.000Z'));
+    await cycleAt(at('2026-09-30T12:41:50.000Z'));
+    expect(q.read(900060)).not.toBeNull(); // not archived: a reply cannot prove an unsubmitted paste was read
+    expect(q.read(900060)!.submit_phase).toBe('stuck');
+    expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1); // 900061 still queued behind the gate
+  });
+
+  it('the 24 h proof window closing does NOT open the gate; scanning continues for this PTY and late proof clears it', async () => {
+    q.persist(textRecord(900062, 'ZZTEST stuck a day', '2026-09-30T12:40:00.000Z'));
+    q.persist(textRecord(900063, 'ZZTEST behind it', '2026-09-30T12:40:01.000Z'));
+    await cycleAt(at('2026-09-30T12:40:02.000Z'));
+    await cycleAt(at('2026-09-30T12:41:10.000Z'));
+    await cycleAt(at('2026-10-01T12:41:10.000Z')); // > 24 h later, same PTY
+    await cycleAt(at('2026-10-01T12:41:20.000Z'));
+    expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
+    appendFileSync(sessionFile, line(genuinePromptWith(telegramToken(900062), '2026-10-01T12:42:00.000Z', 'zztest-uuid-62')));
+    await cycleAt(at('2026-10-01T12:42:10.000Z'));
+    expect(q.read(900062)!.submit_phase).toBe('submitted');
+    await cycleAt(at('2026-10-01T12:42:20.000Z'));
+    expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Codex round 15 #4 — submitted-only is its own state, never "consumed"', () => {
+  function enqueueOf(id: number, ts: string): any {
+    const e = E('enqueue_telegram_b7476096');
+    e.content = e.content.replace('(chat_id:8727328514)', `${telegramToken(id)} (chat_id:8727328514)`);
+    e.timestamp = ts;
+    return e;
+  }
+
+  it('enqueue-only stays submitted (not unverified) past 10 min, is scanned on, and a later queued_command consumes it', async () => {
+    q.persist(textRecord(900070, 'ZZTEST queued behind a long tool', '2026-09-30T12:40:00.000Z'));
+    await cycleAt(at('2026-09-30T12:40:02.000Z'));
+    appendFileSync(sessionFile, line(enqueueOf(900070, '2026-09-30T12:40:03.000Z')));
+    await cycleAt(at('2026-09-30T12:40:08.000Z'));
+    expect(q.read(900070)).toMatchObject({ submit_phase: 'submitted', submitted_via: 'enqueue' });
+    expect(q.read(900070)!.in_flight_at).toBeUndefined();
+    await cycleAt(at('2026-09-30T12:55:00.000Z'));
+    expect(q.read(900070)!.state).toBe('in_flight'); // NOT unverified: nothing shows the model read it
+    const qc = E('queued_command_telegram_b7476096');
+    qc.attachment.prompt = qc.attachment.prompt.replace('(chat_id:8727328514)', `${telegramToken(900070)} (chat_id:8727328514)`);
+    qc.timestamp = '2026-09-30T12:56:00.000Z';
+    qc.uuid = 'zztest-qc-70';
+    appendFileSync(sessionFile, line(qc));
+    await cycleAt(at('2026-09-30T12:56:10.000Z'));
+    expect(q.read(900070)).toMatchObject({ submitted_via: 'queued_command', in_flight_at: '2026-09-30T12:56:00.000Z' });
+    // Only NOW does the 10-minute unverified clock run.
+    await cycleAt(at('2026-09-30T13:07:00.000Z'));
+    expect(q.read(900070)!.state).toBe('unverified');
+  });
+
+  it('a same-chat reply does not archive a submitted-but-unread message', async () => {
+    q.persist(textRecord(900071, 'ZZTEST unread', '2026-09-30T12:40:00.000Z'));
+    await cycleAt(at('2026-09-30T12:40:02.000Z'));
+    appendFileSync(sessionFile, line(enqueueOf(900071, '2026-09-30T12:40:03.000Z')));
+    await cycleAt(at('2026-09-30T12:40:08.000Z'));
+    writeFileSync(join(paths.logDir, 'outbound-messages.jsonl'), JSON.stringify({ chat_id: CHAT, timestamp: '2026-09-30T12:40:20.000Z', text: 'ZZTEST reply to something earlier' }) + '\n');
+    await cycleAt(at('2026-09-30T12:40:30.000Z'));
+    expect(q.read(900071)).not.toBeNull();
+  });
+});
+
 describe('V5-3 DROP only on positive non-delivery evidence', () => {
   it('a PARTIAL paste (some bytes written, then a throw) is UNKNOWN: no retry, no admission', async () => {
     agent.injectMessageDetailed.mockReturnValue({ ok: false, code: 'WRITE_FAILED', partial: true, message: 'ZZTEST EPIPE after chunk 1' });
@@ -385,15 +457,36 @@ describe('V5-2a / R4-4 boot-window hold', () => {
     expect(logs.some((l) => l.includes('RELEASED') && l.includes('2026-09-30T12:38:21.469Z'))).toBe(true);
   });
 
-  it('bootstrap TIMEOUT (never observed) keeps it held — up to the bound', async () => {
+  // Codex round 15 #6: elapsed time is not readiness. Past the bound the hold
+  // ESCALATES (loud log + hold_escalated_at on every held record, which the
+  // watchdog reports as HELD) and keeps holding until readiness evidence.
+  it('bootstrap never observed: past the bound it escalates and KEEPS holding; readiness later releases it', async () => {
     bootstrapped = false;
     q.persist(textRecord(900041, 'ZZTEST no bootstrap', '2026-09-30T12:37:30.000Z'));
     await cycleAt(at('2026-09-30T12:38:30.000Z'));
-    await cycleAt(at('2026-09-30T12:40:30.000Z'));
-    expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
     await cycleAt(SPAWN + bootHoldMaxMs() + 1_000);
+    await cycleAt(SPAWN + bootHoldMaxMs() + 60_000);
+    expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
+    expect(logs.filter((l) => l.includes('LOUD') && l.includes('boot')).length).toBe(1); // once per PTY
+    expect(q.read(900041)!.hold_escalated_at).toBeTruthy();
+    expect(q.read(900041)!.hold_reason).toBe('boot_not_ready');
+    // A message arriving during the escalated hold is marked too.
+    q.persist(textRecord(900044, 'ZZTEST later', new Date(SPAWN + bootHoldMaxMs() + 70_000).toISOString()));
+    await cycleAt(SPAWN + bootHoldMaxMs() + 80_000);
+    expect(q.read(900044)!.hold_escalated_at).toBeTruthy();
+    bootstrapped = true; // the session finally comes up (boot prompt + turn end already recorded)
+    await cycleAt(SPAWN + bootHoldMaxMs() + 90_000);
     expect(agent.injectMessageDetailed).toHaveBeenCalledTimes(1);
-    expect(logs.some((l) => l.includes('LOUD: no successful bootstrap observed'))).toBe(true);
+    expect(q.read(900041)!.hold_escalated_at).toBeUndefined();
+  });
+
+  it('bootstrapped but the boot turn never ends in the record: escalates, still held', async () => {
+    writeFileSync(sessionFile, line(E('boot_prompt_b64c01d7_line8')));
+    q.persist(textRecord(900045, 'ZZTEST turn never ends', '2026-09-30T12:37:30.000Z'));
+    await cycleAt(SPAWN + bootHoldMaxMs() + 1_000);
+    await cycleAt(SPAWN + bootHoldMaxMs() + 30_000);
+    expect(agent.injectMessageDetailed).not.toHaveBeenCalled();
+    expect(q.read(900045)!.hold_escalated_at).toBeTruthy();
   });
 
   it("a previous generation's boot turn end does not release a NEW PTY; its own does", async () => {

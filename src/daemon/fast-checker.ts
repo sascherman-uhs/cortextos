@@ -29,6 +29,7 @@ import {
   LATE_MEDIA_PREFIX,
   NOTIFY_MAX_ATTEMPTS,
   PROOF_WINDOW_MS,
+  awaitingConsumption,
   mediaNotArrivedText,
   mediaStillDownloadingNote,
   type PendingTelegramRecord,
@@ -126,6 +127,7 @@ export class FastChecker {
   /** PTY instance whose boot turn was observed to end (R4-4). */
   private bootReadyInstance: string | null = null;
   private bootHoldLoggedFor: string | null = null;
+  private bootHoldEscalatedFor: string | null = null;
   /** V4-3 startup reconciliation runs once, before the first durable cycle acts. */
   private reconciled = false;
   private lastPruneAt = 0;
@@ -140,6 +142,8 @@ export class FastChecker {
    * cycle — never logged as "updated" (A3: every patch checks its boolean).
    */
   private pendingMediaPatches = new Map<number, { gen: number; partPath: string | null; transcript?: string; attempts: number }>();
+  /** Media jobs waiting for their owed completion patch to land or be discarded (Codex round 15 #3). */
+  private patchWaiters = new Map<string, Array<() => void>>();
   /** update_id:gen of media jobs THIS process started (their part files are live). */
   private jobsStartedHere = new Set<string>();
   /** Last PTY-token check per record (ms) — the PTY read is rate-limited like the scan. */
@@ -834,11 +838,14 @@ export class FastChecker {
 
   /** Step 6: gates, persist-before-write, then ONE paste. */
   private async injectNext(now: number, answered: (rec: PendingTelegramRecord) => boolean): Promise<void> {
-    const next = this.pending.nextDeliverable(now, answered);
-    if (!next) return;
+    const candidate = this.pending.nextDeliverable(now, answered);
+    if (!candidate) return;
 
     // V5-2a: the boot window of THIS PTY (JSONL runtimes).
     if (this.bootHoldActive(now)) return;
+    // The gate may have patched it (escalation cleared on release): paste
+    // from the current copy, or the rev-guarded accounting write refuses.
+    const next = this.pending.read(candidate.update_id) ?? candidate;
 
     // V5-2c: a paste into this PTY is still unproven (pasted) or stuck — later
     // messages queue rather than pile into a composer that may not be submitting.
@@ -997,8 +1004,10 @@ export class FastChecker {
         (r) =>
           !!r.token &&
           r.pty_instance === inst &&
-          (r.submit_phase === 'pasted' || r.submit_phase === 'stuck') &&
-          !r.proof_window_closed_at,
+          (r.submit_phase === 'pasted' || r.submit_phase === 'stuck'),
+        // No expiry, no reply, no elapsed time opens this gate — only proof of
+        // submission (the record moves to 'submitted') or a new PTY instance.
+        // Nothing else shows the composer is clear (Codex round 15 #2).
       ) ?? null
     );
   }
@@ -1006,13 +1015,17 @@ export class FastChecker {
   /**
    * V5-2a / R4-4: hold Telegram injection while THIS PTY is booting.
    *
-   * Released for a PTY instance only when (1) its output shows a successful
-   * bootstrap (the ring buffer is per PTY, so a previous generation's output
-   * cannot count, and the bootstrap-TIMEOUT path never marks anything ready),
-   * and (2) Claude Code's session record shows this spawn's boot prompt (by
-   * its unique `Current UTC time:` marker) followed by a turn end. Every
-   * respawn is a new instance and starts held again. BOOT_HOLD_MAX_MS bounds
-   * the hold: a hold that can last forever is a new way to lose messages.
+   * Released for a PTY instance only on readiness EVIDENCE: (1) its output
+   * shows a successful bootstrap (the ring buffer is per PTY, so a previous
+   * generation's output cannot count, and the bootstrap-TIMEOUT path never
+   * marks anything ready), and (2) Claude Code's session record shows this
+   * spawn's boot prompt (by its unique `Current UTC time:` marker) followed by
+   * a turn end. Every respawn is a new instance and starts held again.
+   *
+   * Elapsed time is not readiness (Codex round 15 #6). Past BOOT_HOLD_MAX_MS
+   * the hold ESCALATES — one loud log per PTY, and every held record carries
+   * `hold_escalated_at`, which the watchdog reports as HELD — and keeps
+   * holding. Scott's receipt acks keep flowing meanwhile (A6).
    */
   private bootHoldActive(now: number): boolean {
     if (this.proofMode !== 'jsonl' || !this.scanner) return false;
@@ -1027,36 +1040,60 @@ export class FastChecker {
     if (this.bootReadyInstance === inst) return false;
     const spawnedAt = a.getPtySpawnedAt?.() ?? 0;
     const marker = a.getBootMarker?.() ?? null;
+    const overdue = spawnedAt > 0 && now - spawnedAt >= bootHoldMaxMs();
     const held = (why: string): boolean => {
       if (this.bootHoldLoggedFor !== `${inst}:${why}`) {
         this.bootHoldLoggedFor = `${inst}:${why}`;
         this.log(`Telegram injection HELD — boot window of PTY ${inst.slice(0, 8)}: ${why}`);
       }
+      if (overdue) this.escalateBootHold(inst, now, why);
       return true;
     };
     const release = (why: string): boolean => {
       this.bootReadyInstance = inst;
       this.log(`Telegram injection RELEASED for PTY ${inst.slice(0, 8)}: ${why}`);
+      this.clearBootHoldEscalation();
       return false;
     };
-    const overdue = spawnedAt > 0 && now - spawnedAt >= bootHoldMaxMs();
-    if (!this.agent.isBootstrapped()) {
-      if (overdue) return release(`LOUD: no successful bootstrap observed ${Math.round((now - spawnedAt) / 1000)}s after spawn — releasing on the ${Math.round(bootHoldMaxMs() / 60_000)}-min bound; stuck detection still guards every paste`);
-      return held('bootstrap not observed for this PTY');
-    }
+    if (!this.agent.isBootstrapped()) return held('bootstrap not observed for this PTY');
     if (!marker) return release('bootstrap observed; this spawn has no boot marker to bind a turn end to');
     const snap = this.transcriptSnapshot(spawnedAt - 60_000, now);
     const r = bootTurnEnded(snap, marker);
     if (r.ready) return release(`boot turn ended at ${new Date(r.turnEndTs!).toISOString()} (Claude Code session record)`);
-    if (overdue) {
-      return release(
-        r.promptTs
-          ? `LOUD: the boot turn has not ended ${Math.round((now - spawnedAt) / 1000)}s after spawn — releasing on the bound`
-          : `LOUD: this spawn's boot prompt was never recorded as a genuine prompt in ${this.scanner.projectDir} — ` +
-            'the Claude Code JSONL schema may have changed, and submission proof will read UNKNOWN',
+    if (overdue && !r.promptTs) {
+      return held(
+        `this spawn's boot prompt was never recorded as a genuine prompt in ${this.scanner.projectDir} — ` +
+        'the Claude Code JSONL schema may have changed',
       );
     }
     return held(r.promptTs ? 'boot turn still running' : 'boot prompt not recorded yet');
+  }
+
+  /** Past the bound: one loud log per PTY; mark every held record (new ones too) for the watchdog. */
+  private escalateBootHold(inst: string, now: number, why: string): void {
+    if (this.bootHoldEscalatedFor !== inst) {
+      this.bootHoldEscalatedFor = inst;
+      this.log(
+        `LOUD: Telegram injection has been held ${Math.round(bootHoldMaxMs() / 60_000)}+ min in the boot window of PTY ${inst.slice(0, 8)} ` +
+        `(${why}). NOT releasing on time alone — waiting for readiness evidence; held messages are flagged for the watchdog.`,
+      );
+    }
+    const iso = new Date(now).toISOString();
+    for (const r of this.pending.active()) {
+      if (r.hold_escalated_at || r.submit_phase !== undefined || r.state !== 'unattempted' || r.empty) continue;
+      this.pending.patch(r.update_id, { hold_escalated_at: iso, hold_reason: 'boot_not_ready' }, { expectRev: r.rev ?? 0 });
+    }
+  }
+
+  private clearBootHoldEscalation(): void {
+    for (const r of this.pending.active()) {
+      if (!r.hold_escalated_at) continue;
+      this.pending.patch(r.update_id, {
+        hold_escalated_at: undefined,
+        hold_reason: undefined,
+        notes: [...r.notes, `boot hold (escalated ${r.hold_escalated_at}) released on readiness evidence`],
+      }, { expectRev: r.rev ?? 0 });
+    }
   }
 
   /** One scan per ≤5 s, shared by the boot hold and the proof pass (R4-5 cadence). */
@@ -1104,13 +1141,17 @@ export class FastChecker {
         this.log(`Pending ${rec.update_id}: header seen in transcript — in_flight (consumed, NOT answered)`);
       }
     }
+    // A record that gates THIS PTY is scanned for as long as it gates it — past
+    // the 24 h window too: only its evidence can release the queue behind it.
+    const inst = this.currentPtyInstance();
+    const gating = (r: PendingTelegramRecord) =>
+      !!inst && r.pty_instance === inst && (r.submit_phase === 'pasted' || r.submit_phase === 'stuck');
     const awaiting = recs.filter(
       (r) =>
-        !!r.token &&
-        r.state === 'in_flight' &&
+        awaitingConsumption(r) &&
+        (r.state === 'in_flight' || r.state === 'unverified') &&
         !!r.attempt_started_at &&
-        !r.proof_window_closed_at &&
-        (r.submit_phase === 'pasted' || r.submit_phase === 'stuck' || (r.submit_phase === 'submitted' && !r.in_flight_at)),
+        (!r.proof_window_closed_at || gating(r)),
     );
     if (awaiting.length === 0) return;
 
@@ -1148,10 +1189,12 @@ export class FastChecker {
         this.recordSubmission(cur, finding);
         continue;
       }
-      if (!Number.isNaN(started) && now - started > PROOF_WINDOW_MS) {
+      if (!Number.isNaN(started) && now - started > PROOF_WINDOW_MS && !cur.proof_window_closed_at) {
         this.pending.patch(cur.update_id, { proof_window_closed_at: new Date(now).toISOString() }, { expectRev: cur.rev ?? 0 });
-        this.log(`Pending ${cur.update_id}: no proof of submission within 24 h — delivery state stays UNKNOWN; no longer scanning`);
-        continue;
+        this.log(gating(cur)
+          ? `Pending ${cur.update_id}: no proof of submission within 24 h — still UNKNOWN; it still gates this PTY, so scanning continues`
+          : `Pending ${cur.update_id}: no proof of consumption within 24 h — delivery state stays UNKNOWN; no longer scanning`);
+        if (!gating(cur)) continue;
       }
       if (cur.submit_phase === 'pasted') {
         const deadline = Date.parse(cur.submit_deadline_at ?? '');
@@ -1379,11 +1422,12 @@ export class FastChecker {
     }
     const ok = this.pending.patch(cur.update_id, fields, { expectRev: cur.rev ?? 0 });
     if (!ok) {
-      this.pendingMediaPatches.set(cur.update_id, { gen, partPath: null, transcript, attempts: 1 });
+      const prev = this.pendingMediaPatches.get(cur.update_id);
+      this.pendingMediaPatches.set(cur.update_id, { gen, partPath: null, transcript, attempts: prev && prev.gen === gen ? prev.attempts : 1 });
       this.log(`ERROR: media completion for ${cur.update_id} gen ${gen}: the block could NOT be written — kept in memory, retried next cycle`);
       return 'write_failed';
     }
-    this.pendingMediaPatches.delete(cur.update_id);
+    this.settleMediaPatch(cur.update_id);
     this.log(
       outcome === 'landed'
         ? `Media message received: type=${cur.media_type}, durable record ${cur.update_id} ready (gen ${gen})`
@@ -1397,19 +1441,54 @@ export class FastChecker {
   private retryPendingMediaPatches(): void {
     for (const [updateId, p] of [...this.pendingMediaPatches]) {
       const cur = this.pending.read(updateId);
-      if (!cur || cur.media_gen !== p.gen) {
-        this.pendingMediaPatches.delete(updateId);
+      if (!cur || cur.media_gen !== p.gen || !cur.media_dest) {
+        // Superseded or gone: explicitly discarded.
+        if (p.partPath) { try { unlinkSync(p.partPath); } catch { /* gone */ } }
+        this.log(`Owed media completion for ${updateId} gen ${p.gen} discarded — record ${cur ? `moved to gen ${cur.media_gen}` : 'no longer exists'}`);
+        this.settleMediaPatch(updateId);
         continue;
       }
       p.attempts++;
+      const dest = join(this.agentDirOr(), cur.media_dest);
       if (p.partPath) {
-        this.pendingMediaPatches.delete(updateId);
-        this.completeMediaDownload(updateId, p.gen, { partPath: p.partPath, transcript: p.transcript });
-        continue;
+        try {
+          mkdirSync(dirname(dest), { recursive: true });
+          renameSync(p.partPath, dest);
+          p.partPath = null;
+        } catch (err) {
+          if (p.attempts % 10 === 0) this.log(`ERROR: owed media completion for ${updateId} gen ${p.gen}: rename still failing after ${p.attempts} tries: ${String(err)}`);
+          continue;
+        }
       }
-      if (!cur.media_dest) continue;
-      this.landMedia(cur, join(this.agentDirOr(), cur.media_dest), p.transcript, p.gen);
+      this.landMedia(cur, dest, p.transcript, p.gen);
     }
+  }
+
+  /** The owed completion for this record is resolved (landed or discarded): release its job. */
+  private settleMediaPatch(updateId: number): void {
+    const p = this.pendingMediaPatches.get(updateId);
+    this.pendingMediaPatches.delete(updateId);
+    if (!p) return;
+    const key = `${updateId}:${p.gen}`;
+    for (const resolve of this.patchWaiters.get(key) ?? []) resolve();
+    this.patchWaiters.delete(key);
+  }
+
+  /**
+   * Resolves once the completion for (updateId, gen) is no longer owed —
+   * immediately if it is not. The daemon's media job awaits this after a
+   * 'write_failed' completion, so the outstanding-job count the rollback drain
+   * reads cannot reach zero while a download's result exists only in memory.
+   */
+  mediaPatchSettled(updateId: number, gen: number): Promise<void> {
+    const p = this.pendingMediaPatches.get(updateId);
+    if (!p || p.gen !== gen) return Promise.resolve();
+    const key = `${updateId}:${gen}`;
+    return new Promise<void>((resolve) => {
+      const list = this.patchWaiters.get(key) ?? [];
+      list.push(resolve);
+      this.patchWaiters.set(key, list);
+    });
   }
 
   /** The block for a downloaded attachment — same formatters, token in the header. */

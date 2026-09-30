@@ -657,7 +657,10 @@ export class AgentManager {
           downloadTelegramFileTo(telegramApi, rec.file_id, part)
             .then(async () => {
               const transcript = rec.media_type === 'voice' ? (await transcribeVoice(part)) || undefined : undefined;
-              checker.completeMediaDownload(rec.update_id, gen, { partPath: part, transcript });
+              const outcome = checker.completeMediaDownload(rec.update_id, gen, { partPath: part, transcript });
+              // A completion the checker could not write is still owed; the job
+              // stays counted until it lands or is discarded (drain safety).
+              if (outcome === 'write_failed') await checker.mediaPatchSettled(rec.update_id, gen);
             })
             .catch((err) => checker.failMediaDownload(rec.update_id, gen, err))
             .catch((err) => log(`ERROR: media job ${rec.update_id} gen ${gen} completion handling threw: ${String(err)}`))

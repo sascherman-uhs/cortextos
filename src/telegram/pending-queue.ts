@@ -168,7 +168,10 @@ export interface PendingTelegramRecord {
   /**
    * Where the paste stands (JSONL-proof runtimes only):
    *   pasted    — bytes were written; no proof of submission yet (UNKNOWN);
-   *   submitted — Claude Code recorded the prompt (see submitted_via);
+   *   submitted — Claude Code recorded the prompt (see submitted_via). With
+   *               `in_flight_at` it was READ (genuine prompt / queued_command);
+   *               without it only an enqueue row shows the composer accepted
+   *               Enter — submitted-but-unread, still scanned, never unverified;
    *   stuck     — no proof within SUBMIT_TIMEOUT_MS: the composer probably
    *               holds it unsent. Never re-pasted; queues later messages.
    * The uhsJARVIS audit reads `submit_phase === 'stuck'` as STUCK.
@@ -193,6 +196,14 @@ export interface PendingTelegramRecord {
   write_error?: string;
   /** The token was seen in PTY output — a hint only, never proof, in JSONL mode. */
   pty_hint_at?: string;
+  /**
+   * Held before injection past the boot-hold bound (Codex round 15 #6): the
+   * agent's session has not shown readiness, so the message is still queued.
+   * Set on every held record and cleared when the hold releases. The watchdog
+   * reports it as HELD — an engineering alert; injection stays held.
+   */
+  hold_escalated_at?: string;
+  hold_reason?: 'boot_not_ready';
   /** Pastes that wrote NOTHING (PTY absent / first write threw) — V5-3 positive non-delivery. */
   nondelivery_failures?: number;
 
@@ -723,6 +734,11 @@ export class PendingTelegramQueue {
     let n = 0;
     for (const rec of this.active()) {
       if (isTerminal(rec.state) && rec.state !== 'unverified') continue;
+      // A reply to this chat cannot be an answer to a message the agent has not
+      // read: pasted/stuck (maybe never submitted) and submitted-but-unread
+      // records stay until Claude Code records the prompt. Archiving them on an
+      // unrelated reply also silently opened the stuck gate (Codex round 15 #2).
+      if (awaitingConsumption(rec)) continue;
       if (answered(rec) && this.archive(rec.update_id, 'answered', by)) n++;
     }
     return n;
@@ -823,9 +839,13 @@ export class PendingTelegramQueue {
     for (const rec of this.active()) {
       if (rec.empty) continue;
       if (rec.state !== 'in_flight') continue;
-      if (rec.token && rec.submit_phase !== 'submitted') continue;
+      // Consumed = Claude Code recorded the prompt as READ (a genuine prompt or
+      // a queued_command — in_flight_at). An enqueue alone only proves the
+      // composer accepted Enter; that record keeps waiting for consumption
+      // (Codex round 15 #4) and its 10-minute clock has not started.
+      if (rec.token && (rec.submit_phase !== 'submitted' || !rec.in_flight_at)) continue;
       if (answered(rec)) continue;
-      const since = Date.parse(rec.submitted_at ?? rec.in_flight_at ?? rec.last_attempt_at ?? rec.created_at);
+      const since = Date.parse(rec.token ? rec.in_flight_at! : (rec.in_flight_at ?? rec.last_attempt_at ?? rec.created_at));
       if (!Number.isNaN(since) && now - since < IN_FLIGHT_RETRY_MS) continue;
       out.push(rec);
     }
@@ -916,6 +936,17 @@ export class PendingTelegramQueue {
   markFailedNotified(rec: PendingTelegramRecord, note: string, extra: Partial<PendingTelegramRecord> = {}): PendingTelegramRecord | null {
     return this.patch(rec.update_id, { state: 'failed_notified', notes: [...rec.notes, note], ...extra });
   }
+}
+
+/**
+ * A pasted record the agent is not proven to have READ: pasted or stuck (maybe
+ * never submitted), or submitted via an enqueue row only. Such a record is
+ * never resolved by a reply to the chat, never made unverified, and stays
+ * scanned for evidence.
+ */
+export function awaitingConsumption(rec: PendingTelegramRecord): boolean {
+  if (!rec.token) return false;
+  return rec.submit_phase === 'pasted' || rec.submit_phase === 'stuck' || (rec.submit_phase === 'submitted' && !rec.in_flight_at);
 }
 
 /** Build a fresh record. `formatted` may be '' when a media round trip still owes us the block. */

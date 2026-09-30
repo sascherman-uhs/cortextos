@@ -26,6 +26,8 @@ const h = vi.hoisted(() => ({
   downloader: null as any,
   started: [] as Array<{ id: number; gen: number }>,
   exists: new Set<number>(),
+  completeOutcome: 'landed' as string,
+  settlePatch: null as null | (() => void),
 }));
 
 vi.mock('../../../src/daemon/agent-process.js', () => ({
@@ -55,8 +57,9 @@ vi.mock('../../../src/daemon/fast-checker.js', () => ({
     startMediaJob(rec: any, gen: number) { h.started.push({ id: rec.update_id, gen }); h.downloader.start(rec, gen); }
     completeMediaDownload(id: number, gen: number, result: any) {
       h.completions.push({ id, gen, result, jobsAtCompletion: h.gate?.outstandingMediaJobs });
-      return 'landed';
+      return h.completeOutcome;
     }
+    mediaPatchSettled() { return new Promise<void>((r) => { h.settlePatch = r; }); }
     failMediaDownload() {}
     static formatTelegramTextMessage() { return 'ZZTEST text block'; }
     static formatTelegramPhotoMessage() { return 'ZZTEST photo block'; }
@@ -104,6 +107,8 @@ beforeEach(() => {
   h.started.length = 0;
   h.exists.clear();
   h.downloader = null;
+  h.completeOutcome = 'landed';
+  h.settlePatch = null;
   framework = mkdtempSync(join(tmpdir(), 'zztest-a0-am-fw-'));
   ctxRoot = mkdtempSync(join(tmpdir(), 'zztest-a0-am-ctx-'));
 });
@@ -175,6 +180,29 @@ describe('agent-manager media handler (A0 → A3)', () => {
     // The completion was handed to the checker while the job was still counted.
     expect(h.completions[0].jobsAtCompletion).toBe(1);
     expect(readIntakeStatus(join(ctxRoot, 'state', 'vera'))!.outstanding_media_jobs).toBe(0);
+    await manager.stopAgent('vera');
+  });
+
+  // Codex round 15 #3: a completion whose record patch FAILED is still owed
+  // (kept in the checker's retry map). Settling the job then let the rollback
+  // drain report "0 media jobs" while a download's result was still in memory.
+  it('holds the media job until a failed completion patch is landed or discarded', async () => {
+    const dir = join(framework, 'orgs', 'uhs', 'agents', 'vera');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.env'), 'BOT_TOKEN=111111111:ZZTEST-TOKEN-SENTINEL-aaaaaaaaaaaaaaaaaaaaa\nCHAT_ID=1001\nALLOWED_USER=4242\n');
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ agent_name: 'vera', enabled: true }));
+    const manager = new AgentManager('default', ctxRoot, framework, 'uhs');
+    await manager.startAgent('vera', dir, undefined, 'uhs');
+    h.completeOutcome = 'write_failed';
+    await h.handler!({ message_id: 1, date: 1, chat: { id: 1001 }, from: { id: 4242, first_name: 'Scott' },
+      photo: [{ file_id: 'ZZTEST-f', file_unique_id: 'u' }] }, 462809300);
+    expect(h.gate.outstandingMediaJobs).toBe(1);
+    h.finishMedia!(undefined);
+    await vi.waitFor(() => expect(h.completions).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(h.gate.outstandingMediaJobs).toBe(1); // still owed
+    h.settlePatch!();
+    await vi.waitFor(() => expect(h.gate.outstandingMediaJobs).toBe(0));
     await manager.stopAgent('vera');
   });
 });

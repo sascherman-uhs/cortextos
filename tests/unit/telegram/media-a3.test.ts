@@ -264,6 +264,38 @@ describe('patch failure recovery', () => {
   });
 });
 
+describe('Codex round 15 #3 — an owed completion is settled only when landed or discarded', () => {
+  it('mediaPatchSettled resolves when the retried patch lands, not before', async () => {
+    receive();
+    const real = q.patch.bind(q);
+    const spy = vi.spyOn(q, 'patch').mockImplementation((id: number, f: any, o?: any) => (f.media_state === 'ready' ? null : real(id, f, o)));
+    vi.setSystemTime(T0 + 1_000);
+    expect(checker.completeMediaDownload(ID, 1, { partPath: downloaded(1) })).toBe('write_failed');
+    let settled = false;
+    checker.mediaPatchSettled(ID, 1).then(() => { settled = true; });
+    await cycleAt(T0 + 2_000); // patch still failing
+    expect(settled).toBe(false);
+    spy.mockRestore();
+    await cycleAt(T0 + 3_000);
+    expect(q.read(ID)!.media_state).toBe('ready');
+    expect(settled).toBe(true);
+  });
+
+  it('... and when it is explicitly discarded because its record is gone', async () => {
+    receive();
+    const spy = vi.spyOn(q, 'patch').mockImplementation(() => null);
+    vi.setSystemTime(T0 + 1_000);
+    expect(checker.completeMediaDownload(ID, 1, { partPath: downloaded(1) })).toBe('write_failed');
+    spy.mockRestore();
+    let settled = false;
+    checker.mediaPatchSettled(ID, 1).then(() => { settled = true; });
+    q.remove(ID); // e.g. archived/removed by an operator
+    await cycleAt(T0 + 2_000);
+    expect(settled).toBe(true);
+    expect(logs.some((l) => l.includes('discarded'))).toBe(true);
+  });
+});
+
 describe('V4-3 restart reconciliation', () => {
   it('(a) crash BETWEEN rename and patch: the final file exists => block rebuilt from it at startup', async () => {
     q.persist(photoAtReceipt());
