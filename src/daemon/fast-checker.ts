@@ -722,7 +722,11 @@ export class FastChecker {
         await this.telegramApi.sendMessage(rec.chat_id, text);
         const cur = this.pending.read(rec.update_id);
         if (!cur) return;
-        const ok = this.pending.patch(cur.update_id, { stuck_receipt_at: new Date().toISOString() }, { expectRev: cur.rev ?? 0 });
+        const iso = new Date().toISOString();
+        // The stuck receipt IS this record's receipt ack (A6 stage 1) — Scott
+        // should not get "received" twice fifteen seconds apart.
+        const ackFields: Partial<PendingTelegramRecord> = cur.ack_stage === 0 ? { ack_stage: 1, ack1_at: iso } : {};
+        const ok = this.pending.patch(cur.update_id, { stuck_receipt_at: iso, ...ackFields }, { expectRev: cur.rev ?? 0 });
         this.log(ok
           ? `Pending ${rec.update_id}: stuck receipt sent to chat ${rec.chat_id}`
           : `ERROR: Pending ${rec.update_id}: stuck receipt SENT but not recorded — it may be sent again`);
@@ -779,7 +783,12 @@ export class FastChecker {
     }
     for (const [chatId, recs] of byChat) {
       const age = (r: PendingTelegramRecord) => now - Date.parse(r.created_at);
-      const stage1 = recs.filter((r) => r.ack_stage === 0 && r.state !== 'unverified' && age(r) >= delay);
+      // A paste still inside its proof window is about to be either proven or
+      // stuck (which sends its own receipt) — acking it now would say the same
+      // thing twice within seconds.
+      const provingNow = (r: PendingTelegramRecord) =>
+        r.submit_phase === 'pasted' && Date.parse(r.submit_deadline_at ?? '') > now;
+      const stage1 = recs.filter((r) => r.ack_stage === 0 && r.state !== 'unverified' && age(r) >= delay && !provingNow(r));
       if (stage1.length > 0) await this.sendAckStage(chatId, stage1, 1, now);
       const stage2 = recs.filter((r) => r.ack_stage === 1 && age(r) >= ACK_FOLLOWUP_MS);
       if (stage2.length > 0) await this.sendAckStage(chatId, stage2, 2, now);
@@ -798,7 +807,9 @@ export class FastChecker {
     const status = all
       ? (n === 1 ? 'JARVIS has it; no reply yet.' : 'JARVIS has them; no reply yet.')
       : none
-        ? "JARVIS hasn't picked it up yet — it is queued."
+        ? recs.some((r) => r.submit_phase === 'stuck' || r.submit_phase === 'pasted')
+          ? "JARVIS hasn't picked it up yet — the delivery is stuck and has been flagged."
+          : "JARVIS hasn't picked it up yet — it is queued."
         : 'JARVIS has some of them; no reply yet.';
     const text = stage === 1
       ? `Received ${subject} (${Math.round((now - Date.parse(oldest.created_at)) / 1000)}s ago) — automatic receipt, not an answer. ${status}`

@@ -285,6 +285,22 @@ describe('A6 receipt acks by unacknowledged receipt', () => {
     expect(sent().some((t) => t.startsWith('Received') || t.startsWith('Still no reply'))).toBe(false);
   });
 
+  it('a fresh paste that goes stuck gets ONE receipt (the stuck receipt), not an ack AND a receipt; follow-up at 10 min', async () => {
+    q.insert(textRecord(39, 'ZZTEST never submitted', '2026-09-30T12:00:00.000Z'));
+    await cycleAt(at('2026-09-30T12:00:20.000Z')); // pasted at 12:00:20, proof window to 12:01:20
+    await cycleAt(at('2026-09-30T12:00:50.000Z')); // 50 s old, still proving: no ack yet
+    expect(sent()).toEqual([]);
+    await cycleAt(at('2026-09-30T12:01:25.000Z')); // stuck => the one receipt
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toMatch(/^Received your message from .* — JARVIS hasn't picked it up yet\./);
+    expect(q.read(39)).toMatchObject({ submit_phase: 'stuck', ack_stage: 1 });
+    await cycleAt(at('2026-09-30T12:02:30.000Z'));
+    expect(sent()).toHaveLength(1);
+    await cycleAt(at('2026-09-30T12:10:05.000Z'));
+    expect(sent()).toHaveLength(2);
+    expect(sent()[1]).toMatch(/^Still no reply observed to your message from .* JARVIS hasn't picked it up yet/);
+  });
+
   it('an answered message inside 45 s is never acked', async () => {
     q.insert(textRecord(38, 'ZZTEST quick', '2026-09-30T12:00:00.000Z'));
     await cycleAt(at('2026-09-30T12:00:01.000Z'));
