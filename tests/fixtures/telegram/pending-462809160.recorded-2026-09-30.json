@@ -1,0 +1,16 @@
+{
+  "update_id": 462809160,
+  "chat_id": "8727328514",
+  "from": "Scott",
+  "text": "",
+  "formatted": "=== TELEGRAM PHOTO from Scott (chat_id:8727328514) ===\ncaption:\n```\n\n```\nlocal_file: ../../../../cortextos/orgs/uhs/agents/jarvis-telegram/telegram-images/20260930_044129_file_481.jpg\nReply using: cortextos bus send-telegram 8727328514 '<your reply>'\n\n",
+  "header": "=== TELEGRAM from [USER: Scott] (chat_id:8727328514) ===",
+  "state": "failed_notified",
+  "attempts": 0,
+  "empty": false,
+  "created_at": "2026-09-30T11:41:31.338Z",
+  "notes": [
+    "raw media update persisted before download/transcribe",
+    "no formatted block and no recoverable text after restart"
+  ]
+}

@@ -1,0 +1,3 @@
+2026-09-30T04:41:31: [jarvis-telegram] Persisted pending Telegram update 462809160 (chat 8727328514)
+2026-09-30T04:41:31: [jarvis-telegram] Pending 462809160: unrecoverable after restart — retained, not injected
+2026-09-30T04:41:33: [jarvis-telegram] Media message received: type=photo, durable record 462809160 updated (empty=false)

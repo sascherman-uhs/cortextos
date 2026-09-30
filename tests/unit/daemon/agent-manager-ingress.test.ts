@@ -42,6 +42,7 @@ vi.mock('../../../src/telegram/poller.js', () => ({
     onMessage() {}
     onCallback() {}
     onReaction() {}
+    setIntakeGate() {}
     lastExitReason = 'stopped-externally';
     async start() { return; }
     stop() { stopped.push('poller'); }

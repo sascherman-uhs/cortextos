@@ -109,6 +109,21 @@ export interface PendingTelegramRecord {
    */
   log_offset?: number | null;
   notes: string[];
+  // --- Media identity (A0, 2026-09-30). Optional: records written before this
+  // change have none of them and are handled exactly as before. -------------
+  /** Telegram file_id of the attachment — what a later re-download would need. */
+  file_id?: string;
+  /** photo | document | voice | audio | video | video_note */
+  media_type?: string;
+  /** Telegram message_id of the inbound media message. */
+  message_id?: number;
+  /**
+   * Forward-compat with the A3 media state machine. A0 never writes these; it
+   * only HONOURS them, so rolling A1–A8 back to A0 can never re-terminalize a
+   * record whose download the newer code still considers in progress.
+   */
+  media_state?: 'pending' | 'ready' | 'failed';
+  media_deadline_at?: string;
 }
 
 /** After this many injections with no observed reply, admit it rather than repeat. */
@@ -135,6 +150,34 @@ export const UNATTEMPTED_RETRY_MS = 180_000;
  * in the TUI, so a second copy can only duplicate it.
  */
 export const IN_FLIGHT_RETRY_MS = 10 * 60_000;
+
+/**
+ * How long a raw media record (persisted BEFORE its download, `formatted === ''`)
+ * is held — neither deliverable nor treated as orphaned — while the download
+ * and transcription finish.
+ *
+ * Why (2026-09-30). The raw record is persisted first so the Telegram offset can
+ * advance safely, and the checker's poll cycle then saw it within ~1 second,
+ * concluded "the daemon died between persisting and formatting", and marked it
+ * `failed_notified` without telling anyone. The download landed two seconds
+ * later on a terminal record that was never injected. 23 of 25 photos Scott
+ * sent between 9/24 and 9/29 were dropped this way; on 9/30 JARVIS missed a
+ * warehouse-capacity sheet and shipped a guessed migration instead.
+ *
+ * 180s: the measured persist -> "durable record updated" gap over all 25 media
+ * records in the pm2 logs was 1-3s (p99 3s), so this is ~60x p99 — and it is
+ * also the bound on how long a genuinely orphaned record (daemon really did
+ * die) waits before the expiry path tells the sender.
+ */
+export const MEDIA_GRACE_MS = 180_000;
+
+/** MEDIA_GRACE_MS, overridable with TELEGRAM_MEDIA_GRACE_MS (positive integer ms). */
+export function mediaGraceMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.TELEGRAM_MEDIA_GRACE_MS;
+  if (!raw) return MEDIA_GRACE_MS;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : MEDIA_GRACE_MS;
+}
 
 function truthy(v: string | undefined): boolean {
   if (!v) return false;
@@ -235,10 +278,106 @@ export function sendEvidenceInTranscript(text: string, chatId: string): boolean 
 export class PendingTelegramQueue {
   readonly dir: string;
   private log: (msg: string) => void;
+  /** See MEDIA_GRACE_MS. Read once at construction; tests pass it explicitly. */
+  readonly mediaGraceMs: number;
 
-  constructor(dir: string, log?: (msg: string) => void) {
+  constructor(dir: string, log?: (msg: string) => void, opts: { mediaGraceMs?: number } = {}) {
     this.dir = dir;
     this.log = log ?? (() => {});
+    this.mediaGraceMs = opts.mediaGraceMs ?? mediaGraceMs();
+  }
+
+  /**
+   * A media download still owes this record its block. While held, a record is
+   * NOT deliverable and NOT an orphan — the two readings the 9/30 race confused.
+   *
+   * Held when non-terminal AND either:
+   *   - `formatted === ''` and it is younger than the grace window, or
+   *   - it carries A3's `media_state: 'pending'` with a deadline still ahead.
+   * Past the grace window a raw record falls through to the expiry path in the
+   * checker (caption injected with a note, or the sender told to resend).
+   */
+  isMediaHeld(rec: PendingTelegramRecord, now: number): boolean {
+    if (isTerminal(rec.state)) return false;
+    if (rec.media_state === 'pending' && rec.media_deadline_at) {
+      const deadline = Date.parse(rec.media_deadline_at);
+      if (!Number.isNaN(deadline) && now < deadline) return true;
+    }
+    if (rec.formatted !== '') return false;
+    const created = Date.parse(rec.created_at);
+    if (Number.isNaN(created)) return false;
+    return now - created < this.mediaGraceMs;
+  }
+
+  /**
+   * Media records whose download has not settled into a block: NON-TERMINAL
+   * with `formatted === ''` (the raw A0/legacy shape) or `media_state:
+   * 'pending'`. Terminal historical records are never counted. This is the
+   * record half of the rollback drain gate (see intake-control.ts).
+   */
+  unfinishedMedia(): PendingTelegramRecord[] {
+    return this.list().filter(
+      (r) => !isTerminal(r.state) && (r.formatted === '' || r.media_state === 'pending'),
+    );
+  }
+
+  /**
+   * Captionless raw media whose grace has run out: nothing can be injected, so
+   * the checker tells the sender to resend (and only marks the record once that
+   * notice has actually been sent).
+   */
+  expiredCaptionlessMedia(now: number): PendingTelegramRecord[] {
+    return this.list().filter(
+      (r) =>
+        r.state === 'unattempted' &&
+        !r.empty &&
+        r.formatted === '' &&
+        !r.text.trim() &&
+        !this.isMediaHeld(r, now),
+    );
+  }
+
+  /**
+   * Land a finished media round trip on its record.
+   *
+   * The record may have moved while the download ran:
+   *   - still raw / non-terminal       => patch the block in ('updated');
+   *   - `failed_notified`, never injected (attempts 0) — the sender was told it
+   *     hadn't come through — => RE-ARM: back to `unattempted`, block prefixed
+   *     so the agent knows the resend note is moot ('rearmed');
+   *   - any other terminal state, or an answered-and-reaped record => nothing
+   *     is re-injected ('discarded' / 'missing').
+   * Every write's result is checked: 'write_failed' is never reported as done.
+   */
+  applyMediaCompletion(
+    updateId: number,
+    fields: { formatted: string; text: string; empty: boolean; notes?: string[] },
+  ): 'updated' | 'rearmed' | 'discarded' | 'missing' | 'write_failed' {
+    const cur = this.read(updateId);
+    if (!cur) return 'missing';
+    const notes = [...cur.notes, ...(fields.notes ?? [])];
+    if (!isTerminal(cur.state)) {
+      const next = { ...cur, formatted: fields.formatted, text: fields.text, empty: fields.empty, notes };
+      if (cur.formatted && fields.formatted && cur.attempts > 0) {
+        // The expiry path already injected the caption. The block is updated so
+        // a retry would carry the attachment, but it is NOT re-injected.
+        next.notes = [...notes, 'media completed after the caption was injected — not re-injected'];
+      }
+      return this.persist(next) ? 'updated' : 'write_failed';
+    }
+    if (cur.state === 'failed_notified' && cur.attempts === 0 && !fields.empty && fields.formatted) {
+      const next: PendingTelegramRecord = {
+        ...cur,
+        state: 'unattempted',
+        empty: false,
+        formatted: `${LATE_MEDIA_PREFIX}\n${fields.formatted}`,
+        text: fields.text,
+        notes: [...notes, 'media arrived after the sender was told to resend — re-armed'],
+      };
+      delete next.last_attempt_at;
+      return this.persist(next) ? 'rearmed' : 'write_failed';
+    }
+    return 'discarded';
   }
 
   private pathFor(updateId: number): string {
@@ -341,6 +480,11 @@ export class PendingTelegramQueue {
   isEligible(rec: PendingTelegramRecord, now: number, answered: (rec: PendingTelegramRecord) => boolean): boolean {
     if (rec.empty) return false;
     if (isTerminal(rec.state)) return false;
+    // A download still owes this record its block (see MEDIA_GRACE_MS).
+    if (this.isMediaHeld(rec, now)) return false;
+    // Nothing to inject at all (captionless media past grace): the checker's
+    // expiry path notifies the sender instead. Never hand it to the injector.
+    if (rec.formatted === '' && !rec.text.trim()) return false;
     // A consumed block is already in the TUI. Re-injecting it can only produce
     // the duplicate delivery observed live on 2026-09-24 ("Got all two").
     if (rec.state === 'in_flight') return false;
@@ -459,8 +603,11 @@ export function newRecord(fields: {
   header?: string;
   empty?: boolean;
   note?: string;
+  file_id?: string;
+  media_type?: string;
+  message_id?: number;
 }): PendingTelegramRecord {
-  return {
+  const rec: PendingTelegramRecord = {
     update_id: fields.update_id,
     chat_id: String(fields.chat_id),
     from: fields.from,
@@ -473,6 +620,11 @@ export function newRecord(fields: {
     created_at: new Date().toISOString(),
     notes: fields.note ? [fields.note] : [],
   };
+  // Only set when given, so a text record's JSON is byte-for-byte what it was.
+  if (fields.file_id !== undefined) rec.file_id = fields.file_id;
+  if (fields.media_type !== undefined) rec.media_type = fields.media_type;
+  if (fields.message_id !== undefined) rec.message_id = fields.message_id;
+  return rec;
 }
 
 /**
@@ -489,6 +641,40 @@ export function admissionText(text: string): string {
   return preview
     ? `I may have missed this: «${preview}» — do you still want it?`
     : 'I may have missed a message you sent — could you resend it?';
+}
+
+/** Prefix on a block whose media landed after the sender was asked to resend. */
+export const LATE_MEDIA_PREFIX = "(this photo arrived late — ignore the earlier 'resend' note)";
+
+const MEDIA_NOUNS: Record<string, string> = {
+  photo: 'photo',
+  document: 'file',
+  voice: 'voice note',
+  audio: 'audio file',
+  video: 'video',
+  video_note: 'video message',
+};
+
+/** "photo" for a photo; legacy records without media_type are photos in practice. */
+export function mediaNoun(mediaType: string | undefined): string {
+  return (mediaType && MEDIA_NOUNS[mediaType]) || 'photo';
+}
+
+/** The note appended to a caption injected while its attachment is still downloading. */
+export function mediaStillDownloadingNote(mediaType?: string): string {
+  return `(a ${mediaNoun(mediaType)} came with this and is still downloading)`;
+}
+
+/** Local wall-clock HH:MM of the record, e.g. "4:41 AM". */
+export function clockTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return 'earlier';
+  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+
+/** Sent to the sender when a captionless attachment never finished downloading. */
+export function mediaNotArrivedText(rec: Pick<PendingTelegramRecord, 'created_at' | 'media_type'>): string {
+  return `A ${mediaNoun(rec.media_type)} you sent at ${clockTime(rec.created_at)} hasn't come through yet — if it matters, resend it`;
 }
 
 export const EMPTY_MEDIA_REPLY =

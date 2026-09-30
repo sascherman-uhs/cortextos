@@ -5,6 +5,30 @@ so they can be reapplied after framework upgrades.
 
 ---
 
+## MOD #52 — Telegram media race fix + intake pause / rollback drain (A0, 2026-09-30)
+
+The durable queue persisted a raw media record (`formatted=''`) before the download; the checker saw it
+within ~1s, treated it as "daemon died", and marked it `failed_notified` with no notice — 23 of 25 photos
+to jarvis-telegram dropped 9/24–9/29 (incident: update 462809160, 04:41:31→33). Raw media is now held for
+`TELEGRAM_MEDIA_GRACE_MS` (default 180s; measured persist→updated gap 1–3s over all 25 records), then:
+captioned ⇒ caption injected with a still-downloading note; captionless ⇒ sender told to resend, marked only
+after the send succeeds; a late download re-arms the record. Durable mode only (TELEGRAM_DURABLE_QUEUE).
+
+Also: `state/<agent>/telegram-intake-paused` pauses the agent's poller between batches, and
+`state/<agent>/telegram-intake-status.json` publishes the pause ack + outstanding media jobs (pid + start
+time). `npx tsx scripts/telegram-media-rollback.ts --agent <name>` is the drain gate to run BEFORE rolling
+this back (or rolling A1+ back to it): it aborts, leaving the daemon untouched, unless nothing is mid-download.
+
+Modified files: src/telegram/pending-queue.ts, src/daemon/fast-checker.ts, src/daemon/agent-manager.ts,
+src/telegram/poller.ts, src/telegram/media.ts. New: src/telegram/intake-control.ts,
+scripts/telegram-media-rollback.ts. Tests: tests/unit/telegram/{media-race-a0,intake-control}.test.ts,
+tests/unit/daemon/agent-manager-media-a0.test.ts (fixtures: tests/fixtures/telegram/, recorded).
+
+Activates on next daemon restart. Rollback: run the drain script, then `git revert` + /restart-cortexos,
+then `--release`.
+
+---
+
 ## MOD #51 — Telegram command registration cap (2026-08-30)
 
 `collectTelegramCommands()` scans `[agentDir, frameworkRoot]`; the framework tree has ~210 `SKILL.md`, so any

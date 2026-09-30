@@ -20,7 +20,8 @@ import {
   headerNeedle,
   newRecord,
 } from '../telegram/pending-queue.js';
-import { processMediaMessage } from '../telegram/media.js';
+import { processMediaMessage, mediaIdentity } from '../telegram/media.js';
+import { TelegramIntakeControl } from '../telegram/intake-control.js';
 import { stripBom } from '../utils/strip-bom.js';
 import { prepareAgentPrompt } from '../utils/secret-refs.js';
 import { resolveIngressPaths } from '../ingress/state.js';
@@ -631,6 +632,11 @@ export class AgentManager {
     if (telegramApi && chatId && config.telegram_polling !== false && !ingressOwnsBot) {
       const stateDir = join(this.ctxRoot, 'state', name);
       const poller = new TelegramPoller(telegramApi, stateDir);
+      // Intake pause + outstanding media jobs, published for the rollback
+      // drain (scripts/telegram-media-rollback.ts). See intake-control.ts.
+      const intake = new TelegramIntakeControl(stateDir, name, { log });
+      poller.setIntakeGate(intake);
+      intake.publish();
 
       const REJECT_ALERT_THRESHOLD = 3;
       const REJECT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
@@ -699,6 +705,7 @@ export class AgentManager {
           // that window destroyed the message with no trace.
           if (durable) {
             const caption = stripControlChars(msg.caption || '');
+            const ident = mediaIdentity(msg);
             const rec = newRecord({
               update_id: updateId,
               chat_id: effectiveChatId,
@@ -706,10 +713,17 @@ export class AgentManager {
               text: caption,
               header: headerNeedle(sanitizeForPtyInjection(from), effectiveChatId),
               note: 'raw media update persisted before download/transcribe',
+              file_id: ident?.file_id,
+              media_type: ident?.media_type,
+              message_id: msg.message_id,
             });
             if (!checker.persistPendingTelegram(rec)) return false;
           }
 
+          // Counted from here until the round trip settled AND its completion
+          // patch was written or discarded (the .finally below) — never on any
+          // earlier signal. The rollback drain waits on this reaching zero.
+          const settleMediaJob = intake.beginMediaJob();
           const mediaPersisted = processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
             if (!media) {
               log('Media processing returned null - falling back to text format');
@@ -719,10 +733,11 @@ export class AgentManager {
                 // No text and no transcript => an EMPTY block, which is
                 // unanswerable by construction. Never inject it; the durable
                 // cycle notifies the sender instead and retains the record.
-                checker.patchPendingTelegram(updateId, {
+                checker.completePendingMedia(updateId, {
                   formatted: text.trim() ? formatted : '',
+                  text: text.trim(),
                   empty: !text.trim(),
-                });
+                }, 'media processing returned null');
                 return;
               }
               if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
@@ -763,12 +778,11 @@ export class AgentManager {
                 media.image_path ||
                 media.file_path
               );
-              checker.patchPendingTelegram(updateId, {
+              checker.completePendingMedia(updateId, {
                 formatted: hasContent ? formatted : '',
                 text: (media.transcript || media.text || caption || '').trim(),
                 empty: !hasContent,
-              });
-              log(`Media message received: type=${media.type}, durable record ${updateId} updated (empty=${!hasContent})`);
+              }, `type=${media.type}`);
               return;
             }
             if (checker.isDuplicate(formatted)) {
@@ -782,15 +796,18 @@ export class AgentManager {
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
             if (durable) {
-              checker.patchPendingTelegram(updateId, {
+              checker.completePendingMedia(updateId, {
                 formatted: text.trim() ? formatted : '',
+                text: text.trim(),
                 empty: !text.trim(),
                 notes: ['media processing error: ' + String(err)],
-              });
+              }, 'media processing error');
               return;
             }
             if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
-          });
+          }).catch((err) => {
+            log(`ERROR: media completion handling threw: ${String(err)}`);
+          }).finally(settleMediaJob);
           if (durable) {
             // The raw update is already durable, so the offset may advance now;
             // the formatted block lands via patch when the round trip finishes.

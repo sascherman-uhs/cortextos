@@ -53,6 +53,20 @@ function formatDate(unixTs: number): string {
  * Process a Telegram message for media content.
  * Downloads the file and returns a ProcessedMedia object, or null if no media.
  */
+/**
+ * The attachment's identity, recorded on the raw durable record at receipt so
+ * the record says WHAT is still owed, not merely that something is.
+ */
+export function mediaIdentity(msg: TelegramMessage): { media_type: string; file_id: string } | null {
+  if (msg.photo && msg.photo.length > 0) return { media_type: 'photo', file_id: msg.photo[msg.photo.length - 1].file_id };
+  if (msg.document) return { media_type: 'document', file_id: msg.document.file_id };
+  if (msg.audio) return { media_type: 'audio', file_id: msg.audio.file_id };
+  if (msg.voice) return { media_type: 'voice', file_id: msg.voice.file_id };
+  if (msg.video) return { media_type: 'video', file_id: msg.video.file_id };
+  if (msg.video_note) return { media_type: 'video_note', file_id: msg.video_note.file_id };
+  return null;
+}
+
 export async function processMediaMessage(
   msg: TelegramMessage,
   api: TelegramAPI,

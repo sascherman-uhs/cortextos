@@ -25,6 +25,16 @@ export type CallbackHandler = (query: TelegramCallbackQuery) => void | boolean |
 export type ReactionHandler = (reaction: TelegramMessageReaction) => void | boolean | Promise<void | boolean>;
 
 /**
+ * Intake pause hook (see telegram/intake-control.ts). Consulted only BETWEEN
+ * getUpdates batches, so a pause always lets the batch in hand finish.
+ */
+export interface IntakeGate {
+  isPauseRequested(): boolean;
+  setPaused(paused: boolean): void;
+  tick(): void;
+}
+
+/**
  * Telegram polling loop. Replaces the Telegram portion of fast-checker.sh.
  * Polls getUpdates every 1 second and routes messages/callbacks to handlers.
  */
@@ -49,6 +59,7 @@ export class TelegramPoller {
    *   - '' : loop still running / never exited.
    */
   lastExitReason: string = '';
+  private intake: IntakeGate | null = null;
 
   /**
    * @param api Telegram API client scoped to a single bot token.
@@ -99,12 +110,35 @@ export class TelegramPoller {
   }
 
   /**
+   * Honour an intake pause. While paused the loop stays alive (so the
+   * supervisor never restarts it) but calls getUpdates no more: nothing new is
+   * taken, and everything already taken keeps flowing through the daemon.
+   */
+  setIntakeGate(gate: IntakeGate | null): void {
+    this.intake = gate;
+  }
+
+  /**
    * Start the polling loop.
    */
   async start(): Promise<void> {
     this.running = true;
     this.lastExitReason = '';
     while (this.running) {
+      if (this.intake) {
+        let paused = false;
+        try {
+          paused = this.intake.isPauseRequested();
+          this.intake.setPaused(paused);
+          this.intake.tick();
+        } catch (err) {
+          console.error('[telegram-poller] Intake gate error:', err);
+        }
+        if (paused) {
+          await sleep(this.pollInterval);
+          continue;
+        }
+      }
       try {
         await this.pollOnce();
       } catch (err) {

@@ -24,6 +24,9 @@ import {
   sendEvidenceInTranscript,
   strictPromptGateEnabled,
   EMPTY_MEDIA_REPLY,
+  LATE_MEDIA_PREFIX,
+  mediaNotArrivedText,
+  mediaStillDownloadingNote,
   type PendingTelegramRecord,
 } from '../telegram/pending-queue.js';
 
@@ -278,6 +281,37 @@ export class FastChecker {
   }
 
   /**
+   * Land a finished media round trip on its durable record. The record may
+   * already have expired (caption injected, or the sender told to resend);
+   * see PendingTelegramQueue.applyMediaCompletion for what each case does.
+   * Logs the true outcome — a failed write is an ERROR, never "updated".
+   */
+  completePendingMedia(
+    updateId: number,
+    fields: { formatted: string; text: string; empty: boolean; notes?: string[] },
+    what: string,
+  ): boolean {
+    const outcome = this.pending.applyMediaCompletion(updateId, fields);
+    switch (outcome) {
+      case 'updated':
+        this.log(`Media message received: ${what}, durable record ${updateId} updated (empty=${fields.empty})`);
+        return true;
+      case 'rearmed':
+        this.log(`Media message received LATE: ${what}, durable record ${updateId} re-armed for delivery (sender had been asked to resend)`);
+        return true;
+      case 'discarded':
+        this.log(`Media message received: ${what}, but durable record ${updateId} is already terminal — completion discarded`);
+        return false;
+      case 'missing':
+        this.log(`Media message received: ${what}, but durable record ${updateId} no longer exists — completion discarded`);
+        return false;
+      case 'write_failed':
+        this.log(`ERROR: media completion for durable record ${updateId} (${what}) could NOT be written — record left as it was`);
+        return false;
+    }
+  }
+
+  /**
    * Single poll cycle: check inbox + queued Telegram messages.
    */
   private async pollCycle(): Promise<void> {
@@ -458,30 +492,72 @@ export class FastChecker {
       this.log(`Pending ${rec.update_id}: empty media — sender notified, not injected`);
     }
 
+    // 4b. Captionless media whose download did not land inside the grace
+    //     window (MEDIA_GRACE_MS) — still in flight, or the daemon really did
+    //     die mid-download. There is nothing to inject, so tell the sender.
+    //     The record is marked ONLY after the notice was actually sent; a
+    //     failed send is retried next cycle. (2026-09-30: this used to be
+    //     marked failed_notified ~1s after receipt, with no notice, while the
+    //     download was still running — 23 of 25 photos lost.)
+    for (const rec of this.pending.expiredCaptionlessMedia(now)) {
+      if (!this.telegramApi) continue;
+      try {
+        await this.telegramApi.sendMessage(rec.chat_id, mediaNotArrivedText(rec));
+      } catch (err) {
+        this.log(`Pending ${rec.update_id}: media-not-arrived notice failed — will retry next cycle: ${String(err)}`);
+        continue;
+      }
+      // Re-read: the download may have landed while the send was awaited.
+      const cur = this.pending.read(rec.update_id);
+      if (!cur) continue;
+      if (cur.formatted !== '' && cur.state === 'unattempted') {
+        const ok = this.pending.patch(cur.update_id, {
+          formatted: cur.formatted.startsWith(LATE_MEDIA_PREFIX) ? cur.formatted : `${LATE_MEDIA_PREFIX}\n${cur.formatted}`,
+          notes: [...cur.notes, 'media landed while the resend notice was being sent — delivering it'],
+        });
+        this.log(
+          ok
+            ? `Pending ${cur.update_id}: media landed during the resend notice — delivering it with a late note`
+            : `ERROR: Pending ${cur.update_id}: could not write the late note — record left as it was`,
+        );
+        continue;
+      }
+      if (cur.formatted !== '' || cur.state !== 'unattempted') continue;
+      const marked = this.pending.markFailedNotified(
+        cur,
+        'media did not arrive within the grace window — sender asked to resend',
+      );
+      this.log(
+        marked
+          ? `Pending ${cur.update_id}: media not arrived after grace — sender asked to resend, not injected`
+          : `ERROR: Pending ${cur.update_id}: resend notice SENT but the record could not be marked — it may be sent again`,
+      );
+    }
+
     // 5. Inject exactly one.
     const next = this.pending.nextDeliverable(now, answered);
     if (!next) return;
 
     let block = next.formatted;
     if (!block) {
-      // The daemon died between persisting the raw update and formatting it
-      // (the media round trip). Rebuild a text block from what we durably kept
-      // rather than dropping the message.
-      if (!next.text.trim()) {
-        this.pending.markFailedNotified(next, 'no formatted block and no recoverable text after restart');
-        this.log(`Pending ${next.update_id}: unrecoverable after restart — retained, not injected`);
-        return;
-      }
+      // A media record past its grace window whose download has not landed
+      // (still running, or the daemon died mid round trip). isEligible never
+      // returns a raw record inside the grace window, and never one with no
+      // caption (step 4b handles those), so this carries the caption plus a
+      // note that the attachment is still owed. A later completion re-arms or
+      // updates the record (applyMediaCompletion).
+      if (!next.text.trim()) return; // defensive: never inject an empty block
       block = FastChecker.formatTelegramTextMessage(
         next.from,
         next.chat_id,
-        next.text,
+        `${next.text}\n${mediaStillDownloadingNote(next.media_type)}`,
         this.frameworkRoot,
       );
-      this.pending.patch(next.update_id, {
+      const ok = this.pending.patch(next.update_id, {
         formatted: block,
-        notes: [...next.notes, 'reformatted from persisted text after restart'],
+        notes: [...next.notes, 'media not arrived after grace — injecting the caption with a still-downloading note'],
       });
+      if (!ok) this.log(`ERROR: Pending ${next.update_id}: could not persist the caption block — injecting it anyway`);
     }
 
     // Prompt-state gate. SOFT for the first 24h: log what it WOULD have held
