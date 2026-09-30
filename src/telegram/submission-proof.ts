@@ -23,7 +23,9 @@
  *     `type:"user"`-only rule would have called every one of them stuck;
  *   - (submission only, not consumption) a `queue-operation` `enqueue` entry:
  *     written the moment the composer accepted Enter while a turn was running.
- *     It proves the paste was submitted, not that the model has read it.
+ *     It proves the paste was submitted, not that the model has read it — and
+ *     only when its text IS our block (enqueue rows carry no provenance; task
+ *     notifications are enqueued too — enqueueIsOurPaste).
  * Anything else — tool results that echo the token, compaction summaries,
  * sidechains, entries whose provenance fields are missing (a future Claude
  * Code schema) — proves nothing, and "nothing found" means UNKNOWN, never
@@ -337,6 +339,11 @@ export function findSubmission(
       if (countedUuids.includes(ev.uuid)) continue;
       if (!ev.text.includes(token)) continue;
       if (ev.kind === 'enqueue') {
+        // An enqueue row carries no provenance at all, and task notifications
+        // and agent messages are enqueued the same way (18 of 44 in the real
+        // previous session). It corroborates a submission only when the queued
+        // text IS our paste — see enqueueIsOurPaste.
+        if (!enqueueIsOurPaste(ev.text, token)) continue;
         if (!submitted || ev.ts < submitted.ts) submitted = ev;
       } else if (!consumed || ev.ts < consumed.ts) {
         consumed = ev;
@@ -346,6 +353,22 @@ export function findSubmission(
   if (consumed) return { phase: 'consumed', evidence: consumed };
   if (submitted) return { phase: 'submitted', evidence: submitted };
   return null;
+}
+
+/**
+ * Does this queued composer text consist of OUR block? True only when it
+ * starts — after an optional `<pasted_content id="…">` wrapper, which is how
+ * Claude Code records a paste — with a `=== TELEGRAM` header line carrying the
+ * token. A task notification (`<task-notification>…`) or agent message
+ * (`<agent-message …>`) that merely echoes the token somewhere in its body can
+ * never match: its text starts with its own tag.
+ */
+export function enqueueIsOurPaste(text: string, token: string): boolean {
+  const body = text.replace(/^\s*(?:<pasted_content\b[^>]*>\s*)?/, '');
+  if (!body.startsWith('=== TELEGRAM')) return false;
+  const nl = body.indexOf('\n');
+  const header = nl < 0 ? body : body.slice(0, nl);
+  return header.includes(token);
 }
 
 /**

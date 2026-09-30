@@ -167,6 +167,37 @@ describe('findSubmission (R4-1 per-attempt filters over a full scan)', () => {
     expect(findSubmission(s.scan(t0), tok, t0)).toMatchObject({ phase: 'consumed', evidence: { kind: 'queued_command' } });
   });
 
+  // Codex round 15, #1: enqueue rows carry NO provenance (44 of 44 in the real
+  // previous session); 18 of them were task notifications / agent messages. A
+  // background task's output that echoes a token must not count as Scott's
+  // paste being submitted. Corroboration: the queued text IS our block — it
+  // starts (inside the optional <pasted_content> wrapper) with the header line
+  // carrying the token.
+  it('a task-notification or agent-message enqueue that echoes the token is NOT evidence', () => {
+    const tok = telegramToken(778);
+    const t0 = Date.parse('2026-09-28T00:00:00.000Z');
+    for (const key of ['enqueue_task_notification_b7476096', 'enqueue_agent_message_b7476096']) {
+      const e = E(key);
+      e.content = e.content.replace('\n', `\n=== TELEGRAM from [USER: Scott] ${tok} (chat_id:8727328514) ===\n`);
+      expect(e.content).toContain(tok);
+      writeFileSync(join(dir, 's.jsonl'), line(e));
+      expect(findSubmission(new ClaudeTranscriptScanner(dir, { cache: false }).scan(t0), tok, t0)).toBeNull();
+    }
+  });
+
+  it('an enqueue whose text is our paste (wrapped or bare) IS submission evidence', () => {
+    const tok = telegramToken(779);
+    const t0 = Date.parse('2026-09-28T00:00:00.000Z');
+    const wrapped = E('enqueue_telegram_b7476096');
+    wrapped.content = wrapped.content.replace('(chat_id:8727328514)', `${tok} (chat_id:8727328514)`);
+    const bare = E('enqueue_telegram_b7476096');
+    bare.content = `=== TELEGRAM from [USER: Scott] ${tok} (chat_id:8727328514) ===\nhi\n`;
+    for (const e of [wrapped, bare]) {
+      writeFileSync(join(dir, 's.jsonl'), line(e));
+      expect(findSubmission(new ClaudeTranscriptScanner(dir, { cache: false }).scan(t0), tok, t0)?.phase).toBe('submitted');
+    }
+  });
+
   it('a different update\'s token never proves this one', () => {
     writeFileSync(join(dir, 's.jsonl'), line(genuineWithToken()));
     expect(findSubmission(new ClaudeTranscriptScanner(dir).scan(started), telegramToken(ID + 1), started)).toBeNull();
