@@ -208,7 +208,10 @@ describe('retry capping and the admission', () => {
     q.markAttempt(q.read(305)!);
     q.markInFlight(q.read(305)!);
     const r = q.read(305)!;
-    const later = Date.parse(r.last_attempt_at!) + IN_FLIGHT_RETRY_MS + 1;
+    // The unverified clock runs from in_flight_at (set by markInFlight, which can
+    // be a millisecond after last_attempt_at under load — measuring from the
+    // attempt made this test flaky).
+    const later = Date.parse(r.in_flight_at!) + IN_FLIGHT_RETRY_MS + 1;
     expect(q.dropCandidates(later, noReply)).toEqual([]);
     // It becomes an operator-only record instead.
     expect(q.unverifiedCandidates(later, noReply).map((x) => x.update_id)).toEqual([305]);
