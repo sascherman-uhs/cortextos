@@ -140,7 +140,10 @@ export async function transcribeVoice(
     return null;
   }
 
-  const wavPath = oggPath.replace(/\.ogg$/i, '.wav');
+  // A temp WAV that can never be the input. Deriving it by replacing `.ogg$`
+  // made the A3 part file `<id>-voice.ogg.part.<gen>` its own output — ffmpeg
+  // overwrote its input and the finally-block below deleted the voice note.
+  const wavPath = path.join(os.tmpdir(), `cortextos-transcribe-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.wav`);
   const ffmpegOk = await runProcess(
     ffmpegBin,
     ['-y', '-i', oggPath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wavPath],
